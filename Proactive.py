@@ -876,18 +876,37 @@ def run():
                 _owner_bili = _rcfg.get("OWNER_BILI_NAME", "")
                 _owner_name = _rcfg.get("OWNER_NAME", "") or "主人"
                 if _owner_bili:
-                    # 让AI生成一条自然的推荐语
+                    # 让AI生成一条自然的推荐语（带人设）
                     try:
-                        _rec_prompt = f"""你刚看完视频「{video.get('title', '')}」，觉得{_owner_name}会喜欢。
-写一条B站评论@她推荐这个视频。要求：
-- 用你平时说话的语气，自然随意
-- 不超过30字（不含@）
-- 直接输出评论内容"""
+                        # 读取人设
+                        _active = _rcfg.get("ACTIVE_PERSONA", "default")
+                        _personas = load_json("data/personas.json", [])
+                        _p = next((p for p in _personas if p.get("name") == _active), None)
+                        _persona_text = (_p.get("system_prompt", "") if _p else "")[:500]
+                        
+                        if _persona_text:
+                            _rec_system = _persona_text
+                        else:
+                            _bot_name = _rcfg.get("BOT_NAME", "霜序")
+                            _rec_system = f"你是{_bot_name}，说话自然有个性。"
+                        
+                        _rec_prompt = f"""你刚看完视频「{video.get('title', '')}」，觉得很不错想推荐给{_owner_name}。
+写一句简短的推荐语，要求：
+- 用你自己的语气，自然随意
+- 不超过25字
+- 不要带@、不要带任何人名或称呼
+- 直接输出推荐语"""
                         _rec_resp = or_client.chat.completions.create(
                             model=OR_CHAT_MODEL, max_tokens=60,
-                            messages=[{"role": "user", "content": _rec_prompt}]
+                            messages=[
+                                {"role": "system", "content": _rec_system},
+                                {"role": "user", "content": _rec_prompt}
+                            ]
                         )
                         rec_text = _rec_resp.choices[0].message.content.strip()
+                        # 清理可能残留的@和称呼
+                        rec_text = re.sub(r'@\S+\s*', '', rec_text)
+                        rec_text = re.sub(r'^(主人|柠弥|亲爱的)[，,\s]*', '', rec_text)
                     except:
                         rec_text = evaluation.get("recommend_reason", "你可能会喜欢这个")
                     rec_msg = f"@{_owner_bili} {rec_text}"
