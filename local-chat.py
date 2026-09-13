@@ -1,9 +1,11 @@
 import json
 import math
 import os
+import io
 import base64
 import uuid
-from datetime import datetime
+import traceback
+from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, send_from_directory, session
 from openai import OpenAI
 from bili_login import BiliQrLoginManager
@@ -12,13 +14,119 @@ from bili_login import BiliQrLoginManager
 from config import *
 
 # ========== 访问密码 ==========
-AUTH_PASSWORD = os.environ.get("CHAT_PASSWORD", "") or "admin()"
+# 默认密码常量单独具名，供 /api/auth_check 判断"是否仍在使用默认密码"，
+# 避免前端把默认值写死（写死会在已改密后继续对外宣称一个不存在的密码）。
+DEFAULT_AUTH_PASSWORD = "admin()"
+AUTH_PASSWORD = os.environ.get("CHAT_PASSWORD", "") or DEFAULT_AUTH_PASSWORD
 # 从config.json读取（前端改过密码会存在这里）
 from config import get_raw_config as _get_raw
 _saved_pwd = _get_raw().get("CHAT_PASSWORD", "")
 if _saved_pwd:
     AUTH_PASSWORD = _saved_pwd
-SECRET_KEY = os.environ.get("SECRET_KEY", uuid.uuid4().hex)
+# 会话密钥：环境变量优先；否则用 data/.secret_key 持久化（0600）。
+# 好处：① 重启不把所有人踢下线 ② 密钥不可预测（不能用写死的常量）。
+def _load_secret_key():
+    env = (os.environ.get("SECRET_KEY") or "").strip()
+    if env:
+        return env
+    path = os.path.join("data", ".secret_key")
+    try:
+        if os.path.exists(path):
+            k = open(path, encoding="utf-8").read().strip()
+            if len(k) >= 32:
+                return k
+        k = uuid.uuid4().hex + uuid.uuid4().hex
+        os.makedirs("data", exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(k)
+        return k
+    except Exception:
+        return uuid.uuid4().hex
+
+SECRET_KEY = _load_secret_key()
+
+# ========== 口令密封：RSA-OAEP-SHA256 ==========
+# 第 2 层：登录密码在浏览器端先用公钥加密，链路上不出现明文口令。
+# 密钥对持久化在 data/.seal_key.pem（0600）——重启换钥会让刷新后无法解密，必须固定。
+SEAL_ENABLED = True
+try:
+    from cryptography.hazmat.primitives.asymmetric import padding as _asym_padding
+    from cryptography.hazmat.primitives.asymmetric import rsa as _asym_rsa
+    from cryptography.hazmat.primitives import hashes as _asym_hashes
+    from cryptography.hazmat.primitives import serialization as _asym_ser
+except Exception:  # 环境里没有 cryptography 时自动降级，不阻断启动
+    SEAL_ENABLED = False
+
+def _load_seal_key():
+    """载入或生成密封密钥对；在 data/.seal_key.pem 里持久化。"""
+    if not SEAL_ENABLED:
+        return None
+    path = os.path.join("data", ".seal_key.pem")
+    try:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return _asym_ser.load_pem_private_key(f.read(), password=None)
+    except Exception:
+        pass
+    try:
+        key = _asym_rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        os.makedirs("data", exist_ok=True)
+        pem = key.private_bytes(
+            encoding=_asym_ser.Encoding.PEM,
+            format=_asym_ser.PrivateFormat.PKCS8,
+            encryption_algorithm=_asym_ser.NoEncryption(),
+        )
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(pem)
+        return key
+    except Exception:
+        return None
+
+SEAL_PRIVATE_KEY = _load_seal_key()
+if SEAL_PRIVATE_KEY is None:
+    SEAL_ENABLED = False
+
+def _seal_pubkey_b64():
+    """导出 SPKI(DER) 公钥并 base64，供前端 crypto.subtle.importKey 使用。"""
+    if not SEAL_ENABLED:
+        return ""
+    der = SEAL_PRIVATE_KEY.public_key().public_bytes(
+        _asym_ser.Encoding.DER, _asym_ser.PublicFormat.SubjectPublicKeyInfo)
+    return base64.b64encode(der).decode("ascii")
+
+def _seal_decrypt(token):
+    """RSA-OAEP(SHA-256) 解密。任何异常都归为 None，不把失败细节漏给请求方。"""
+    if not SEAL_ENABLED:
+        return None
+    try:
+        raw = base64.b64decode((token or "").strip(), validate=True)
+        if len(raw) != 256:            # RSA-2048 密文长度必须正好 256 字节
+            return None
+        return SEAL_PRIVATE_KEY.decrypt(
+            raw,
+            _asym_padding.OAEP(mgf=_asym_padding.MGF1(algorithm=_asym_hashes.SHA256()),
+                               algorithm=_asym_hashes.SHA256(), label=None),
+        )
+    except Exception:
+        return None
+
+# ========== 传输加密（HTTPS） ==========
+# 为什么"前端到后端的数据加密"必须先把面板跑在 HTTPS 上：
+#   浏览器只在安全上下文（https:// 或 localhost）才暴露 WebCrypto（crypto.subtle）。
+#   用明文 HTTP 从公网访问时该 API 直接不存在，前端根本拿不到可用的加密原语，
+#   所以 HTTPS 不是可选项，而是前端加密的前提。HTTPS 一旦就位，
+#   链路上的密码、会话 Cookie、全部 API 报文、上传图片都已整体加密。
+PANEL_TLS = os.environ.get("PANEL_TLS", "0").strip() == "1"
+PANEL_TLS_CERT = (os.environ.get("PANEL_TLS_CERT", "").strip()
+                  or os.path.join("data", "tls", "panel.crt"))
+PANEL_TLS_KEY = (os.environ.get("PANEL_TLS_KEY", "").strip()
+                 or os.path.join("data", "tls", "panel.key"))
+
+# Cookie 是否只走加密传输：默认跟环境变量走；真正起上 HTTPS 之后会在 main 里强制打开。
+# 注意不要直接写 or PANEL_TLS —— 万一证书缺失回落到 HTTP，Secure Cookie 会把登录悄悄锁死。
+SECURE_COOKIES = (os.environ.get("SECURE_COOKIES", "0").strip() == "1")
 
 AFFECTION_FILE = "data/affection.json"
 MEMORY_FILE = "data/memory.json"
@@ -86,40 +194,127 @@ def web_search(query):
                 pass
         return ""
 
-app = Flask(__name__, template_folder=".", static_folder=".", static_url_path="")
+# 关键：static_folder 只能指向 static/，绝不能再把应用根目录挂成静态根。
+# 原写法 static_folder="." 会让 /config.json、/ai.py、/data/** 全部可直接下载。
+app = Flask(__name__, template_folder=".", static_folder="static",
+            static_url_path="/static")
 app.secret_key = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,      # JS 读不到会话 Cookie
+    SESSION_COOKIE_SAMESITE="Lax",     # 防 CSRF
+    SESSION_COOKIE_SECURE=SECURE_COOKIES,
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+)
 bili_qr_login = BiliQrLoginManager()
 
-# ========== 登录验证 ==========
+# ========== 鉴权：默认拒绝 ==========
+# 只有下面这张显式白名单可以免登录访问；其余任何路径都必须带有效会话。
+# 这样以后新增路由默认就是受保护的，不会再出现"忘了挂鉴权"的漏网。
+PUBLIC_PATHS = frozenset({
+    "/",              # 登录页本身
+    "/favicon.ico",
+    "/api/login",     # 提交密码（明文或 RSA-OAEP 密封）
+    "/api/auth_check",
+    "/api/handshake",  # 取 RSA 公钥；公钥本身不是秘密
+    "/api/health",    # 前端心跳
+    "/api/branding",    # 登录页需要 Bot 名称/头像
+    "/media/bot-avatar",  # 只放行"配置里指定的那一张"头像，登录页鉴权前要用
+})
+# 仅放行静态皮肤资源（壁纸 / Logo），它们位于 static/ 目录内，不含任何敏感数据
+PUBLIC_PREFIXES = ("/static/",)
+
 @app.before_request
 def check_auth():
-    # 放行：首页、静态资源、登录接口
-    if request.path == "/" or request.path == "/api/login" or request.path == "/api/auth_check" or request.path == "/api/health" or request.path == "/api/branding":
+    path = request.path
+    if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
         return
-    if request.path.startswith("/data/images/"):
+    if session.get("authed"):
         return
-    # 非html/css/js等静态资源也放行
-    if not request.path.startswith("/api/"):
-        return
-    # API 需要验证
-    if not session.get("authed"):
+    # 未登录：API 回 401 让前端弹登录框；其余一律 404，不泄露路径是否存在
+    if path.startswith("/api/"):
         return jsonify({"error": "未登录", "need_login": True}), 401
+    return ("Not Found", 404)
+
+# 只有本机回环上的反向代理（natfrp 的 frpc、nginx 等）才允许影响"是否 HTTPS"的判断
+_TRUSTED_PROXY_ADDRS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+def _client_is_secure():
+    """判断浏览器那一侧是否 HTTPS。
+
+    面板可能自己跑明文 HTTP（由 natfrp 的 frpc 在公网侧终止 TLS），
+    这时 request.is_secure 恒为 False，但用户实际是 https 访问的。
+    因此优先采信同机代理给的 X-Forwarded-Proto。
+    """
+    try:
+        if request.remote_addr in _TRUSTED_PROXY_ADDRS:
+            proto = (request.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+            if proto:
+                return proto == "https"
+    except Exception:
+        pass
+    return bool(request.is_secure)
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.path.startswith("/api/"):
+        resp.headers.setdefault("Cache-Control", "no-store")
+    # 只有"浏览器那一侧"确实走 HTTPS 才发 HSTS（含同机代理终止 TLS 的情形），
+    # 避免纯 HTTP 访问时把访问方式锁死。
+    if _client_is_secure():
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return resp
 
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.json or {}
-    pwd = data.get("password", "")
-    if pwd == AUTH_PASSWORD:
+    # sealed：前端用 /api/handshake 的公钥做过 RSA-OAEP 的密文（推荐路径，链路上无明文口令）
+    # password：明文回退。旧页面、或浏览器在明文 HTTP 下没有 WebCrypto 时走这条，
+    #           保证任何情况下都不会把用户锁在门外。
+    sealed = data.get("sealed")
+    if sealed:
+        raw = _seal_decrypt(sealed)
+        if raw is None:
+            return jsonify({"error": "密文无法解密，请刷新页面重试"}), 400
+        pwd = raw.decode("utf-8", errors="replace")
+        channel = "sealed"
+    else:
+        pwd = data.get("password", "")
+        channel = "plain"
+    if pwd and pwd == AUTH_PASSWORD:
         session["authed"] = True
         session.permanent = True
-        return jsonify({"ok": True})
+        app.logger.info("登录成功 channel=%s tls=%s", channel, request.is_secure)
+        return jsonify({"ok": True, "channel": channel})
+    app.logger.warning("登录失败 channel=%s", channel)
     return jsonify({"error": "密码错误"}), 403
 
 @app.route("/api/auth_check", methods=["GET"])
 def auth_check():
-    if session.get("authed"):
-        return jsonify({"authed": True})
-    return jsonify({"authed": False})
+    # default_password 只暴露"是否仍为默认密码"，不回传密码本身。
+    # tls：当前连接是否加密。前端据此判断能否做口令密封 ——
+    #      浏览器只在安全上下文（https:// 或 localhost）暴露 WebCrypto。
+    # 该路由位于 before_request 的免认证白名单内，登录前即可访问。
+    return jsonify({
+        "authed": bool(session.get("authed")),
+        "default_password": (AUTH_PASSWORD == DEFAULT_AUTH_PASSWORD),
+        "tls": _client_is_secure(),
+        "seal": bool(SEAL_ENABLED),
+    })
+
+@app.route("/api/handshake", methods=["GET"])
+def handshake():
+    """下发 RSA 公钥。公钥不是秘密，但只在登录前用得上。"""
+    if not SEAL_ENABLED:
+        return jsonify({"alg": None, "pubkey": ""})
+    return jsonify({
+        "alg": "RSA-OAEP-256",
+        "pubkey": _seal_pubkey_b64(),
+        "usage": "对文本做 RSA-OAEP(SHA-256) 加密后 base64，作为 /api/login 的 sealed 字段",
+    })
 
 @app.route("/api/change_password", methods=["POST"])
 def change_password():
@@ -207,13 +402,30 @@ def log_cost(source, input_tokens, output_tokens, model=""):
         for k in keys[:-30]: del logs[k]
     save_json(COST_LOG_FILE, logs)
 
+# 语义检索是加分项，不是必需项：Embedding 未配置或调用失败时一律降级，
+# 绝不让它把整条聊天链路拖成 500（ai.py 侧早有同样的降级，面板侧曾漏掉）。
+_embed_warned = False
+
+
 def get_embedding(text):
+    """返回向量；不可用时返回 None，调用方按「无向量」处理。"""
+    global _embed_warned
     from config import get_raw_config
-    _ecfg = get_raw_config()
-    resp = embed_client.embeddings.create(model=_ecfg.get("EMBED_MODEL", "BAAI/bge-m3"), input=text)
-    if resp and resp.data:
-        return resp.data[0].embedding
-    return [0.0] * 1024
+    model = str(get_raw_config().get("EMBED_MODEL") or "").strip()
+    if not model:
+        if not _embed_warned:
+            print("⚠️ 未配置 EMBED_MODEL，语义记忆检索停用（降级为最近记忆）")
+            _embed_warned = True
+        return None
+    try:
+        resp = embed_client.embeddings.create(model=model, input=text)
+        if resp and resp.data:
+            return resp.data[0].embedding
+    except Exception as e:
+        if not _embed_warned:
+            print(f"⚠️ Embedding 调用失败，语义记忆检索停用（降级为最近记忆）：{str(e)[:160]}")
+            _embed_warned = True
+    return None
 
 def cosine_similarity(a, b):
     dot = sum(x * y for x, y in zip(a, b))
@@ -242,7 +454,11 @@ LEVEL_NAMES = {
 def get_relevant_memories(memory, query_text, limit=5):
     if not memory or not query_text: return []
     query_embedding = get_embedding(query_text)
-    scored = [(cosine_similarity(query_embedding, m["embedding"]), m["text"]) for m in memory if "embedding" in m]
+    if not query_embedding:
+        # 没有向量能力：退化为「最近 N 条」，让对话仍带着上下文进行
+        return get_recent_memories(memory, limit)
+    scored = [(cosine_similarity(query_embedding, m["embedding"]), m["text"])
+              for m in memory if m.get("embedding")]
     scored.sort(reverse=True)
     return [text for _, text in scored[:limit]]
 
@@ -255,15 +471,17 @@ def save_local_memory(memory, user_msg, reply_text):
     bot_name = get_raw_config().get("BOT_NAME", "Bot")
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     text = f"[{now}] 用户（本地聊天）说：{user_msg} | {bot_name}回复：{reply_text}"
-    embedding = get_embedding(text)
-    memory.append({
+    entry = {
         "rpid": f"local_{int(datetime.now().timestamp())}",
         "thread_id": "local_chat",
         "user_id": str(OWNER_MID),
         "time": now,
         "text": text,
-        "embedding": embedding
-    })
+    }
+    embedding = get_embedding(text)
+    if embedding:            # 无向量时干脆不写该字段，避免在数据里留 null
+        entry["embedding"] = embedding
+    memory.append(entry)
     save_json(MEMORY_FILE, memory)
 
 # ========== 性格演化读取 ==========
@@ -296,6 +514,24 @@ def save_chat_history(history):
 def index():
     return render_template("chat.html")
 
+def _bot_avatar_public():
+    """把配置里的 BOT_AVATAR 归一成"匿名可取"的地址。
+
+    只有形如 /data/images/<单个文件名> 的头像才归一成 /media/bot-avatar；
+    其余（emoji、绝对 http 链接、空值）原样返回，由前端自己渲染。
+    这样登录页在鉴权之前也能显示头像，而 /data/** 整体仍然关着。
+    """
+    from config import get_raw_config
+    from urllib.parse import unquote
+    raw = str(get_raw_config().get("BOT_AVATAR", "") or "")
+    if not raw.startswith("/data/images/"):
+        return raw
+    name = unquote(raw[len("/data/images/"):])
+    # 只接受单层文件名：出现路径分隔符或 .. 一律不归一，避免把穿越意图带进路由
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return raw
+    return "/media/bot-avatar"
+
 @app.route("/api/branding", methods=["GET"])
 def api_branding():
     """返回Bot品牌信息，前端用来动态显示名称和头像"""
@@ -303,14 +539,52 @@ def api_branding():
     cfg = get_raw_config()
     return jsonify({
         "bot_name": cfg.get("BOT_NAME", "Bot"),
-        "bot_avatar": cfg.get("BOT_AVATAR", "🤖"),
+        "bot_avatar": _bot_avatar_public(),
         "user_avatar": cfg.get("USER_AVATAR", "🌙"),
         "bot_welcome": cfg.get("BOT_WELCOME", "你好，有什么想聊的？"),
         "bot_subtitle": cfg.get("BOT_SUBTITLE", "AI 聊天助手"),
     })
 
+@app.route("/media/bot-avatar")
+def bot_avatar():
+    """匿名提供"配置里指定的那一张" Bot 头像。
+
+    只认 config 的 BOT_AVATAR 指向的文件，不接受任何来自请求的文件名参数 ——
+    没有可控输入，也就没有穿越面。该路径在 PUBLIC_PATHS 里逐条放行。
+    """
+    from config import get_raw_config
+    from urllib.parse import unquote
+    raw = str(get_raw_config().get("BOT_AVATAR", "") or "")
+    prefix = "/data/images/"
+    if not raw.startswith(prefix):
+        return ("Not Found", 404)
+    name = unquote(raw[len(prefix):])
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return ("Not Found", 404)
+
+    # 头像原图往往是大图（当前这张 3 MB），而登录页只显示 48px。
+    # 经 natfrp 隧道下发时限速 10 Mibit/s，每次刷新拖满尺寸很浪费，
+    # 所以现场缩到 160px；缩图失败就回落到原图，不因为优化把头像搞挂。
+    path = os.path.join(IMAGE_DIR, name)
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            im.thumbnail((160, 160))
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, format="JPEG", quality=86, optimize=True)
+        data = buf.getvalue()
+        resp = app.response_class(data, mimetype="image/jpeg")
+    except Exception:
+        resp = send_from_directory(IMAGE_DIR, name)
+
+    # 这张图本来就是登录页公开展示的 Bot 头像，缓存不会扩大泄露面，
+    # 却能省掉每次刷新的整图传输。
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
 @app.route("/data/images/<filename>")
 def serve_image(filename):
+    # 聊天图片留在鉴权之后：登录用户的 <img> 会带上同源会话 Cookie，正常可见
     return send_from_directory(IMAGE_DIR, filename)
 
 @app.route("/api/upload_image", methods=["POST"])
@@ -367,10 +641,14 @@ def chat_regenerate():
     image_filename = last_user.get("image", "")
 
     # 用同样的逻辑重新生成（复用 _generate_reply）
-    reply, error = _generate_reply(user_msg, image_filename, chat_history[:-1])
+    try:
+        reply, error = _generate_reply(user_msg, image_filename, chat_history[:-1])
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"生成失败：{str(e)[:200]}"}), 502
     if error:
         # 恢复被删的 assistant 消息
-        return jsonify({"error": error}), 500
+        return jsonify({"error": error}), 502
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     chat_history.append({"role": "assistant", "content": reply, "time": now})
@@ -666,7 +944,10 @@ def _generate_reply(user_msg, image_filename, context_history):
         in_tok = message.usage.prompt_tokens if message.usage else 0
         out_tok = message.usage.completion_tokens if message.usage else 0
         log_cost("本地聊天", in_tok, out_tok, model=model)
-        reply = message.choices[0].message.content.strip()
+        reply = (message.choices[0].message.content or "").strip()
+        if not reply:
+            # 推理型模型会把 token 预算花在思考上，正文可能是空串
+            raise RuntimeError("模型返回空正文（推理型模型可能吃完了 max_tokens）")
         return reply, None
     except Exception as e:
         print(f"⚠️ 主模型失败：{e}")
@@ -674,7 +955,9 @@ def _generate_reply(user_msg, image_filename, context_history):
             try:
                 message = client.chat.completions.create(
                     model=fallback, max_tokens=250, messages=messages)
-                reply = message.choices[0].message.content.strip()
+                reply = (message.choices[0].message.content or "").strip()
+                if not reply:
+                    raise RuntimeError("回退模型返回空正文")
                 return reply, None
             except Exception as e2:
                 return None, f"主模型和回退模型都失败：{e2}"
@@ -708,9 +991,14 @@ def chat():
     if not user_msg and not image_filename:
         return jsonify({"error": "空消息"}), 400
 
-    reply, error = _generate_reply(user_msg, image_filename, chat_history)
+    try:
+        reply, error = _generate_reply(user_msg, image_filename, chat_history)
+    except Exception as e:
+        # 兜住未预期异常：回 JSON 让前端给出可读提示，而不是 HTML 500
+        traceback.print_exc()
+        return jsonify({"error": f"生成失败：{str(e)[:200]}"}), 502
     if error:
-        return jsonify({"error": error}), 500
+        return jsonify({"error": error}), 502
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     user_entry = {"role": "user", "content": user_msg if user_msg else "（发送了图片）", "time": now}
@@ -846,8 +1134,12 @@ def summary_save():
     if not text: return jsonify({"error": "内容为空"}), 400
     memory = load_json(MEMORY_FILE, [])
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    embedding = get_embedding(f"[{now}] Bot总结：{text}")
-    memory.append({"rpid": f"summary_{int(datetime.now().timestamp())}", "thread_id": "summary", "user_id": str(OWNER_MID), "time": now, "text": f"[{now}] Bot总结：{text}", "embedding": embedding})
+    entry = {"rpid": f"summary_{int(datetime.now().timestamp())}", "thread_id": "summary",
+             "user_id": str(OWNER_MID), "time": now, "text": f"[{now}] Bot总结：{text}"}
+    embedding = get_embedding(entry["text"])
+    if embedding:
+        entry["embedding"] = embedding
+    memory.append(entry)
     save_json(MEMORY_FILE, memory)
     return jsonify({"ok": True})
 
@@ -869,6 +1161,79 @@ def security_list():
     page = min(page, pages)
     start = (page - 1) * per_page
     return jsonify({"logs": logs[start:start + per_page], "page": page, "pages": pages, "total": total})
+
+
+# ========== 拉黑建议（自动拉黑已关闭，命中阈值转人工决策）==========
+# 自动拉黑关闭后，命中阈值的用户不会被动拉黑，而是落到这里作为"建议"，
+# 由引航者喵在 WebUI 上自己决定是否拉黑。数据直接来自 ai.py 写的安全日志，
+# 所以改动之前的历史事件也会自动出现在建议列表里，不需要迁移。
+BLOCK_SUGGEST_TYPES = ("auto_block_suppressed", "private_message_quarantined")
+BLOCK_SUGGEST_DISMISSED_FILE = "data/block_suggestion_dismissed.json"
+
+
+def _suggest_source(event_type):
+    return "私信" if str(event_type) == "private_message_quarantined" else "评论"
+
+
+def build_block_suggestions():
+    """聚合出待人工确认的拉黑建议。
+
+    过滤规则：本人、已拉黑、已被手动忽略的用户不进列表。
+    """
+    logs = load_json("data/security_log.json", []) or []
+    block_log = load_json(BLOCK_LOG_FILE, {}) or {}
+    dismissed = {str(x) for x in (load_json(BLOCK_SUGGEST_DISMISSED_FILE, []) or [])}
+    agg = {}
+    for ev in logs:
+        etype = str(ev.get("type") or "")
+        if etype not in BLOCK_SUGGEST_TYPES:
+            continue
+        uid = str(ev.get("uid") or "").strip()
+        if not uid or uid in ("0", "None", "null"):
+            continue
+        if uid == str(OWNER_MID) or uid in block_log or uid in dismissed:
+            continue
+        item = agg.get(uid)
+        if item is None:
+            item = {"uid": uid, "username": "", "reason": "", "source": "",
+                    "hits": 0, "first_time": "", "last_time": "", "samples": []}
+            agg[uid] = item
+        item["hits"] += 1
+        t = str(ev.get("time") or "")
+        if t and (not item["first_time"] or t < item["first_time"]):
+            item["first_time"] = t
+        # 取时间最新的一条作为展示口径（原因/来源/昵称）
+        if t >= item["last_time"]:
+            item["last_time"] = t
+            item["username"] = str(ev.get("username") or item["username"] or "未知")
+            item["reason"] = str(ev.get("detail") or item["reason"])
+            item["source"] = _suggest_source(etype)
+        content = str(ev.get("content") or "").strip()
+        if content and content not in item["samples"] and len(item["samples"]) < 3:
+            item["samples"].append(content[:120])
+    return sorted(agg.values(), key=lambda x: x["last_time"], reverse=True)
+
+
+@app.route("/api/block_suggestions", methods=["GET"])
+def block_suggestions():
+    """待人工确认的拉黑建议列表。"""
+    items = build_block_suggestions()
+    return jsonify({"suggestions": items, "total": len(items)})
+
+
+@app.route("/api/block_suggestion/dismiss", methods=["POST"])
+def block_suggestion_dismiss():
+    """忽略一条拉黑建议（数据体里带 undo=true 可撤销）。"""
+    data = request.json or {}
+    uid = str(data.get("uid", "")).strip()
+    if not uid:
+        return jsonify({"error": "缺少UID"}), 400
+    kept = [str(x) for x in (load_json(BLOCK_SUGGEST_DISMISSED_FILE, []) or []) if str(x) != uid]
+    if not data.get("undo"):
+        kept.append(uid)
+    save_json(BLOCK_SUGGEST_DISMISSED_FILE, kept[-1000:])
+    return jsonify({"ok": True, "total": len(build_block_suggestions())})
+
 
 @app.route("/api/permanent/list", methods=["GET"])
 def permanent_list():
@@ -1406,6 +1771,9 @@ def api_block_user():
             headers=h, data={"fid": uid, "act": 5, "re_src": 11, "csrf": BILI_JCT})
         result = resp.json()
         if result.get("code") == 0:
+            # 拉黑成功：清掉"已忽略"记录，避免与拉黑记录语义打架
+            kept = [str(x) for x in (load_json(BLOCK_SUGGEST_DISMISSED_FILE, []) or []) if str(x) != uid]
+            save_json(BLOCK_SUGGEST_DISMISSED_FILE, kept[-1000:])
             return jsonify({"ok": True, "msg": f"已拉黑UID:{uid}"})
         else:
             return jsonify({"ok": False, "msg": f"B站API拉黑失败: {result.get('message', '')}"})
@@ -1538,6 +1906,25 @@ if __name__ == "__main__":
     valid, info = check_bili_cookie()
     print(f"🍪 B站Cookie: {info}")
 
-    print("🌙 本地聊天已启动 → http://localhost:5000")
-    print(f"🔑 访问密码：{AUTH_PASSWORD}")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    # 传输加密：证书缺失就回落 HTTP，绝不因为配置笔误把服务起不来
+    ssl_ctx = None
+    scheme = "http"
+    if PANEL_TLS:
+        if os.path.exists(PANEL_TLS_CERT) and os.path.exists(PANEL_TLS_KEY):
+            ssl_ctx = (PANEL_TLS_CERT, PANEL_TLS_KEY)
+            scheme = "https"
+        else:
+            print(f"[warn] PANEL_TLS=1 但证书不存在：{PANEL_TLS_CERT} / {PANEL_TLS_KEY}，本次回落 HTTP")
+    if ssl_ctx:
+        # 真正起上 HTTPS 之后才把 Cookie 锁到加密传输
+        app.config["SESSION_COOKIE_SECURE"] = True
+        SECURE_COOKIES = True
+        print(f"[tls] 证书 {PANEL_TLS_CERT}，有效期与 SAN 见 openssl x509 -text")
+
+    print(f"本地聊天已启动 -> {scheme}://localhost:5000")
+    print(f"访问密码：{AUTH_PASSWORD}")
+    print(f"传输加密：{scheme.upper()}"
+          f"{'（自签证书）' if scheme == 'https' else '（明文，建议启用 PANEL_TLS=1）'}"
+          f" | Secure Cookie：{'开' if SECURE_COOKIES else '关'}"
+          f" | 口令密封：{'开' if SEAL_ENABLED else '关（缺少 cryptography）'}")
+    app.run(host="0.0.0.0", port=5000, debug=False, ssl_context=ssl_ctx)
