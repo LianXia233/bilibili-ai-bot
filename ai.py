@@ -1171,6 +1171,19 @@ def _record_private_block(message, reason, score, blocked):
     save_json("data/block_log.json", block_log)
 
 
+def auto_block_on_affection_enabled():
+    """好感度 / 连续负反馈是否允许自动拉黑。
+
+    默认 False —— 拉黑只允许在 WebUI「用户管理」里手动执行。
+    需要恢复旧行为时，在 config.json 里写 "AUTO_BLOCK_ON_AFFECTION": true 即可，无需改代码。
+    注意：本开关只管自动拉黑，不影响面板上的手动拉黑入口。
+    """
+    try:
+        return bool(get_raw_config().get("AUTO_BLOCK_ON_AFFECTION", False))
+    except Exception:
+        return False
+
+
 def process_private_messages(client, affection, memory):
     """处理一轮新私信；危险内容先隔离，再决定是否拉黑，绝不交给 LLM。"""
     config = get_raw_config()
@@ -1202,7 +1215,9 @@ def process_private_messages(client, affection, memory):
                 continue
 
             blocked = False
-            if config.get("PRIVATE_MESSAGE_AUTO_BLOCK", True):
+            # 默认 False：拉黑只允许人工在面板执行。
+            # 注意隔离逻辑不变 —— 命中安全规则的私信仍然不回复、不交给 LLM。
+            if config.get("PRIVATE_MESSAGE_AUTO_BLOCK", False):
                 blocked = block_user(mid, config)
             action = "已拉黑" if blocked else "已隔离，未完成拉黑"
             print(f"🚫 私信安全拦截 {username}（{mid}）：{decision.reason}；{action}")
@@ -1217,7 +1232,8 @@ def process_private_messages(client, affection, memory):
                 mid,
                 username,
                 content,
-                f"{decision.reason}；{action}",
+                f"私信命中安全规则：{decision.reason}；{action}"
+                + ("" if blocked else "，可在 WebUI「安全中心」一键拉黑"),
             )
             continue
 
@@ -1475,27 +1491,31 @@ def run():
                     log_security_event("negative_interaction", mid, reply["username"], reply["content"],
                         f"好感度 {current_score}→{new_score}({delta_str})，回复：{ai_reply[:50]}")
 
+                # 触发条件照常统计（block_count 继续累计），
+                # 但"是否真的拉黑"交给开关决定，默认关闭 —— 拉黑只允许人工在面板执行。
                 should_block = False
+                block_reason = ""
                 if new_score <= -30:
-                    should_block = True
-                    print(f"🔥 好感度过低（{new_score}），触发拉黑！")
+                    block_reason = f"好感度过低（{new_score}）"
 
                 if score_delta <= -3:
                     block_count = load_json("data/block_count.json", {})
                     block_count[mid] = block_count.get(mid, 0) + 1
                     save_json("data/block_count.json", block_count)
                     if block_count[mid] >= 5:
-                        should_block = True
-                        print(f"🔥 连续辱骂{block_count[mid]}次，触发拉黑！")
+                        block_reason = block_reason or f"连续辱骂{block_count.get(mid, 0)}次"
                 else:
                     block_count = load_json("data/block_count.json", {})
                     if mid in block_count:
                         block_count[mid] = 0
                         save_json("data/block_count.json", block_count)
 
-                if should_block and str(mid) != str(OWNER_MID):
+                if block_reason and auto_block_on_affection_enabled() and str(mid) != str(OWNER_MID):
+                    should_block = True
+
+                if should_block:
                     block_log = load_json("data/block_log.json", {})
-                    reason = f"好感度过低（{new_score}）" if new_score <= -30 else f"连续辱骂{block_count.get(mid, 0)}次"
+                    reason = block_reason
                     block_log[mid] = {
                         "username": reply["username"], "reason": reason,
                         "last_comment": reply["content"], "score": new_score,
@@ -1511,6 +1531,15 @@ def run():
                     replied_rpids.add(rpid)
                     save_replied(replied_rpids)
                     continue
+
+                if block_reason and str(mid) != str(OWNER_MID):
+                    # 命中自动拉黑条件但开关关闭：只记录，不拉黑，决定权留给人工
+                    log_security_event(
+                        "auto_block_suppressed", mid, reply["username"], reply["content"],
+                        f"命中拉黑阈值：{block_reason}（自动拉黑已关闭，未执行，"
+                        f"可在 WebUI「安全中心」一键拉黑）"
+                    )
+                    print(f"命中自动拉黑条件（{block_reason}），按配置未拉黑，仅记录安全日志")
 
                 success = send_reply(reply["oid"], rpid, reply["type"], ai_reply,
                                      reply.get("root_rpid"))
