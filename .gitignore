@@ -1,20 +1,42 @@
-# 配置（包含API密钥）
+# ===== 敏感配置（含 API Key / Cookie / Token）=====
 config.json
+config.local.json
+.env
+.env.*
+*.key
+*.pem
+*.token
+secrets.json
+cookies.txt
 
-# 数据目录
+# ===== 本地数据 =====
 data/
-
-# 临时文件
 temp_videos/
 temp_dynamic.png
-cookies.txt
-*.pyc
+
+# ===== Python =====
 __pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
 
-# 系统文件
-.DS_Store
-Thumbs.db
+# ===== 备份与临时产物 =====
+*.bak
+*.bak.*
+*.orig
+*.rej
+_new_style.css
 
-# 日志
+# ===== 日志 =====
 *.log
 nohup.out
+*.log.*
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
