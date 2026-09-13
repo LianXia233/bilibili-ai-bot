@@ -1,14 +1,39 @@
 # 生产部署指南
 
-面向「一台 Linux 服务器长期跑 Bot + 面板」的场景。所有地址、端口、口令一律用占位符，
-请替换为你自己的值；**不要把真实值写进仓库**。
+<div align="center">
+
+面向「一台 Linux 服务器长期跑 Bot + 面板」的场景
+
+![Platform](https://img.shields.io/badge/Platform-Linux-4B5563?style=flat-square&logo=linux&logoColor=white)
+![Init](https://img.shields.io/badge/Init-systemd-000000?style=flat-square&logo=systemd&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![TLS](https://img.shields.io/badge/TLS-required%20for%20public-0F9D58?style=flat-square&logo=letsencrypt&logoColor=white)
+
+</div>
+
+> **占位符约定**：本文所有地址、端口、账号、口令一律使用占位符（`<你的域名>`、`<强口令>` 等），请替换为你自己的值。**不要把真实值写进仓库。**
+
+## 步骤索引
+
+| 步骤 | 内容 | 是否必做 |
+|:----:|------|:--------:|
+| [1](#1-前置条件) | 前置条件 | — |
+| [2](#2-落地目录) | 落地目录 | 必做 |
+| [3](#3-依赖安装) | 依赖安装 | 必做 |
+| [4](#4-配置) | 配置 | 必做 |
+| [5](#5-systemd-服务) | systemd 服务 | 必做 |
+| [6](#6-暴露到公网必须带-tls) | 暴露到公网（必须带 TLS） | 公网访问必做 |
+| [7](#7-日志与轮转) | 日志与轮转 | 建议 |
+| [8](#8-上线自检清单) | 上线自检清单 | 必做 |
+| [9](#9-升级流程) | 升级流程 | 升级时 |
+| [10](#10-安全加固清单) | 安全加固清单 | 建议 |
 
 ---
 
 ## 1. 前置条件
 
 | 项 | 要求 |
-| --- | --- |
+|------|------|
 | 系统 | 任意主流 Linux 发行版（本文以 systemd 为例） |
 | Python | 3.10 以上（本项目在 3.13 上验证过） |
 | 网络 | 服务器能直连 B站 API 与你的模型网关 |
@@ -63,24 +88,28 @@ chmod 600 config.json          # 内含 Cookie 与 API Key
 `config.json` 至少填这几项：
 
 | 键 | 说明 |
-| --- | --- |
+|------|------|
 | `SESSDATA` / `BILI_JCT` / `DEDE_USER_ID` | B站登录凭证 |
 | `OWNER_MID` | 主人的 UID（好感度永远 100，且永不被拉黑） |
 | `OR_API_KEY` / `OR_BASE_URL` / `OR_CHAT_MODEL` | 对话模型 |
 | `EMBED_*` | 可选；不配则语义记忆检索自动降级为「最近记忆」 |
 
-面板访问口令通过环境变量注入，**不要写进 config.json**：
+面板访问口令通过环境变量注入，**不要写进 `config.json`**：
 
 ```ini
 # /etc/systemd/system/bilibili-panel.service 里的片段
 Environment=CHAT_PASSWORD=<强口令>
 ```
 
-口令优先级：`config.json` 里的 `CHAT_PASSWORD` > 环境变量 `CHAT_PASSWORD` > 默认值 `admin()`。
+口令优先级：
+
+```
+config.json 里的 CHAT_PASSWORD  >  环境变量 CHAT_PASSWORD  >  默认值 admin()
+```
+
 在面板「系统设置」里改过密码后，值会落到 `config.json`，此时环境变量不再生效。
 
-> 首次部署务必确认面板没有停留在默认口令上，
-> 可打开 `/api/auth_check` 看 `default_password` 是否为 `true`。
+> **首次部署务必确认面板没有停留在默认口令上**，可打开 `/api/auth_check` 看 `default_password` 是否为 `true`。
 
 ---
 
@@ -141,18 +170,23 @@ systemctl enable --now bilibili-panel bilibili-bot
 systemctl status bilibili-panel --no-pager
 ```
 
+> `RestartSec` 面板用 5 秒、Bot 用 10 秒：Bot 重启会重新建连 B站，间隔太短容易触发风控。
+
 ---
 
 ## 6. 暴露到公网（必须带 TLS）
 
-面板本身只监听明文 HTTP。这不是偷懒，而是刻意把 TLS 交给更专业的边界去终止；
-但**生产环境必须在面板前面放一层 TLS**，原因有二：
+面板本身只监听明文 HTTP。这不是偷懒，而是刻意把 TLS 交给更专业的边界去终止；但**生产环境必须在面板前面放一层 TLS**，原因有二：
 
-1. 明文传输口令与会话 Cookie，等于把面板交出去
-2. 浏览器的 WebCrypto 只在安全上下文（`https://` 或 `localhost`）可用，
-   没有 TLS 就没有前端口令密封，只能退回明文提交
+| 原因 | 后果 |
+|------|------|
+| 明文传输口令与会话 Cookie | 等于把面板交出去 |
+| 浏览器 WebCrypto 只在安全上下文（`https://` 或 `localhost`）可用 | 没有 TLS 就没有前端口令密封，只能退回明文提交 |
 
-### 方式一：反向代理（Nginx / Caddy）
+<details open>
+<summary><b>方式一：反向代理（Nginx / Caddy）</b></summary>
+
+<br>
 
 ```nginx
 server {
@@ -173,7 +207,12 @@ server {
 }
 ```
 
-### 方式二：内网穿透隧道
+</details>
+
+<details>
+<summary><b>方式二：内网穿透隧道</b></summary>
+
+<br>
 
 适合没有域名、或服务器 443 不可用的场景。以 frp 类客户端为例：
 
@@ -191,14 +230,13 @@ remote_port = <你的远程端口>
 auto_https = auto          # 由隧道边缘生成证书，浏览器会提示自签警告
 ```
 
-> `auto_https = auto` 用的是边缘自签证书，浏览器会报不受信任。
-> 想要不报警告，就在隧道侧绑定域名并使用受信任证书。
+> `auto_https = auto` 用的是边缘自签证书，浏览器会报不受信任。想要不报警告，就在隧道侧绑定域名并使用受信任证书。
+
+</details>
 
 ### 面板侧的反代感知
 
-面板只在「请求来自回环地址」时才采信 `X-Forwarded-Proto`，
-因此反向代理/隧道必须与面板同机（或经由本机转发），否则 `tls` 判定不会生效 ——
-这是为了避免伪造请求头骗过 HSTS 与 `Secure Cookie` 判定。
+面板只在「请求来自回环地址」时才采信 `X-Forwarded-Proto`，因此反向代理 / 隧道必须与面板同机（或经由本机转发），否则 `tls` 判定不会生效 —— 这是为了避免伪造请求头骗过 HSTS 与 `Secure Cookie` 判定。
 
 ---
 
@@ -215,7 +253,7 @@ auto_https = auto          # 由隧道边缘生成证书，浏览器会提示自
 }
 ```
 
-`copytruncate` 是必需的：服务用 `append:` 持有文件描述符直接写，不做 truncate 会一直写旧 inode。
+`copytruncate` 是**必需的**：服务用 `append:` 持有文件描述符直接写，不做 truncate 会一直写旧 inode。
 
 ---
 
@@ -242,6 +280,18 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5000/                 
 ./venv/bin/python -c "import json;c=json.load(open('config.json'));print(c.get('AUTO_BLOCK_ON_AFFECTION'), c.get('PRIVATE_MESSAGE_AUTO_BLOCK'))"
 ```
 
+预期的自检结果：
+
+| 检查项 | 期望值 |
+|--------|--------|
+| 服务状态 | `active` / `active` |
+| `5000` 端口 | 处于 `LISTEN` |
+| `/api/block_suggestions`（未登录） | `401` |
+| `/data/images/x.jpg`（未登录） | `404` |
+| `/`（登录页） | `200` |
+| `py_compile` | 无输出（即无语法错误） |
+| 自动拉黑开关 | `False False` |
+
 浏览器侧再确认三件事：能登录、能发一条消息并收到回复、侧栏「安全中心」能打开。
 
 ---
@@ -262,26 +312,27 @@ systemctl is-active bilibili-panel bilibili-bot
 tail -n 20 /var/log/bilibili-panel.log
 ```
 
-排查问题时先看日志里的真实异常：面板把未预期异常收敛成 JSON 错误返回给前端，
-前端只会显示一句「出了点问题」，真实原因一定在 `/var/log/bilibili-panel.log` 里。
+> **排查问题时先看日志里的真实异常**：面板把未预期异常收敛成 JSON 错误返回给前端，前端只会显示一句「出了点问题」，真实原因一定在 `/var/log/bilibili-panel.log` 里。
 
 ---
 
 ## 10. 安全加固清单
 
-已完成：
+### 已完成
 
-- 默认拒绝鉴权，未登录 `/api/*` 401、其余 404
-- 口令 RSA-OAEP 密封提交，明文仅作降级回退
-- 会话 Cookie `HttpOnly` + `SameSite=Lax`，`Secure` 按 TLS 动态判定
-- 会话密钥持久化 0600，重启不掉线
-- `/media/bot-avatar` 不接受文件名参数，防目录穿越
-- 拉黑动作只由人工在面板确认，Bot 不自动封人
-- `config.json` 与 `data/` 全程不入库（见 `.gitignore`）
+| 项 | 实现 |
+|----|------|
+| 鉴权 | 默认拒绝，未登录 `/api/*` 返回 `401`、其余 `404` |
+| 口令 | RSA-OAEP 密封提交，明文仅作降级回退 |
+| 会话 | Cookie `HttpOnly` + `SameSite=Lax`，`Secure` 按 TLS 动态判定 |
+| 会话密钥 | 持久化 `0600`，重启不掉线 |
+| 头像路由 | `/media/bot-avatar` 不接受文件名参数，防目录穿越 |
+| 拉黑动作 | 只由人工在面板确认，Bot 不自动封人 |
+| 敏感文件 | `config.json` 与 `data/` 全程不入库（见 `.gitignore`） |
 
-建议补充：
+### 建议补充
 
-- 面板登录失败限速（当前未实现，公网暴露时建议在反向代理层加限制）
-- 反向代理层限制来源 IP 或叠加一层 Basic Auth
-- 定期轮换 `CHAT_PASSWORD` 与 B站 Cookie
-- 服务器防火墙只放行必要端口，管理端口限制来源
+- [ ] 面板登录失败限速（当前未实现，公网暴露时建议在反向代理层加限制）
+- [ ] 反向代理层限制来源 IP 或叠加一层 Basic Auth
+- [ ] 定期轮换 `CHAT_PASSWORD` 与 B站 Cookie
+- [ ] 服务器防火墙只放行必要端口，管理端口限制来源
