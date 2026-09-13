@@ -32,5 +32,8 @@
   "BOT_SUBTITLE": "AI 聊天助手",
   "OWNER_NAME": "你的名字",
   "OWNER_BILI_NAME": "你的B站昵称",
-  "PROMPT_PRIVATE_MESSAGE": ""
+  "PROMPT_PRIVATE_MESSAGE": "",
+
+  "SLEEP_START": 24,
+  "SLEEP_END": 0
 }

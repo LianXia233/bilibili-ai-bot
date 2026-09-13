@@ -86,8 +86,8 @@ _DEFAULTS = {
     "PROACTIVE_TIMES_COUNT": 2,    # 每天触发几次主动评论
     "DYNAMIC_ENABLED": True,
     "EVOLVE_HOUR": 1,              # 性格演化时间（0-23）
-    "SLEEP_START": 2,              # 休眠开始
-    "SLEEP_END": 8,                # 休眠结束
+    "SLEEP_START": 24,              # 休眠开始
+    "SLEEP_END": 0,                # 休眠结束
 
     # ===== 权重参数 =====
     "MOOD_WEIGHT": 0.5,            # 心情对回复的影响程度 0-1
@@ -201,8 +201,8 @@ PROACTIVE_COMMENT_COUNT = _cfg.get("PROACTIVE_COMMENT_COUNT", 2)
 PROACTIVE_TIMES_COUNT = _cfg.get("PROACTIVE_TIMES_COUNT", 2)
 DYNAMIC_ENABLED = _cfg.get("DYNAMIC_ENABLED", True)
 EVOLVE_HOUR = _cfg.get("EVOLVE_HOUR", 1)
-SLEEP_START = _cfg.get("SLEEP_START", 2)
-SLEEP_END = _cfg.get("SLEEP_END", 8)
+SLEEP_START = _cfg.get("SLEEP_START", 24)
+SLEEP_END = _cfg.get("SLEEP_END", 0)
 
 # 权重
 MOOD_WEIGHT = _cfg.get("MOOD_WEIGHT", 0.5)
@@ -284,8 +284,8 @@ def reload_config():
     PROACTIVE_TIMES_COUNT = _cfg.get("PROACTIVE_TIMES_COUNT", 2)
     DYNAMIC_ENABLED = _cfg.get("DYNAMIC_ENABLED", True)
     EVOLVE_HOUR = _cfg.get("EVOLVE_HOUR", 1)
-    SLEEP_START = _cfg.get("SLEEP_START", 2)
-    SLEEP_END = _cfg.get("SLEEP_END", 8)
+    SLEEP_START = _cfg.get("SLEEP_START", 24)
+    SLEEP_END = _cfg.get("SLEEP_END", 0)
     MOOD_WEIGHT = _cfg.get("MOOD_WEIGHT", 0.5)
     ACTIVE_PERSONA = _cfg.get("ACTIVE_PERSONA", "default")
     PROMPT_DYNAMIC = _cfg.get("PROMPT_DYNAMIC", "")
@@ -344,7 +344,7 @@ def check_bili_cookie():
         url = "https://api.bilibili.com/x/web-interface/nav"
         h = {
             "Cookie": f"SESSDATA={SESSDATA}; bili_jct={BILI_JCT}; DedeUserID={DEDE_USER_ID}",
-            "User-Agent": "Mozilla/5.0"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         }
         resp = requests.get(url, headers=h, timeout=10)
         data = resp.json()
@@ -412,7 +412,7 @@ def check_need_refresh() -> tuple:
         params = {"csrf": bili_jct}
         headers = {
             "Cookie": f"SESSDATA={sessdata}; bili_jct={bili_jct}",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         }
         resp = requests.get(url, params=params, headers=headers, timeout=10)
         data = resp.json()

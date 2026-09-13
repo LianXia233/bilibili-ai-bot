@@ -111,8 +111,8 @@ USER_MEMORY_KEEP_RECENT = 5
 
 headers = {
     "Cookie": f"SESSDATA={SESSDATA}; bili_jct={BILI_JCT}; DedeUserID={DEDE_USER_ID}",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Referer": "https://www.bilibili.com"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Referer": "https://www.bilibili.com/"
 }
 
 or_client = OpenAI(
@@ -147,25 +147,67 @@ def _get_active_persona():
     # 没找到就返回默认
     return {"name": "default", "display_name": "默认", "system_prompt": "", "style_prompt": "", "owner_prompt": ""}
 
-def claude_chat(prompt, max_tokens=300):
-    resp = or_client.chat.completions.create(
-        model=OR_CHAT_MODEL,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    text = resp.choices[0].message.content.strip()
-    input_tokens = resp.usage.prompt_tokens if resp.usage else 0
-    output_tokens = resp.usage.completion_tokens if resp.usage else 0
-    return text, input_tokens, output_tokens
+def _chat_candidates():
+    """候选通道列表：(base_url, api_key, model)
+    顺序为 主模型 -> 兜底模型 -> 备用通道(OpenRouter)。"""
+    from config import get_raw_config
+    cfg = get_raw_config()
+    g_url = cfg.get("OR_BASE_URL", "") or None
+    g_key = cfg.get("OR_API_KEY", "") or None
+    out = []
+    for model in (cfg.get("OR_CHAT_MODEL", ""), cfg.get("OR_CHAT_MODEL_FALLBACK", "")):
+        if model:
+            out.append((g_url, g_key, model))
+    b_model = cfg.get("OR_BACKUP_MODEL", "")
+    if b_model:
+        out.append((cfg.get("OR_BACKUP_URL", "") or g_url,
+                    cfg.get("OR_BACKUP_KEY", "") or g_key,
+                    b_model))
+    return out
 
-# ========== 联网搜索系统 ==========
+
+_CHAT_CLIENTS = {}
+
+
+def _chat_client(base_url, api_key):
+    key = (base_url, api_key)
+    if key not in _CHAT_CLIENTS:
+        _CHAT_CLIENTS[key] = OpenAI(api_key=api_key or "EMPTY",
+                                    base_url=base_url or None, timeout=120)
+    return _CHAT_CLIENTS[key]
+
+
+def claude_chat(prompt, max_tokens=300):
+    """按 主模型 -> 兜底模型 -> 备用通道 依次尝试，任一返回非空正文即采纳。
+    非首选通道放宽 token 预算：推理型模型会先把预算消耗在推理过程上。"""
+    last_err = "未配置任何对话模型"
+    for idx, (base_url, api_key, model) in enumerate(_chat_candidates()):
+        budget = max(max_tokens, 1500) if idx > 0 else max_tokens
+        try:
+            resp = _chat_client(base_url, api_key).chat.completions.create(
+                model=model,
+                max_tokens=budget,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            choice = resp.choices[0]
+            text = (choice.message.content or "").strip()
+            if text:
+                if idx > 0:
+                    print(f"  \u21a9\ufe0f 已切换到备用模型 {model}")
+                return text, (resp.usage.prompt_tokens if resp.usage else 0), (resp.usage.completion_tokens if resp.usage else 0)
+            last_err = f"{model} 返回空正文(finish={choice.finish_reason})"
+        except Exception as e:
+            last_err = f"{model}: {str(e)[:120]}"
+    print(f"  \u26a0\ufe0f 对话模型全部失败（{last_err}）")
+    return "", 0, 0
+
 SEARCH_KEYWORDS = [
-    "最近", "最新",
+    "最近", "最新", "今天", "昨天", "现在", "目前", "当前",
     "新闻", "热搜", "热门", "发生了什么", "怎么回事",
     "什么时候", "多少钱", "价格", "股价", "天气",
     "谁赢了", "比分", "比赛", "选举", "发布",
     "上映", "更新", "版本", "公告", "通知",
-    "真的吗", "是真的吗", "听说","是什么","怎么办",
+    "真的吗", "是真的吗", "听说", "搜一下", "查一下", "帮我查",
 ]
 
 def needs_search(text):
@@ -497,9 +539,21 @@ def get_festival_prompt():
     return festivals.get(today, "") or lunar_festivals.get(lunar_md, "")
 
 # ========== 向量记忆系统 ==========
+_EMBED_AVAILABLE = True
+
 def get_embedding(text):
-    resp = embed_client.embeddings.create(model="BAAI/bge-m3", input=text)
-    return resp.data[0].embedding
+    """获取文本向量。Embedding 不可用时自动降级为空列表，
+    仅影响记忆语义检索，不影响评论/私信的回复与发送。"""
+    global _EMBED_AVAILABLE
+    if not _EMBED_AVAILABLE:
+        return []
+    try:
+        resp = embed_client.embeddings.create(model="BAAI/bge-m3", input=text)
+        return resp.data[0].embedding
+    except Exception as e:
+        _EMBED_AVAILABLE = False
+        print("⚠️ Embedding 不可用，已自动禁用语义记忆检索（不影响评论/私信回复）：" + str(e)[:100])
+        return []
 
 def cosine_similarity(a, b):
     dot = sum(x * y for x, y in zip(a, b))
@@ -903,10 +957,14 @@ def get_new_replies():
     replies = []
     for item in items:
         r = item["item"]
+        _root_rpid = r.get("root_id") or r["source_id"]
         replies.append({
             "rpid":      r["source_id"],
+            "root_rpid": _root_rpid,
             "oid":       r["subject_id"],
-            "thread_id": r.get("root_id") or r["source_id"],
+            # 按「评论串 + 用户」隔离：同一串下不同用户互不串台，
+            # 同一用户的连续对话仍保留上下文
+            "thread_id": f"{_root_rpid}:{item['user']['mid']}",
             "type":      r["business_id"],
             "content":   r["source_content"],
             "username":  item["user"]["nickname"],
@@ -1041,11 +1099,13 @@ impression简短描述用户性格/说话风格，如"友善健谈，喜欢聊�
         result.get("user_facts", [])
     )
 
-def send_reply(oid, rpid, content_type, reply_text):
+def send_reply(oid, rpid, content_type, reply_text, root_rpid=None):
     url = "https://api.bilibili.com/x/v2/reply/add"
     data = {
         "oid": oid, "type": content_type,
-        "root": rpid, "parent": rpid,
+        # root=所属评论串的根评论，parent=被回复的那条评论，
+        # 保证回复挂在正确楼层、归属正确的对话串
+        "root": root_rpid or rpid, "parent": rpid,
         "message": reply_text, "csrf": BILI_JCT
     }
     resp = requests.post(url, headers=headers, data=data)
@@ -1444,14 +1504,16 @@ def run():
                     save_json("data/block_log.json", block_log)
                     log_security_event("user_blocked", mid, reply["username"], reply["content"],
                         f"原因：{reason}，好感度：{new_score}")
-                    send_reply(reply["oid"], rpid, reply["type"], "我不想和你说话了。")
+                    send_reply(reply["oid"], rpid, reply["type"], "我不想和你说话了。",
+                               reply.get("root_rpid"))
                     block_user(int(mid))
                     print(f"🚫 已拉黑用户 {reply['username']}（{mid}）| 原因：{reason}")
                     replied_rpids.add(rpid)
                     save_replied(replied_rpids)
                     continue
 
-                success = send_reply(reply["oid"], rpid, reply["type"], ai_reply)
+                success = send_reply(reply["oid"], rpid, reply["type"], ai_reply,
+                                     reply.get("root_rpid"))
 
                 if success:
                     save_memory_record(memory, rpid, thread_id, mid, reply["username"], reply["content"], ai_reply)
@@ -1473,6 +1535,8 @@ def run():
 
         except Exception as e:
             print(f"⚠️ 出错了：{e}，30秒后重试...")
+            import traceback
+            traceback.print_exc()
             time.sleep(30)
 
 if __name__ == "__main__":
