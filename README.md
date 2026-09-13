@@ -354,3 +354,5 @@ A: 检查以下几点：
 ## 修复记录
 
 本仓库在原始项目基础上做了若干修复，详见 [FIXES.md](FIXES.md)。
+
+更新日志见 [CHANGELOG.md](CHANGELOG.md)，修复细节见 [FIXES.md](FIXES.md)。
