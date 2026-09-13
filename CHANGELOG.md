@@ -3,6 +3,8 @@
 本仓库 fork 自 [chenluQwQ/bilibili-ai-bot](https://github.com/chenluQwQ/bilibili-ai-bot)，
 本文件记录相对上游的变更。格式参考 Keep a Changelog，提交信息遵循 Conventional Commits。
 
+这里是本项目**唯一的更新日志文件**；问题根因与排查手法另见 [FIXES.md](FIXES.md)。
+
 ## [2026-09-14]
 
 ### fix(bot) — 修复私信与评论完全不回复等问题
