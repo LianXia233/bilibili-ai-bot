@@ -1,8 +1,29 @@
 <!DOCTYPE html>
 
-<html lang="zh-CN" style="background:#0d1117;">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="UTF-8">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" type="image/svg+xml" href="static/img/logo/triangles.svg">
+<script>
+/* 主题初始化：置于 head 首部同步执行，避免首帧主题闪烁。
+   与参考站一致——暗色即根元素上的一个标记（此处用 data-theme="dark"）。
+   优先级：localStorage 手动选择 > 系统偏好。 */
+(function () {
+  var t = null;
+  try { t = localStorage.getItem('ba-theme'); } catch (e) {}
+  if (t !== 'dark' && t !== 'light') {
+    t = (window.matchMedia &&
+         window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+  }
+  document.documentElement.setAttribute('data-theme', t);
+})();
+/* 品牌三角标记：与侧边栏 Logo 同源，供 JS 兜底头像复用 */
+function brandMarkSvg(w, h) {
+  return '<svg viewBox="0 0 48 42" width="' + w + '" height="' + h + '" '
+    + 'fill="currentColor" aria-hidden="true">' + '<path d="M24 2 34 19H14Z"></path><path d="m12 22 10 17H2Z"></path><path d="M36 22 46 39H26Z"></path><path d="M14 21h20L24 38Z"></path>' + '</svg>';
+}
+</script>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>本地聊天</title>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
@@ -63,12 +84,38 @@
   --shadow-soft: 4px 5px rgba(53, 157, 214, 0.08);
   --shadow-lift: 8px 8px rgba(28, 154, 211, 0.16), 0 12px 50px rgba(52, 125, 162, 0.13);
 
+  /* ---- Logo 配色（对齐参考站 --logo-blue / --logo-ink）---- */
+  --logo-blue: #1289f9;
+  --logo-ink: #2b2b2b;
+
+  /* ---- 壁纸：亮色 / 暗色 x 桌面 / 移动，共四套 ----
+     切换只发生在变量层：
+       主题切换 -> 换 --wallpaper-desktop / --wallpaper-mobile 这一对
+       设备切换 -> 换 --wallpaper 取哪一套（见文件底部 767px 断点）
+     规则层零改动，因此切主题、转屏幕都自动生效。 */
+  --wallpaper-light-desktop: url("static/img/wallpaper/light-desktop.webp");
+  --wallpaper-light-mobile: url("static/img/wallpaper/light-mobile.webp");
+  --wallpaper-dark-desktop: url("static/img/wallpaper/dark-desktop.webp");
+  --wallpaper-dark-mobile: url("static/img/wallpaper/dark-mobile.webp");
+  --wallpaper-desktop: var(--wallpaper-light-desktop);
+  --wallpaper-mobile: var(--wallpaper-light-mobile);
+  --wallpaper: var(--wallpaper-desktop);
+  --wallpaper-opacity: 1;
+
+  /* 人物立绘在主界面里的水印强度（登录页另有一套，见 .login-char） */
+  --char-opacity: 0.30;
+
   /* 深色偏好：只覆盖变量值，规则层零改动 */
   color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
+/* ============================================================
+   暗色主题：html[data-theme="dark"]
+   与参考站 .dark 同理——只覆盖变量值，规则层零改动。
+   系统偏好已在 head 首部同步解析并写入 data-theme，
+   故此处只需属性选择器，无需再叠一层 @media。
+   ============================================================ */
+html[data-theme="dark"] {
     --ice-blue: #61c9f4;
     --ice-dark: #29a9e1;
     --ice-light: #1b3c52;
@@ -102,9 +149,16 @@
     --warning: #f0c674;
     --warning-soft: rgba(240, 198, 116, 0.12);
     --shadow-soft: 4px 5px rgba(0, 0, 0, 0.35);
-    --shadow-lift: 8px 8px rgba(0, 0, 0, 0.4), 0 12px 50px rgba(0, 0, 0, 0.35);
-    color-scheme: dark;
-  }
+  --shadow-lift: 8px 8px rgba(0, 0, 0, 0.4), 0 12px 50px rgba(0, 0, 0, 0.35);
+
+  /* Logo 与壁纸：暗色换另一套（参考站 .dark .archive-title__title 的 --logo-blue）*/
+  --logo-blue: #58bcff;
+  --logo-ink: #e5eff7;
+  --wallpaper-desktop: var(--wallpaper-dark-desktop);
+  --wallpaper-mobile: var(--wallpaper-dark-mobile);
+  /* 深底上浅色线稿本来就比亮底更难看清，暗色再提一档 */
+  --char-opacity: 0.34;
+  color-scheme: dark;
 }
 
 /* html 上存在内联 background:#0d1117，需强制覆盖 */
@@ -120,8 +174,32 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* 全局背景光效：淡蓝晕染 + 纸感网格 */
+/* ============================================================
+   壁纸层（body::before）
+   亮/暗 x 桌面/移动 的整套切换都落在 CSS 变量上：
+     html[data-theme="dark"] -> 换 --wallpaper-desktop / --wallpaper-mobile
+     @media (max-width:767px) -> 换 --wallpaper 取哪一套
+   规则层零改动，所以切主题、转屏幕都自动生效。
+   资源尺寸对齐参考站：桌面 1920x1080、移动 750x1334
+   （与参考站 loading-desktop / loading-mobile 同比例）。
+   参考站原图按 1440px 810px 平铺；本图已把渐变与三角网格烘焙进单张图片，
+   故改用 cover 裁切，纹理视觉密度与原站一致。
+   ============================================================ */
 body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: var(--wallpaper);
+  background-size: cover;
+  background-position: center top;
+  background-repeat: no-repeat;
+  pointer-events: none;
+  z-index: 0;
+  opacity: var(--wallpaper-opacity);
+}
+
+/* 全局背景光效：淡蓝晕染（叠于壁纸之上，对应参考站 hero 的柔光） */
+body::after {
   content: '';
   position: fixed;
   top: -20%; left: -10%; right: -10%; bottom: -20%;
@@ -132,6 +210,130 @@ body::before {
   pointer-events: none;
   z-index: 0;
   animation: bgBreathing 15s ease-in-out infinite alternate;
+}
+
+/* 设备切换：767px 以下改用 750x1334 移动壁纸（与参考站断点一致） */
+@media (max-width: 767px) {
+  :root { --wallpaper: var(--wallpaper-mobile); }
+}
+
+/* ============================================================
+   人物壁纸层（复刻参考站四种人物素材）
+   亮色 -> 阿罗娜 Arona      暗色 -> 普拉娜 Plana
+   每个角色两件素材：*-touch.webp 立绘 + *-expressions.webp 2 帧表情条
+   表情条尺寸恰好是立绘的等比切片（实测 406x236 / 180x135），
+   按参考站量得的百分比盖回眼睛位置，用 opacity 时序做出眨眼。
+   两种角色同时存在于 DOM，靠 data-theme 切 display，无需 JS。
+   ============================================================ */
+.char-wallpaper {
+  position: fixed;
+  inset: 0;
+  z-index: 0;                 /* 与 body::before / ::after 同层，按 DOM 顺序盖在其上 */
+  pointer-events: none;       /* 纯装饰，不吃点击 */
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+}
+
+.char-figure {
+  position: relative;
+  flex: none;
+  aspect-ratio: 1 / 1;        /* 立绘是正方形，表情条的百分比才有意义 */
+  width: min(52vw, 720px);
+  margin: 0 -3vw -7vh 0;      /* 往右下出血，避免生硬的直角边 */
+  opacity: var(--char-opacity);
+}
+
+/* 主界面里做水印：向左渐隐，避免和右侧卡片打架 */
+.char-wallpaper:not(.login-char) .char-figure {
+  -webkit-mask-image: linear-gradient(to left, #000 0 62%, rgba(0, 0, 0, 0.55) 86%, transparent 100%);
+          mask-image: linear-gradient(to left, #000 0 62%, rgba(0, 0, 0, 0.55) 86%, transparent 100%);
+}
+
+.char-figure > .char-art {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  filter: drop-shadow(-16px 15px 24px rgba(35, 118, 153, 0.07));
+  animation: charFloat 7s ease-in-out infinite;
+}
+
+/* 表情条：盖回眼睛位置。百分比取自参考站 .expressionRegion
+   阿罗娜 left 45.2951% top 26.1563% 32.3764%x18.8198%
+   普拉娜 left 63.7959% top 39.8724% 14.3541%x10.7656% */
+.char-expr {
+  position: absolute;
+  left: 45.2951%;
+  top: 26.1563%;
+  width: 32.3764%;
+  height: 18.8198%;
+}
+
+.char-expr > i {
+  position: absolute;
+  inset: 0;
+  background-repeat: no-repeat;
+  background-size: 200% 100%;   /* 2 帧横向排列 */
+  opacity: 0;                   /* 默认不显，露出立绘本身的睁眼 */
+  animation: charBlinkHalf 6.4s steps(1, end) infinite;
+}
+
+.char-expr .expr-half   { background-position-x: 0%; }    /* 第 1 帧：半睁 */
+.char-expr .expr-closed { background-position-x: 100%; }  /* 第 2 帧：闭合 */
+.char-expr .expr-closed { animation-name: charBlinkClosed; }
+
+.char-light .char-expr > i { background-image: url("static/img/character/arona-expressions.webp"); }
+.char-dark  .char-expr > i { background-image: url("static/img/character/plana-expressions.webp"); }
+.char-dark  .char-expr {
+  left: 63.7959%;
+  top: 39.8724%;
+  width: 14.3541%;
+  height: 10.7656%;
+}
+
+.char-dark { display: none; }
+html[data-theme="dark"] .char-light { display: none; }
+html[data-theme="dark"] .char-dark  { display: block; }
+
+@keyframes charFloat {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-5px); }
+}
+/* 眨眼时序：静止 91.5% -> 半睁 2% -> 闭合 3% -> 回到静止 */
+@keyframes charBlinkHalf {
+  0%, 91.4%      { opacity: 0; }
+  91.5%, 93.4%   { opacity: 1; }
+  93.5%, 100%    { opacity: 0; }
+}
+@keyframes charBlinkClosed {
+  0%, 93.4%      { opacity: 0; }
+  93.5%, 96.4%   { opacity: 1; }
+  96.5%, 100%    { opacity: 0; }
+}
+
+/* 登录遮罩里的人物：同一套素材，放大到完整呈现 */
+.login-char { position: absolute; }
+.login-char .char-figure {
+  width: min(56vw, 640px);
+  margin: 0 -2vw -6vh 0;
+  opacity: 0.98;
+}
+/* 遮罩内的表单需要压在人物之上 */
+#loginOverlay > div:not(.login-char),
+#loginOverlay > p { position: relative; z-index: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .char-figure > .char-art { animation: none; }
+  .char-expr > i { animation: none; }
+}
+
+/* 移动端：立绘缩小压暗，只留氛围不抢内容 */
+@media (max-width: 767px) {
+  .char-figure { width: min(78vw, 380px); margin: 0 -8vw -4vh 0; }
+  .char-wallpaper:not(.login-char) .char-figure { opacity: calc(var(--char-opacity) * 0.85); }
+  .login-char .char-figure { width: min(92vw, 420px); margin: 0 -10vw -2vh 0; opacity: 0.42; }
 }
 
 @keyframes bgBreathing {
@@ -203,6 +405,50 @@ body::before {
   margin-top: 6px;
 }
 
+/* 品牌行：参考站 schale-brand —— 三角标记 + 标题 */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* 参考站 .loading-module__triangles：30x27、色 #1289f9、路径 opacity .65 +
+   flash 动画，逐条 0/.15/.3/.45s 延迟（1.2s：0%,65%,100% -> .15；30% -> 1）*/
+.brand-mark {
+  width: 30px;
+  height: 27px;
+  flex-shrink: 0;
+  overflow: visible;
+  color: var(--logo-blue);
+}
+
+.brand-mark path {
+  fill: currentColor;
+  opacity: 0.65;
+  animation: triFlash 1.2s ease-in-out infinite;
+}
+
+.brand-mark path:nth-child(2) { animation-delay: 0.15s; }
+.brand-mark path:nth-child(3) { animation-delay: 0.3s; }
+.brand-mark path:nth-child(4) { animation-delay: 0.45s; }
+
+@keyframes triFlash {
+  0%, 65%, 100% { opacity: 0.15; }
+  30% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-mark path { animation: none; opacity: 0.85; }
+}
+
+.brand-text {
+  min-width: 0;
+}
+
+.brand-text p {
+  margin-top: 4px;
+}
+
 .sidebar-nav {
   padding: 14px 12px;
   flex: 1;
@@ -270,7 +516,38 @@ body::before {
   border-radius: 0 3px 3px 0;
 }
 
-.nav-item .icon { font-size: 18px; width: 24px; text-align: center; }
+/* 图标槽位：由 Emoji 改为内联 Lucide SVG，尺寸与参考站图标规范一致
+   （viewBox 0 0 24 24 / stroke-width 2 / stroke currentColor）*/
+.nav-item .icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+/* 侧栏角标：用在「安全中心」上，提示有 N 条待确认的拉黑建议 */
+.nav-item .nav-badge {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: #c0392b;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.icon svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
 
 .sidebar-footer {
   padding: 14px 20px 16px;
@@ -281,6 +558,41 @@ body::before {
   background: var(--muted);
   line-height: 1.7;
 }
+
+/* 主题切换：参考站亮/暗各有一套美术资源（arona 亮 / plana 暗），
+   此处以 sun / moon 图标组表达同一语义 */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 10px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--primary);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.2s var(--ease), box-shadow 0.2s var(--ease);
+}
+
+.theme-toggle:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-hard);
+}
+
+.theme-toggle svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+
+.theme-toggle .icon-moon { display: none; }
+
+html[data-theme="dark"] .theme-toggle .icon-sun { display: none; }
+html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
 
 /* ============================================================
    主内容区
@@ -712,6 +1024,12 @@ body::before {
   transition: background 0.18s var(--ease);
 }
 .mobile-menu-btn:hover { background: var(--secondary); }
+
+.mobile-menu-btn svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
 
 /* ===== 模态框遮罩 ===== */
 .modal-overlay {
@@ -1216,17 +1534,41 @@ body::before {
 </head>
 <body>
 
+<!-- 人物壁纸层：亮色阿罗娜 / 暗色普拉娜，随主题切换，纯装饰不参与交互 -->
+<div class="char-wallpaper" aria-hidden="true">
+  <div class="char-figure char-light">
+    <img class="char-art" src="static/img/character/arona-touch.webp" alt="" width="1254" height="1254" decoding="async">
+    <span class="char-expr"><i class="expr-half"></i><i class="expr-closed"></i></span>
+  </div>
+  <div class="char-figure char-dark">
+    <img class="char-art" src="static/img/character/plana-touch.webp" alt="" width="1254" height="1254" decoding="async">
+    <span class="char-expr"><i class="expr-half"></i><i class="expr-closed"></i></span>
+  </div>
+</div>
+
 <!-- 登录遮罩 -->
 <div id="loginOverlay" style="
   position:fixed; top:0; left:0; right:0; bottom:0;
-  background:var(--bg-dark); z-index:9999;
+  background:color-mix(in srgb, var(--bg-dark) 78%, transparent);
+  backdrop-filter:blur(3px); -webkit-backdrop-filter:blur(3px); z-index:9999;
   display:none; align-items:center; justify-content:center;
   flex-direction:column; gap:20px;
 ">
+  <div class="char-wallpaper login-char" aria-hidden="true">
+  <div class="char-figure char-light">
+    <img class="char-art" src="static/img/character/arona-touch.webp" alt="" width="1254" height="1254" decoding="async">
+    <span class="char-expr"><i class="expr-half"></i><i class="expr-closed"></i></span>
+  </div>
+  <div class="char-figure char-dark">
+    <img class="char-art" src="static/img/character/plana-touch.webp" alt="" width="1254" height="1254" decoding="async">
+    <span class="char-expr"><i class="expr-half"></i><i class="expr-closed"></i></span>
+  </div>
+  </div>
   <div style="text-align:center;">
-    <div style="font-size:48px; margin-bottom:12px;" id="loginAvatar">🤖</div>
+    <div style="margin-bottom:12px;line-height:1;color:var(--logo-blue);" id="loginAvatar"><svg class="login-mark" viewBox="0 0 48 42" width="48" height="42" aria-hidden="true" focusable="false"><path d="M24 2 34 19H14Z"></path><path d="m12 22 10 17H2Z"></path><path d="M36 22 46 39H26Z"></path><path d="M14 21h20L24 38Z"></path></svg></div>
     <h1 style="font-size:22px; color:var(--ice-blue); font-weight:500; letter-spacing:2px;" id="loginTitle">本地聊天</h1>
-    <p style="font-size:13px; color:var(--text-dim); margin-top:6px;">请输入访问密码（默认：admin()）</p>
+    <p style="font-size:13px; color:var(--text-dim); margin-top:6px;">请输入访问密码以继续</p>
+    <p id="loginHint" style="display:none; font-size:12px; color:var(--warning); margin-top:8px; max-width:340px; line-height:1.6;"></p>
   </div>
   <div style="display:flex; gap:10px; align-items:center;">
     <input type="password" id="loginPassword" placeholder="密码..." 
@@ -1248,36 +1590,50 @@ body::before {
 <div class="app">
   <div class="sidebar">
     <div class="sidebar-header">
-      <h1 id="sidebarTitle">🤖 Bot</h1>
-      <p>本地聊天 · 共享记忆</p>
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 48 42" width="30" height="27" aria-hidden="true" focusable="false"><path d="M24 2 34 19H14Z"></path><path d="m12 22 10 17H2Z"></path><path d="M36 22 46 39H26Z"></path><path d="M14 21h20L24 38Z"></path></svg>
+        <div class="brand-text">
+          <h1 id="sidebarTitle">Bot</h1>
+          <p>本地聊天 · 共享记忆</p>
+        </div>
+      </div>
     </div>
     <div class="sidebar-nav">
       <div class="nav-item active" onclick="switchPanel('chat')">
-        <span class="icon">💬</span> 聊天
+        <span class="icon"><svg class="lucide lucide-message-square" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z" /></svg></span> 聊天
       </div>
       <div class="nav-item" onclick="switchPanel('summary')">
-        <span class="icon">📋</span> 快捷总结
+        <span class="icon"><svg class="lucide lucide-book-open" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 7v14" /> <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" /></svg></span> 快捷总结
       </div>
       <div class="nav-item" onclick="switchPanel('persona')">
-        <span class="icon">🎭</span> 人格管理
+        <span class="icon"><svg class="lucide lucide-user-round" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="8" r="5" /> <path d="M20 21a8 8 0 0 0-16 0" /></svg></span> 人格管理
       </div>
       <div class="nav-item" onclick="switchPanel('users')">
-        <span class="icon">👥</span> 用户管理
+        <span class="icon"><svg class="lucide lucide-users" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /> <path d="M16 3.128a4 4 0 0 1 0 7.744" /> <path d="M22 21v-2a4 4 0 0 0-3-3.87" /> <circle cx="9" cy="7" r="4" /></svg></span> 用户管理
+      </div>
+      <div class="nav-item" onclick="switchPanel('security')">
+        <span class="icon"><svg class="lucide lucide-shield" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" /></svg></span> 安全中心
+        <span class="nav-badge" id="secNavBadge" style="display:none;">0</span>
       </div>
       <div class="nav-item" onclick="switchPanel('memory')">
-        <span class="icon">🧠</span> 记忆管理
+        <span class="icon"><svg class="lucide lucide-database" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><ellipse cx="12" cy="5" rx="9" ry="3" /> <path d="M3 5V19A9 3 0 0 0 21 19V5" /> <path d="M3 12A9 3 0 0 0 21 12" /></svg></span> 记忆管理
       </div>
       <div class="nav-item" onclick="switchPanel('personality')">
-        <span class="icon">🌱</span> 成长日志
+        <span class="icon"><svg class="lucide lucide-sprout" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M14 9.536V7a4 4 0 0 1 4-4h1.5a.5.5 0 0 1 .5.5V5a4 4 0 0 1-4 4 4 4 0 0 0-4 4c0 2 1 3 1 5a5 5 0 0 1-1 3" /> <path d="M4 9a5 5 0 0 1 8 4 5 5 0 0 1-8-4" /> <path d="M5 21h14" /></svg></span> 成长日志
       </div>
       <div class="nav-item" onclick="switchPanel('activity')">
-        <span class="icon">📺</span> 活动日志
+        <span class="icon"><svg class="lucide lucide-activity" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2" /></svg></span> 活动日志
       </div>
       <div class="nav-item" onclick="switchPanel('settings')">
-        <span class="icon">⚙</span> 系统设置
+        <span class="icon"><svg class="lucide lucide-settings" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" /> <circle cx="12" cy="12" r="3" /></svg></span> 系统设置
       </div>
     </div>
     <div class="sidebar-footer">
+      <button class="theme-toggle" id="themeToggle" type="button" onclick="toggleTheme()" aria-pressed="false">
+        <svg class="lucide lucide-sun icon-sun" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4" /> <path d="M12 2v2" /> <path d="M12 20v2" /> <path d="m4.93 4.93 1.41 1.41" /> <path d="m17.66 17.66 1.41 1.41" /> <path d="M2 12h2" /> <path d="M20 12h2" /> <path d="m6.34 17.66-1.41 1.41" /> <path d="m19.07 4.93-1.41 1.41" /></svg>
+        <svg class="lucide lucide-moon icon-moon" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401" /></svg>
+        <span id="themeToggleText">亮色</span>
+      </button>
       <div class="status-bar" style="justify-content:center;margin-bottom:4px;">
         <span class="status-dot checking" id="sidebarStatusDot"></span>
         <span id="sidebarStatusText">检测后端...</span>
@@ -1291,7 +1647,7 @@ body::before {
     <div id="panel-chat" class="panel active">
       <div class="chat-panel">
         <div class="chat-header">
-          <button class="mobile-menu-btn" onclick="toggleSidebar()">☰</button>
+          <button class="mobile-menu-btn" type="button" onclick="toggleSidebar()" aria-label="打开导航"><svg class="lucide lucide-menu" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 5h16" /> <path d="M4 12h16" /> <path d="M4 19h16" /></svg></button>
           <div class="avatar" id="chatAvatar">🤖</div>
           <div class="chat-header-info">
             <h2 id="chatBotName">Bot</h2>
@@ -1433,10 +1789,19 @@ body::before {
 <!-- 安全日志面板 -->
 <div id="panel-security" class="panel">
   <div class="panel-header">
-    <h2>🛡️ 安全日志</h2>
-    <p>好感度异常变化、关键词拦截、拉黑事件记录</p>
+    <h2>🛡️ 安全中心</h2>
+    <p>自动拉黑已关闭：命中拉黑阈值的用户只生成建议，是否拉黑由你决定</p>
   </div>
   <div class="panel-content">
+    <div id="blockSuggestCard" style="display:none;margin-bottom:22px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+        <div style="font-size:14px;font-weight:600;color:var(--text-main);">待确认的拉黑建议 <span id="blockSuggestCount" style="color:var(--ice-blue)"></span></div>
+        <button class="summary-btn" style="margin:0" onclick="loadBlockSuggestions()">刷新</button>
+      </div>
+      <p style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:10px;">这些用户命中了拉黑条件（好感度过低 / 连续负反馈 / 私信安全规则），但 Bot 不会自动拉黑。点「拉黑」才会真正调用 B 站接口。</p>
+      <div id="blockSuggestList"></div>
+    </div>
+    <h3 style="font-size:14px;font-weight:600;color:var(--text-main);margin:0 0 10px;">安全事件日志</h3>
     <div id="securityList"></div>
     <div id="securityPager" style="margin-top:16px;text-align:center;"></div>
   </div>
@@ -2168,13 +2533,79 @@ function toast(msg, type = 'info', duration = 2500) {
 }
 
 // ===== 登录验证 =====
+// 仅在「确实仍在使用默认密码」时给出一次性提醒；
+// 已改密则不显示任何默认密码字样（旧版把默认密码写死在页面上，会误导用户）。
+function renderLoginHint(stillDefault) {
+  const el = document.getElementById('loginHint');
+  if (!el) return;
+  if (stillDefault) {
+    el.textContent = '当前仍在使用默认密码，登录后请立即在「系统设置」中修改。';
+    el.style.display = 'block';
+  } else {
+    el.textContent = '';
+    el.style.display = 'none';
+  }
+}
+
+// ===== 口令密封（RSA-OAEP-SHA256）=====
+// 为什么这件事必须先有 HTTPS：浏览器只在安全上下文（https:// 或 localhost）
+// 才暴露 WebCrypto（crypto.subtle）。用明文 HTTP 从公网访问时它是 undefined，
+// 前端连一个可用的加密原语都拿不到。所以这里先探测能力：
+//   拿得到 -> 密码加密后上行，链路上不出现明文口令；
+//   拿不到 -> 返回 null，调用方回退明文提交，绝不把用户挡在门外。
+var MZ_SEAL_PUB = null;   // null=未探测  false=已确认不可用  CryptoKey=可用
+
+async function mzSealPubKey() {
+  if (MZ_SEAL_PUB !== null) return MZ_SEAL_PUB;
+  try {
+    if (!window.crypto || !window.crypto.subtle) { MZ_SEAL_PUB = false; return false; }
+    const resp = await fetch('/api/handshake', {cache: 'no-store'});
+    const data = await resp.json();
+    if (!data || !data.pubkey) { MZ_SEAL_PUB = false; return false; }
+    const der = Uint8Array.from(atob(data.pubkey), c => c.charCodeAt(0));
+    MZ_SEAL_PUB = await crypto.subtle.importKey(
+      'spki', der, {name: 'RSA-OAEP', hash: 'SHA-256'}, false, ['encrypt']);
+  } catch (e) {
+    MZ_SEAL_PUB = false;
+  }
+  return MZ_SEAL_PUB;
+}
+
+async function mzSeal(text) {
+  const key = await mzSealPubKey();
+  if (!key) return null;
+  try {
+    const ct = await crypto.subtle.encrypt(
+      {name: 'RSA-OAEP'}, key, new TextEncoder().encode(text));
+    const bytes = new Uint8Array(ct);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  } catch (e) {
+    return null;
+  }
+}
+
+// 传输层不是 HTTPS 时，明确告知"浏览器没给加密能力"，不假装已加密
+function renderSecurityHint(data) {
+  if (!data || data.tls !== false) return;
+  const el = document.getElementById('loginHint');
+  if (!el) return;
+  const extra = '当前连接为明文 HTTP，浏览器在该环境下不提供加密能力，密码只能明文提交；建议改用 HTTPS 地址访问。';
+  el.textContent = el.textContent ? el.textContent + ' ' + extra : extra;
+  el.style.display = 'block';
+}
+
 async function checkAuth() {
   try {
     const resp = await fetch('/api/auth_check');
     const data = await resp.json();
+    renderLoginHint(data.default_password);
+    renderSecurityHint(data);
     if (data.authed) {
       document.getElementById('loginOverlay').style.display = 'none';
       loadChatHistory();
+      refreshBlockSuggestBadge();
     } else {
       document.getElementById('loginOverlay').style.display = 'flex';
       document.getElementById('loginPassword').focus();
@@ -2189,16 +2620,21 @@ async function doLogin() {
   const errEl = document.getElementById('loginError');
   if (!pwd) { errEl.textContent = '请输入密码'; errEl.style.display = 'block'; return; }
   try {
+    // 优先走密封通道：密码在浏览器内先用服务端公钥做 RSA-OAEP，链路上只有密文
+    const sealed = await mzSeal(pwd);
     const resp = await fetch('/api/login', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({password: pwd})
+      body: JSON.stringify(sealed ? {sealed: sealed} : {password: pwd})
     });
     const data = await resp.json();
     if (data.ok) {
       document.getElementById('loginOverlay').style.display = 'none';
       loadChatHistory();
+      refreshBlockSuggestBadge();
     } else {
+      // 400 通常是服务端换过密封密钥导致旧公钥失效：清掉缓存，下次点击自动重新握手
+      if (resp.status === 400) MZ_SEAL_PUB = null;
       errEl.textContent = data.error || '密码错误';
       errEl.style.display = 'block';
       document.getElementById('loginPassword').value = '';
@@ -2221,9 +2657,9 @@ function isAvatarUrl(val) {
 }
 
 function renderAvatarInner(val) {
-  if (!val || val.trim() === '') return '🤖';
+  if (!val || val.trim() === '') return brandMarkSvg(26, 23);
   if (isAvatarUrl(val)) {
-    return `<img src="${val}" alt="头像" onerror="this.parentElement.textContent='🤖'">`;
+    return `<img src="${val}" alt="头像" onerror="this.parentElement.innerHTML=brandMarkSvg(26, 23)">`;
   }
   return val;
 }
@@ -2416,7 +2852,7 @@ function switchPanel(name) {
   if (name === 'users') loadUsers();
   if (name === 'blocks') loadBlocks();
   if (name === 'memory') loadMemory(1);
-  if (name === 'security') loadSecurity(1);
+  if (name === 'security') { loadBlockSuggestions(); loadSecurity(1); }
   if (name === 'permanent') loadPermanent();
   if (name === 'cost') loadCost();
   if (name === 'proactive') loadProactive();
@@ -2789,9 +3225,95 @@ async function deleteMemory(id) {
   try { await fetch('/api/memory/delete', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: id}) }); loadMemory(memPage); } catch(e) { toast('删除失败', 'error'); }
 }
 
+// ===== 拉黑建议（自动拉黑已关闭，改为人工确认）=====
+let blockSuggestCache = {};
+
+function setSecBadge(n) {
+  const b = document.getElementById('secNavBadge');
+  if (!b) return;
+  if (n > 0) { b.textContent = n > 99 ? '99+' : String(n); b.style.display = ''; }
+  else { b.style.display = 'none'; }
+}
+
+async function loadBlockSuggestions() {
+  const card = document.getElementById('blockSuggestCard');
+  if (!card) return 0;
+  try {
+    const resp = await apiFetch('/api/block_suggestions');
+    const data = await resp.json();
+    const items = data.suggestions || [];
+    blockSuggestCache = {};
+    items.forEach(s => { blockSuggestCache[String(s.uid)] = s; });
+    setSecBadge(items.length);
+    if (!items.length) { card.style.display = 'none'; return 0; }
+    card.style.display = 'block';
+    document.getElementById('blockSuggestCount').textContent = '(' + items.length + ')';
+    document.getElementById('blockSuggestList').innerHTML = items.map(s => {
+      const safe = String(s.uid).replace(/[^0-9A-Za-z_-]/g, '');
+      const samples = (s.samples || []).map(c =>
+        `<div style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-top:2px;">· ${escapeHtml(c)}</div>`).join('');
+      return `
+      <div class="user-card" style="flex-direction:column;align-items:stretch;gap:8px;border-left:3px solid #f0c674;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+          <div style="font-size:13px;color:var(--text-main);">
+            <span style="color:var(--ice-blue);font-weight:600;">${escapeHtml(s.username || '未知')}</span>
+            <span style="color:var(--text-dim)">(UID:${escapeHtml(String(s.uid))})</span>
+            <span style="color:var(--text-dim);margin-left:6px;">${escapeHtml(s.source || '')}</span>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <button class="summary-btn" style="margin:0;background:#c0392b;border-color:#c0392b;color:#fff;" onclick="blockSuggestedUser('${safe}')">拉黑</button>
+            <button class="summary-btn" style="margin:0" onclick="dismissBlockSuggestion('${safe}')">忽略</button>
+          </div>
+        </div>
+        <div style="font-size:12px;color:var(--text-dim);line-height:1.6;">命中 ${s.hits} 次 · 最近 ${escapeHtml(s.last_time || '')} · 首次 ${escapeHtml(s.first_time || '')}</div>
+        <div style="font-size:12px;color:#e67e22;line-height:1.6;">${escapeHtml(s.reason || '')}</div>
+        ${samples}
+      </div>`;
+    }).join('');
+    return items.length;
+  } catch(e) { return 0; }
+}
+
+async function blockSuggestedUser(uid) {
+  const s = blockSuggestCache[String(uid)] || {};
+  const name = s.username || ('UID ' + uid);
+  if (!confirm(`确认拉黑「${name}」？\n原因：${s.reason || '命中拉黑阈值'}\n\n确认后将调用 B 站接口执行拉黑，可在「拉黑记录」中查看。`)) return;
+  try {
+    const resp = await apiFetch('/api/block_user', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uid: String(uid), username: name,
+                            reason: '人工确认拉黑：' + (s.reason || '命中拉黑阈值')})
+    });
+    const data = await resp.json();
+    toast(data.ok ? (data.msg || '已拉黑') : (data.msg || '拉黑失败'), data.ok ? 'success' : 'error');
+  } catch(e) { toast('请求失败', 'error'); }
+  loadBlockSuggestions();
+}
+
+async function dismissBlockSuggestion(uid) {
+  const s = blockSuggestCache[String(uid)] || {};
+  if (!confirm(`忽略「${s.username || uid}」的拉黑建议？\n该用户不会再出现在建议列表里（自动拉黑仍保持关闭）。`)) return;
+  try {
+    await apiFetch('/api/block_suggestion/dismiss', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uid: String(uid)})
+    });
+    toast('已忽略该建议', 'info');
+  } catch(e) { toast('操作失败', 'error'); }
+  loadBlockSuggestions();
+}
+
+async function refreshBlockSuggestBadge() {
+  try {
+    const resp = await apiFetch('/api/block_suggestions');
+    const data = await resp.json();
+    setSecBadge((data.suggestions || []).length);
+  } catch(e) {}
+}
+
 // ===== 安全日志 =====
-const secTypeMap = {'negative_interaction': '⚠️ 负面互动', 'keyword_blocked': '🚫 关键词拦截', 'user_blocked': '🔒 用户拉黑'};
-const secColorMap = {'negative_interaction': '#e67e22', 'keyword_blocked': '#e74c3c', 'user_blocked': '#c0392b'};
+const secTypeMap = {'negative_interaction': '负面互动', 'keyword_blocked': '关键词拦截', 'user_blocked': '用户拉黑', 'auto_block_suppressed': '命中自动拉黑但已放行（待人工处理）', 'private_message_auto_block': '私信命中安全规则并拉黑', 'private_message_quarantined': '私信安全隔离（未拉黑）', 'private_message_protected': '私信命中但用户受保护', 'private_message_reply_failed': '私信回复失败'};
+const secColorMap = {'negative_interaction': '#e67e22', 'keyword_blocked': '#e74c3c', 'user_blocked': '#c0392b', 'auto_block_suppressed': '#f0c674', 'private_message_auto_block': '#c0392b', 'private_message_quarantined': '#e67e22', 'private_message_protected': '#5fd39a', 'private_message_reply_failed': '#8a94a6'};
 let secPage = 1;
 async function loadSecurity(page) {
   secPage = page || 1;
@@ -3924,6 +4446,31 @@ async function testModel(type) {
   }
 }
 
+// ===== 主题切换：写入 localStorage，刷新后保持 =====
+function toggleTheme() {
+  var root = document.documentElement;
+  var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  root.setAttribute('data-theme', next);
+  try { localStorage.setItem('ba-theme', next); } catch (e) {}
+  syncThemeToggle();
+}
+
+function syncThemeToggle() {
+  var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+  var btn = document.getElementById('themeToggle');
+  if (btn) {
+    btn.setAttribute('aria-pressed', dark ? 'true' : 'false');
+    btn.setAttribute('title', dark ? '切换到亮色主题' : '切换到暗色主题');
+  }
+  var txt = document.getElementById('themeToggleText');
+  if (txt) txt.textContent = dark ? '暗色' : '亮色';
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', syncThemeToggle);
+} else {
+  syncThemeToggle();
+}
 </script>
 
 </body>

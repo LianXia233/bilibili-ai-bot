@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 四三角品牌标记。几何取自参考站 Logo（viewBox 0 0 48 42）：
+     1) 上方正三角  2) 左下三角  3) 右下三角  4) 中部倒三角
+     配色对齐参考站 --logo-blue：亮色 #1289f9 / 暗色 #58bcff。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 42" width="48" height="42" role="img" aria-label="Bot">
+  <style>
+    :root { --logo-blue: #1289f9; }
+    @media (prefers-color-scheme: dark) { :root { --logo-blue: #58bcff; } }
+    path { fill: var(--logo-blue); }
+  </style>
+  <path d="M24 2 34 19H14Z"/>
+  <path d="m12 22 10 17H2Z"/>
+  <path d="M36 22 46 39H26Z"/>
+  <path d="M14 21h20L24 38Z"/>
+</svg>
