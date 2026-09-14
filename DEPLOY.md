@@ -318,21 +318,47 @@ tail -n 20 /var/log/bilibili-panel.log
 
 ## 10. 安全加固清单
 
+面板长期挂在公网（经隧道暴露），以下项均已落地。逐项的**根因与判定逻辑**见 [FIXES.md 第六节](FIXES.md#六面板安全加固)，此处只列部署侧需要知道的部分。
+
 ### 已完成
 
-| 项 | 实现 |
-|----|------|
-| 鉴权 | 默认拒绝，未登录 `/api/*` 返回 `401`、其余 `404` |
-| 口令 | RSA-OAEP 密封提交，明文仅作降级回退 |
-| 会话 | Cookie `HttpOnly` + `SameSite=Lax`，`Secure` 按 TLS 动态判定 |
-| 会话密钥 | 持久化 `0600`，重启不掉线 |
-| 头像路由 | `/media/bot-avatar` 不接受文件名参数，防目录穿越 |
-| 拉黑动作 | 只由人工在面板确认，Bot 不自动封人 |
-| 敏感文件 | `config.json` 与 `data/` 全程不入库（见 `.gitignore`） |
+| 项 | 实现 | 为什么 / 部署注意 |
+|----|------|-------------------|
+| 鉴权 | 默认拒绝：`before_request` 兜底，未登录 `/api/*` 返回 `401`、其余 `404` | 白名单逐条列举而非前缀匹配，**新增路由自动受保护**，不需要维护者记得加装饰器 |
+| 静态目录 | `static_folder="static"`，只暴露前端资源 | 历史写法 `static_folder="."` 会让 `/config.json`、`/ai.py`、`/data/**` 可直接下载 —— 升级时务必确认这一行 |
+| 口令 | RSA-OAEP(SHA-256) 密封提交，明文仅作降级回退 | 隧道边缘终止 TLS，密封用于避免口令在中间段可读。依赖 `cryptography`，缺失时自动降级而非启动失败 |
+| 会话 Cookie | `HttpOnly` + `SameSite=Lax`，`Secure` 按 TLS 动态判定 | `Secure` **不能**直接跟 `PANEL_TLS` 联动：证书缺失回落 HTTP 时，`Secure` Cookie 会被浏览器拒绝存储，表现为「登录成功但页面停在登录页」 |
+| 会话密钥 | 持久化 `data/.secret_key`（`0600`），重启不掉线 | 若写成随机生成，每次重启都会让所有会话失效 |
+| 反代感知 | 只采信回环地址（`127.0.0.1` / `::1`）来的 `X-Forwarded-Proto` | 该头可伪造；不限制来源时任何直连请求都能把面板骗成「HTTPS 上下文」 |
+| 安全响应头 | `nosniff` / `X-Frame-Options: DENY` / `Referrer-Policy: no-referrer`；`/api/*` 加 `no-store`；HSTS 仅在安全上下文发 | 避免聊天记录与 UID 被中间层缓存 |
+| 头像路由 | `/media/bot-avatar` 不接受任何文件名参数，只认配置指向的文件 | 「没有可控输入也就没有穿越面」；登录页需在鉴权前展示头像，因此单独放行 |
+| 拉黑动作 | 只由人工在面板确认，Bot 不自动封人 | 避免误判导致不可逆操作 |
+| 敏感文件 | `config.json` 与 `data/` 全程不入库（见 `.gitignore`） | 同时确认 `data/` 目录权限，其中含会话密钥与密封私钥 |
+
+### 上线验证
+
+权限问题的判据在**未登录**这一侧，不要只测「登录后能不能用」：
+
+```bash
+# 数据接口：必须 401
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5000/api/summary
+# 敏感文件：必须 404（若为 200，说明静态根没收到 static/）
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5000/config.json
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5000/ai.py
+# 登录前必须可达：必须 200
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5000/api/handshake
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5000/
+```
 
 ### 建议补充
 
+按当前代码实测，以下为已知但未处理项：
+
+- [ ] **`/api/config` 会原样返回 `CHAT_PASSWORD`** —— 脱敏函数只匹配字段名含 `KEY` / `TOKEN` / `SESSDATA` / `JCT` 且长度 > 10 的项，口令字段不在其中。虽然该接口本身需要登录，但前端读取脱敏配置时应顺带把口令字段屏蔽（建议同时改 `config.get_config()` 的脱敏规则）
+- [ ] **启动日志明文打印口令** —— `local-chat.py` 启动块里的 `print(f"访问密码：{AUTH_PASSWORD}")` 会写入 `/var/log/bilibili-panel.log`。建议改为仅在口令仍为默认值时提示「请尽快修改」，否则不回显
+- [ ] **`yt-dlp` 的 `bvid` 拼接** —— `Proactive.py` 中 `f"https://www.bilibili.com/video/{bvid}"` 直接拼进子进程参数。当前 `bvid` 只来自 B站 API 响应、非用户输入，**不构成 SSRF 或命令注入**；但建议加一道 `^BV[0-9A-Za-z]{10}$` 白名单校验，避免将来引入用户输入路径时无声变成漏洞
 - [ ] 面板登录失败限速（当前未实现，公网暴露时建议在反向代理层加限制）
 - [ ] 反向代理层限制来源 IP 或叠加一层 Basic Auth
 - [ ] 定期轮换 `CHAT_PASSWORD` 与 B站 Cookie
 - [ ] 服务器防火墙只放行必要端口，管理端口限制来源
+- [ ] 清理工作区根目录遗留的 `panel-ca.crt` 等调试产物，避免误入库

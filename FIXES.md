@@ -20,8 +20,9 @@
 | [三](#三模型兜底与记忆检索降级) | 模型兜底与记忆检索降级 | 推理型模型吃光 token | 看 `finish_reason` |
 | [四](#四移动端遮罩压住侧栏) | 移动端点菜单后无法操作 | CSS 层叠上下文嵌套错位 | `elementFromPoint` 命中链 + 读 `parentElement` |
 | [五](#五移动端汉堡按钮随面板消失) | 切面板后无法回到侧栏 | 按钮被放在单个面板内部 | 逐面板遍历断言按钮可见性 |
-| [六](#六user-agent-不完整触发风控) | User-Agent 不完整触发风控 | UA 缺版本号 | 看错误码 + 异常类型 |
-| [七](#七部署注意事项) | 部署注意事项 | — | — |
+| [六](#六面板安全加固) | 面板公网暴露的加固 | `static_folder="."` 暴露根目录、逐路由鉴权易漏 | 以未登录身份打接口断言响应码 |
+| [七](#七user-agent-不完整触发风控) | User-Agent 不完整触发风控 | UA 缺版本号 | 看错误码 + 异常类型 |
+| [八](#八部署注意事项) | 部署注意事项 | — | — |
 
 ---
 
@@ -299,7 +300,233 @@ for name in ("chat", "summary", "security", "memory", "settings"):
 
 ---
 
-## 六、User-Agent 不完整触发风控
+## 六、面板安全加固
+
+面板会长期挂在公网（经 natfrp 隧道暴露），一旦被人扫到端口，默认配置下的攻击面相当大。本章讲的是**加固后的判定逻辑与动机**，而不是「做了哪些项」的清单 —— 变更摘要见 [CHANGELOG.md](CHANGELOG.md) 的 `feat(security)` 条目，部署要点见 [DEPLOY.md](DEPLOY.md) 第 10 节。
+
+### 6.1 静态目录收口：一个参数差点公开整个项目
+
+最严重的一处来自 Flask 构造参数：
+
+```python
+# 危险写法（历史版本）
+app = Flask(__name__, template_folder=".", static_folder=".")
+```
+
+`static_folder="."` 意味着**应用根目录成了静态根**。静态路由不需要登录，于是下面这些全都可以被直接下载：
+
+| 路径 | 后果 |
+|------|------|
+| `/config.json` | API Key、B站 Cookie、面板口令全部泄露 |
+| `/ai.py` `/config.py` | 源码泄露，等于把内部逻辑和密钥读取方式一并交出 |
+| `/data/**` | 聊天记录、记忆库、头像原图 |
+
+修复只有一行，但**判定逻辑值得记住**：Flask 的 `static_folder` 是「信任即公开」的语义，设成 `.` 相当于把整个仓库目录挂成 CDN。正确做法是指向专门的前端资源目录：
+
+```python
+app = Flask(__name__, template_folder=".", static_folder="static",
+            static_url_path="/static")
+```
+
+> 排查方式：不看代码，而是**直接请求敏感路径**，断言返回 `404`。`/config.json`、`/ai.py`、`/data/config.json` 三个探针足以覆盖这一类问题。
+
+### 6.2 默认拒绝，而不是逐路由放行
+
+加固前的模式是「每个接口自己记得检查登录」。这种模式的问题不在当下，而在于**新增路由时容易漏**：60 多个路由，漏一个就是一次数据泄露。
+
+改成在 `before_request` 里做全局兜底，语义是**默认拒绝**：
+
+```python
+PUBLIC_PATHS = frozenset({
+    "/", "/favicon.ico",
+    "/api/login", "/api/auth_check", "/api/handshake", "/api/health",
+    "/api/branding", "/media/bot-avatar",
+})
+PUBLIC_PREFIXES = ("/static/",)
+
+@app.before_request
+def check_auth():
+    path = request.path
+    if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
+        return
+    if session.get("authed"):
+        return
+    # 未登录：API 回 401 让前端弹登录框；其余一律 404，不泄露路径是否存在
+    if path.startswith("/api/"):
+        return jsonify({"error": "未登录", "need_login": True}), 401
+    return ("Not Found", 404)
+```
+
+两点设计取舍：
+
+| 决策 | 理由 |
+|------|------|
+| 白名单用 `frozenset` 逐条列举，而非前缀匹配 | 前缀匹配（如 `/api/auth`）会连带放行 `/api/authz_dump` 之类的意外路由；逐条列举必须显式新增 |
+| 未登录的非 API 路径返回 `404` 而非 `403` | `403` 等于告诉扫描者「这个路径存在，只是你没权限」；`404` 不区分「不存在」与「存在但不可见」 |
+
+`/api/*` 单独回 `401` 是给前端用的 —— 前端据此判断该弹登录框；其余路径用户不会直接看到响应体，用 `404` 更划算。
+
+> 副产物：因为兜底逻辑与路由无关，**将来新增的接口自动受保护**，不需要维护者记得加装饰器。这也是本次没有给 60 多个路由逐个加 `@login_required` 的原因 —— 加装饰器是「记得就安全」，兜底是「忘记也安全」。
+
+### 6.3 口令密封：避免明文口令过链路
+
+登录接口最初接收明文口令：
+
+```json
+POST /api/login   {"password": "..."}
+```
+
+在自建的 TLS 面板里这本身可接受，但项目实际跑在 natfrp 隧道后面 —— **边缘节点终止 TLS**，也就是说口令在中间那一段是可读的。此外若因证书缺失回落 HTTP（见 6.4），明文口令就完全裸露在网络路径上。
+
+加固方式是加一层传输前的 RSA-OAEP 密封，**明文通道保留作降级**：
+
+```python
+@app.route("/api/handshake", methods=["GET"])
+def handshake():
+    """下发 RSA 公钥。公钥不是秘密，但只在登录前用得上。"""
+    return jsonify({"alg": "RSA-OAEP-256", "pubkey": _seal_pubkey_b64()})
+```
+
+前端用 WebCrypto 加密后提交 `sealed` 字段，后端解密：
+
+```python
+def _seal_decrypt(token):
+    """RSA-OAEP(SHA-256) 解密。任何异常都归为 None，不把失败细节漏给请求方。"""
+    try:
+        raw = base64.b64decode((token or "").strip(), validate=True)
+        if len(raw) != 256:            # RSA-2048 密文长度必须正好 256 字节
+            return None
+        return SEAL_PRIVATE_KEY.decrypt(raw, _asym_padding.OAEP(...))
+    except Exception:
+        return None
+```
+
+几个边界处理：
+
+1. **密文长度前置校验 `len(raw) != 256`**：RSA-2048 的密文恒为 256 字节。先判长度再调 `decrypt()`，可以把大量畸形请求挡在昂贵的模幂运算之前，同时也是一层便宜的输入校验。
+2. **异常一律归 `None`**：区分「密文格式错」「密钥不匹配」「padding 错」并回报给请求方，等于给出了 oracle。统一成一句「密文无法解密，请刷新页面重试」。
+3. **公钥可匿名获取是设计意图**：公钥本身不构成秘密，放行 `/api/handshake` 不扩大攻击面。
+
+`cryptography` 缺失时 `SEAL_ENABLED=False` 自动降级回明文通道，**不阻断启动** —— 加密是增强项，不该成为可用性的单点。
+
+### 6.4 反代感知：为什么只信回环地址
+
+面板要判断「浏览器那一侧是不是 HTTPS」，才能决定是否发 HSTS、是否给 Cookie 打 `Secure`。判断依据是 `X-Forwarded-Proto`，但**这个头是客户端可伪造的**：
+
+```python
+_TRUSTED_PROXY_ADDRS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+def _client_is_secure():
+    if request.remote_addr in _TRUSTED_PROXY_ADDRS:
+        proto = (request.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        if proto:
+            return proto == "https"
+    return bool(request.is_secure)
+```
+
+只有请求确实来自本机（反代进程）才采信该头；直连请求即使带了 `X-Forwarded-Proto: https` 也走 `request.is_secure`。**否则任何人都能伪造这个头，把面板骗成「安全上下文」而发出 HSTS 与 `Secure` Cookie。**
+
+取 `.split(",")[0]` 是因为代理链会追加成 `https, http`，第一个才是客户端真实协议。
+
+### 6.5 一个差点把登录锁死的写法
+
+Cookie 的 `Secure` 标志需要跟实际协议联动：
+
+```python
+# 注意不要直接写 or PANEL_TLS —— 万一证书缺失回落到 HTTP，Secure Cookie 会把登录悄悄锁死。
+SECURE_COOKIES = (os.environ.get("SECURE_COOKIES", "0").strip() == "1")
+```
+
+看起来更简洁的 `SECURE_COOKIES = SECURE_COOKIES or PANEL_TLS` 是错的：`PANEL_TLS=1` 只表示「打算起 HTTPS」，而证书缺失时代码会回落 HTTP（见 `__main__` 里 `os.path.exists(PANEL_TLS_CERT)` 的判断）。此时浏览器会拒绝在 HTTP 上存储 `Secure` Cookie，表现为**登录请求返回成功、页面却一直停在登录页** —— 排查时很容易误以为是会话或密钥问题。
+
+正确做法是在真正起了 HTTPS 之后才强制打开：
+
+```python
+if ssl_ctx:
+    app.config["SESSION_COOKIE_SECURE"] = True
+```
+
+> 这是「配置意图」与「运行时事实」不一致的典型陷阱。凡是有降级路径的开关，联动对象必须是**降级后的实际状态**，而不是配置值本身。
+
+### 6.6 会话密钥：重启掉线的根因
+
+会话签名密钥若写成 `app.secret_key = uuid.uuid4().hex`，每次重启都换新密钥 ⇒ 所有会话 Cookie 立即失效 ⇒ 用户莫名其妙被登出。持久化到 `data/.secret_key` 解决，并要求权限 `0600`：
+
+```python
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+```
+
+复用前校验 `len(k) >= 32`，防止被截断或写坏的短密钥上生产。任何异常回落单个 `uuid4().hex`（当次会话可用，但重启会掉线）—— 宁愿掉线也不要起不来。
+
+同一目录下还有口令密封的私钥 `data/.seal_key.pem`（RSA-2048 / PKCS8 / `0600`），`data/` 整体已在 `.gitignore` 中。
+
+### 6.7 头像路由：把可控输入去掉，而不是过滤它
+
+登录页需要展示 Bot 头像，但此刻用户还没登录。最初的直觉是「把 `/data/images/<filename>` 加进白名单」，那会直接把整个图片目录公开，且 `<filename>` 是可控输入，需要额外防目录穿越。
+
+改法是把**可控输入彻底消掉** —— 用一个不接受任何参数的专用路由：
+
+```python
+@app.route("/media/bot-avatar")
+def bot_avatar():
+    """只认 config 的 BOT_AVATAR 指向的文件，不接受任何来自请求的文件名参数 ——
+    没有可控输入，也就没有穿越面。"""
+```
+
+文件名只从 `config.json` 读，且做单层校验：
+
+```python
+name = unquote(raw[len("/data/images/"):])
+if not name or "/" in name or "\\" in name or ".." in name:
+    return ("Not Found", 404)
+```
+
+> **安全设计的优先顺序**：能去掉可控输入 > 能加白名单 > 能做黑名单过滤。「没有可控输入也就没有穿越面」比「过滤掉 `..`」更可靠，因为前者不需要假设自己想到了所有编码变体（URL 编码、双重编码、反斜杠、Unicode 折叠…）。
+
+顺带做了件事：原图 3 MB 而登录页只显示 48px，经隧道限速下发很浪费，因此现场缩到 160px（`im.thumbnail`），失败则回落原图。该路由响应带 `Cache-Control: public, max-age=3600` —— 这张图本来就公开，加缓存不扩大暴露面。
+
+### 6.8 安全响应头
+
+```python
+resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+resp.headers.setdefault("X-Frame-Options", "DENY")
+resp.headers.setdefault("Referrer-Policy", "no-referrer")
+if request.path.startswith("/api/"):
+    resp.headers.setdefault("Cache-Control", "no-store")
+if _client_is_secure():
+    resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+```
+
+| 头 | 挡的问题 |
+|----|----------|
+| `X-Content-Type-Options: nosniff` | 浏览器把上传内容猜成可执行类型 |
+| `X-Frame-Options: DENY` | 面板被嵌进 iframe 做点击劫持 |
+| `Referrer-Policy: no-referrer` | 面板 URL 作为 Referer 泄露给外部站点 |
+| `/api/*` 的 `no-store` | 聊天记录、UID 等数据被浏览器或中间层缓存 |
+| HSTS 仅在安全上下文发 | 避免在 HTTP 下发出后被浏览器长时间强制跳 HTTPS 而打不开 |
+
+用 `setdefault` 而非 `=` 赋值，是为了不覆盖视图函数自己设置的更具体值。
+
+### 6.9 排查手法：不做静态审查，直接打接口
+
+这类问题的验证方式不是读代码，而是**以未登录身份请求真实接口**，断言响应码：
+
+```python
+cases = [
+    ("GET",  "/api/summary",      401),   # 数据接口：需要登录
+    ("GET",  "/api/config",       401),   # 配置接口
+    ("GET",  "/config.json",      404),   # 敏感文件：不存在于静态根
+    ("GET",  "/ai.py",            404),
+    ("GET",  "/api/handshake",    200),   # 登录前必须可达
+    ("GET",  "/",                 200),   # 登录页本身
+]
+```
+
+只测「已登录时能不能用」会漏掉全部这四类问题 —— **权限问题的判据永远在「未登录」这一侧**，而且要看的是「拒绝了没有」，不是「有没有正常返回数据」。
+
+---
+
+## 七、User-Agent 不完整触发风控
 
 B站写操作会拒收不完整的 User-Agent，返回 `code 30014`（`Token is invalid`）。
 
@@ -316,7 +543,7 @@ B站写操作会拒收不完整的 User-Agent，返回 `code 30014`（`Token is 
 
 ---
 
-## 七、部署注意事项
+## 八、部署注意事项
 
 | # | 事项 | 要点 |
 |:-:|------|------|
