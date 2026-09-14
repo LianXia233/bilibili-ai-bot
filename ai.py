@@ -115,10 +115,10 @@ headers = {
     "Referer": "https://www.bilibili.com/"
 }
 
-or_client = OpenAI(
-    api_key=OR_API_KEY,
-    base_url=OR_BASE_URL
-)
+# 说明：这里原有一个固定绑死 OR_BASE_URL / OR_API_KEY 的 or_client 全局实例。
+# 它绕过了「每类模型各自的专用地址 / 密钥 / 备用模型」，正是
+# 「面板上的专用通道填了不生效」的根源，现已统一改为 _complete_with + 候选链
+# （见 _model_candidates / _chat_client），故删除该实例。
 
 embed_client = OpenAI(
     api_key=SILICON_API_KEY,
@@ -147,23 +147,50 @@ def _get_active_persona():
     # 没找到就返回默认
     return {"name": "default", "display_name": "默认", "system_prompt": "", "style_prompt": "", "owner_prompt": ""}
 
-def _chat_candidates():
-    """候选通道列表：(base_url, api_key, model)
-    顺序为 主模型 -> 兜底模型 -> 备用通道(OpenRouter)。"""
-    from config import get_raw_config
-    cfg = get_raw_config()
-    g_url = cfg.get("OR_BASE_URL", "") or None
-    g_key = cfg.get("OR_API_KEY", "") or None
+def _model_candidates(model_type):
+    """候选通道列表：(base_url, api_key, model)，顺序为 主模型 -> 兜底模型（-> 备用通道）。
+
+    通道参数直接取 config.get_model_config()，与面板（local-chat.py 的
+    get_or_client）共用同一份解析逻辑。此前 ai.py 自己另写一套、只认通用的
+    OR_BASE_URL / OR_API_KEY，于是面板上四类模型各自的
+    「专用 API 地址 / 专用 API Key / 备用模型」输入框对 Bot 完全无效 ——
+    面板点「测试连接」走专用通道（显示通过），Bot 实际回复走通用通道（可能失败），
+    两边行为对不上。
+    """
+    from config import get_model_config
+    base_url, api_key, model_id, fallback = get_model_config(model_type)
     out = []
-    for model in (cfg.get("OR_CHAT_MODEL", ""), cfg.get("OR_CHAT_MODEL_FALLBACK", "")):
+    for model in (model_id, fallback):
         if model:
-            out.append((g_url, g_key, model))
-    b_model = cfg.get("OR_BACKUP_MODEL", "")
-    if b_model:
-        out.append((cfg.get("OR_BACKUP_URL", "") or g_url,
-                    cfg.get("OR_BACKUP_KEY", "") or g_key,
-                    b_model))
+            out.append((base_url or None, api_key or None, model))
+    if model_type == "chat":
+        # 备用通道（默认 OpenRouter 免费池）是对话类独有的第三条路
+        from config import get_raw_config
+        cfg = get_raw_config()
+        b_model = cfg.get("OR_BACKUP_MODEL", "")
+        if b_model:
+            out.append((cfg.get("OR_BACKUP_URL", "") or base_url or None,
+                        cfg.get("OR_BACKUP_KEY", "") or api_key or None,
+                        b_model))
     return out
+
+
+def _chat_candidates():
+    return _model_candidates("chat")
+
+
+def _vision_candidates():
+    """视觉通道候选：视觉类没配模型时回落到对话类。
+
+    不回落的后果很隐蔽：OR_VISION_MODEL 为空时，视频分析与评论图片识别都会以
+    「Model name not specified」失败，视频上下文只剩「标题+简介」拼的降级串 ——
+    看上去标题读到了，但那个「内容概括」根本不是分析结果，只是简介原文。
+    """
+    return _model_candidates("vision") or _model_candidates("chat")
+
+
+def _search_candidates():
+    return _model_candidates("search") or _model_candidates("chat")
 
 
 _CHAT_CLIENTS = {}
@@ -177,29 +204,43 @@ def _chat_client(base_url, api_key):
     return _CHAT_CLIENTS[key]
 
 
-def claude_chat(prompt, max_tokens=300):
-    """按 主模型 -> 兜底模型 -> 备用通道 依次尝试，任一返回非空正文即采纳。
-    非首选通道放宽 token 预算：推理型模型会先把预算消耗在推理过程上。"""
-    last_err = "未配置任何对话模型"
-    for idx, (base_url, api_key, model) in enumerate(_chat_candidates()):
+def _complete_with(candidates, content, max_tokens, label):
+    """按候选链依次尝试，返回 (正文, 输入tokens, 输出tokens, 实际模型名)。
+
+    content 可以是纯文本字符串，也可以是 OpenAI 的多模态 content 数组
+    （图文混合），对话 / 联网搜索 / 视觉三类调用共用这一条链路。
+    非首选通道放宽 token 预算：推理型模型会先把预算消耗在推理过程上，正文可能为空串。
+    """
+    last_err = "未配置任何可用模型"
+    for idx, (base_url, api_key, model) in enumerate(candidates):
         budget = max(max_tokens, 1500) if idx > 0 else max_tokens
         try:
             resp = _chat_client(base_url, api_key).chat.completions.create(
                 model=model,
                 max_tokens=budget,
-                messages=[{"role": "user", "content": prompt}]
+                messages=[{"role": "user", "content": content}]
             )
             choice = resp.choices[0]
             text = (choice.message.content or "").strip()
             if text:
                 if idx > 0:
-                    print(f"  \u21a9\ufe0f 已切换到备用模型 {model}")
-                return text, (resp.usage.prompt_tokens if resp.usage else 0), (resp.usage.completion_tokens if resp.usage else 0)
+                    print(f"  \u21a9\ufe0f {label}已切换到备用通道 {model}")
+                return (text,
+                        (resp.usage.prompt_tokens if resp.usage else 0),
+                        (resp.usage.completion_tokens if resp.usage else 0),
+                        model)
             last_err = f"{model} 返回空正文(finish={choice.finish_reason})"
         except Exception as e:
             last_err = f"{model}: {str(e)[:120]}"
-    print(f"  \u26a0\ufe0f 对话模型全部失败（{last_err}）")
-    return "", 0, 0
+    print(f"  \u26a0\ufe0f {label}全部候选通道失败（{last_err}）")
+    return "", 0, 0, ""
+
+
+def claude_chat(prompt, max_tokens=300):
+    """对话调用：主模型 -> 兜底模型 -> 备用通道，任一返回非空正文即采纳。"""
+    text, in_tok, out_tok, _model = _complete_with(
+        _chat_candidates(), prompt, max_tokens, "对话")
+    return text, in_tok, out_tok
 
 SEARCH_KEYWORDS = [
     "最近", "最新", "今天", "昨天", "现在", "目前", "当前",
@@ -225,15 +266,13 @@ def web_search(query):
         from config import get_raw_config
         search_prefix = get_raw_config().get("PROMPT_SEARCH_PREFIX", "").strip() or "请搜索并简要回答（200字以内，中文）："
         print(f"🔍 联网搜索：{query}")
-        resp = or_client.chat.completions.create(
-            model=OR_SEARCH_MODEL,
-            max_tokens=500,
-            messages=[{"role": "user", "content": f"{search_prefix}{query}"}]
-        )
-        result = resp.choices[0].message.content.strip()
-        in_tok = resp.usage.prompt_tokens if resp.usage else 0
-        out_tok = resp.usage.completion_tokens if resp.usage else 0
-        log_cost("联网搜索", in_tok, out_tok, model="gemini")
+        result, in_tok, out_tok, model = _complete_with(
+            _search_candidates(), f"{search_prefix}{query}", 500, "联网搜索")
+        if not result:
+            print("⚠️ 联网搜索失败：候选通道都没返回内容")
+            return ""
+        # 这里原本写死 model="gemini"：账本里那条记录既不是 gemini，也追不到真实来源
+        log_cost("联网搜索", in_tok, out_tok, model=model)
         print(f"🔍 搜索结果：{result[:100]}...")
         return result
     except Exception as e:
@@ -275,7 +314,23 @@ def get_video_info(oid):
         print(f"⚠️ 获取视频信息失败：{e}")
     return None
 
+def _video_fallback_text(video_info):
+    """视频分析失败时的降级文本：只有视频元信息，没有任何内容判断。
+
+    单独抽出来的原因：这串东西长得像「分析结果」，容易被当成模型真看过视频，
+    实际上它只是把标题 / UP主 / 简介重排了一遍。明确命名，避免误读。
+    """
+    desc = (video_info.get("desc") or "").strip() or "无"
+    return (f"视频《{video_info.get('title', '未知')}》，"
+            f"UP主：{video_info.get('owner_name', '未知')}，"
+            f"分区：{video_info.get('tname') or '未知'}。简介：{desc[:100]}")
+
 def analyze_video_with_gemini(video_info):
+    """把视频封面 + 标题 / 分区 / 简介交给视觉模型，产出一段内容概括。
+
+    函数名沿用历史叫法；实际走的是「视觉候选通道」，且视觉类没配模型时会
+    自动回落到对话模型（见 _vision_candidates），不再必然失败。
+    """
     try:
         content = []
         if video_info.get("pic"):
@@ -306,19 +361,15 @@ UP主：{video_info.get('owner_name', '未知')}
 直接输出概括内容，不要加前缀。"""
         content.append({"type": "text", "text": text_prompt})
 
-        response = or_client.chat.completions.create(
-            model=OR_VISION_MODEL,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=250
-        )
-        result = response.choices[0].message.content.strip()
-        in_tok = response.usage.prompt_tokens if response.usage else 0
-        out_tok = response.usage.completion_tokens if response.usage else 0
-        log_cost("视频识别", in_tok, out_tok, model="gemini")
+        result, in_tok, out_tok, model = _complete_with(
+            _vision_candidates(), content, 250, "视频分析")
+        if not result:
+            return _video_fallback_text(video_info)
+        log_cost("视频识别", in_tok, out_tok, model=model)
         return result
     except Exception as e:
-        print(f"⚠️ Gemini视频分析失败：{e}")
-        return f"视频《{video_info.get('title', '未知')}》，UP主：{video_info.get('owner_name', '未知')}，分区：{video_info.get('tname', '未知')}。简介：{video_info.get('desc', '无')[:100]}"
+        print(f"⚠️ 视频分析失败：{e}")
+        return _video_fallback_text(video_info)
 
 def get_video_context(oid, comment_type):
     if comment_type != 1:
@@ -567,30 +618,47 @@ def load_memory():
     return load_json(MEMORY_FILE, [])
 
 def log_cost(source, input_tokens, output_tokens, model="claude"):
-    if model == "gemini":
-        INPUT_PRICE = 0.5 / 1_000_000
-        OUTPUT_PRICE = 3.0 / 1_000_000
-    else:
-        INPUT_PRICE = 3.0 / 1_000_000
-        OUTPUT_PRICE = 15.0 / 1_000_000
-    cost = input_tokens * INPUT_PRICE + output_tokens * OUTPUT_PRICE
+    """记录 API 调用费用。
+
+    价格来自配置，与 local-chat.py 共用 config.resolve_model_price 的解析规则。
+    此前这里写死 3.0/15.0（gemini 0.5/3.0），而面板侧按用户填的价格计算，
+    于是「在设置页改了价格，Bot 的调用仍按写死价格计费」——面板显示与后端真实行为不一致。
+    """
+    from config import resolve_model_price
+    inp_price, out_price = resolve_model_price(source, model)
+    cost = input_tokens * inp_price / 1_000_000 + output_tokens * out_price / 1_000_000
     today = datetime.now().strftime("%Y-%m-%d")
     logs = load_json(COST_LOG_FILE, {})
     if today not in logs:
-        logs[today] = {"total": 0, "calls": 0, "input_tokens": 0, "output_tokens": 0}
-    if "details" not in logs[today]:
-        logs[today]["details"] = []
-    logs[today]["total"] = round(logs[today]["total"] + cost, 6)
-    logs[today]["calls"] += 1
-    logs[today]["input_tokens"] += input_tokens
-    logs[today]["output_tokens"] += output_tokens
-    logs[today]["details"].append({
+        logs[today] = {}
+    day = logs[today]
+    for k in ("total", "calls", "input_tokens", "output_tokens"):
+        day.setdefault(k, 0)
+    if "details" not in day:
+        day["details"] = []
+    # 与面板侧写同一份「按模型明细」：面板的当日卡片会并列展示
+    # 「N 次调用」与明细 chips，若 Bot 的调用不进明细，两个数字必然对不上。
+    if "models" not in day:
+        day["models"] = {}
+    day["total"] = round(day["total"] + cost, 6)
+    day["calls"] += 1
+    day["input_tokens"] += input_tokens
+    day["output_tokens"] += output_tokens
+    day["details"].append({
         "time": datetime.now().strftime("%H:%M"),
         "source": source,
         "in": input_tokens,
         "out": output_tokens,
         "cost": round(cost, 6)
     })
+    # model_key 口径与面板侧一致：带 / 的用模型名，否则用调用来源
+    model_key = model if model and "/" in model else source
+    m = day["models"].setdefault(model_key,
+                                 {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost": 0})
+    m["calls"] += 1
+    m["input_tokens"] += input_tokens
+    m["output_tokens"] += output_tokens
+    m["cost"] = round(m["cost"] + cost, 6)
     keys = sorted(logs.keys())
     if len(keys) > 30:
         for k in keys[:-30]:
@@ -732,22 +800,26 @@ def compress_thread(docs):
     log_cost("线程压缩", in_tok, out_tok)
     return text, recent
 
-def build_memory_context(memory, thread_id, user_id, query_text, video_context=""):
+def build_memory_context(memory, thread_id, user_id, query_text):
+    """拼装「记忆参考」段落。
+
+    刻意不收视频上下文：视频信息会以独立段落（video_section）注入。原因见
+    generate_reply_and_score —— 记忆段落的抬头写的是「仅在与当前话题直接相关时
+    参考，否则忽略」，而「只 @ 不说话」的评论恰好没有任何话题，视频信息被塞进这里
+    就等于给了模型一个「可以不看」的理由，回复会退化成「有什么事」这类空话。
+    """
     parts = []
-    # 1. 视频上下文（最优先）
-    if video_context:
-        parts.append(video_context)
-    # 2. 永久记忆
+    # 永久记忆
     perm = load_json(PERMANENT_MEMORY_FILE, [])
     if perm:
         parts.append("【Bot的自我认知】\n" + "\n".join(
             [f"[{p.get('time', '未知')}] {p['text']}" for p in perm[-20:]]
         ))
-    # 3. 用户档案
+    # 用户档案
     user_profile_ctx = get_user_profile_context(user_id)
     if user_profile_ctx:
         parts.append(user_profile_ctx)
-    # 4. 线程上下文 / 语义记忆
+    # 线程上下文 / 语义记忆
     thread_docs = get_thread_memories(memory, thread_id)
     if thread_docs:
         summary, recent = compress_thread(thread_docs)
@@ -759,7 +831,7 @@ def build_memory_context(memory, thread_id, user_id, query_text, video_context="
         semantic_docs = get_user_semantic_memories(memory, user_id, query_text)
         if semantic_docs:
             parts.append("【相关历史记忆】\n" + "\n".join(semantic_docs))
-    # 5. Bot自身经历
+    # Bot自身经历
     self_memories = get_user_semantic_memories(memory, "self", query_text)
     if self_memories:
         parts.append("【Bot最近的经历】\n" + "\n".join(self_memories))
@@ -1096,17 +1168,22 @@ def get_new_at_replies():
         # 与 reply 流的取值口径保持一致（回复挂在正确的评论串上）
         root_rpid = r.get("root_id") or rpid
         raw_content = r.get("source_content", "") or ""
+        # 剥离掉全部 @昵称 后还剩什么：剩下为空说明「只 @ 了人，一句话都没写」
+        stripped = _strip_at_mentions(raw_content, at_details)
         ats.append({
             "rpid":        rpid,
             "root_rpid":   root_rpid,
             "oid":         oid,
             "thread_id":   f"{root_rpid}:{user.get('mid')}",
             "type":        r["business_id"],
-            "content":     _strip_at_mentions(raw_content, at_details) or _AT_EMPTY_CONTENT,
+            "content":     stripped or _AT_EMPTY_CONTENT,
             "raw_content": raw_content,
             "username":    user.get("nickname"),
             "mid":         user.get("mid"),
             "via":         "at",
+            # 明确标记「只 @ 没写内容」：提示词要据此换成「结合视频主动开话题」的引导。
+            # 否则模型拿到一句没有话题的占位符，很容易只回「有什么事」「有话直说」这类空话。
+            "no_content":  not stripped,
         })
 
     if ats or skipped_business or skipped_not_me or skipped_stale:
@@ -1151,20 +1228,50 @@ def recognize_images(image_urls):
         if not content:
             return ""
         content.append({"type": "text", "text": "请用50字以内描述这些图片的内容。"})
-        response = or_client.chat.completions.create(
-            model=OR_VISION_MODEL,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=100
-        )
-        return response.choices[0].message.content.strip()
+        # 走视觉候选通道（视觉类没配则回落对话类）；此前写死 OR_VISION_MODEL，
+        # 该键为空时图片识别 100% 失败，「只 @ + 发图」的评论等于没有图片信息。
+        result, in_tok, out_tok, model = _complete_with(
+            _vision_candidates(), content, 100, "图片识别")
+        if not result:
+            return ""
+        # 来源名带「识别」二字 -> 按视觉价计费（见 config.resolve_model_price）
+        log_cost("评论图片识别", in_tok, out_tok, model=model)
+        return result
     except Exception as e:
         print(f"  ⚠️ 图片识别失败：{e}")
         return ""
 
-def generate_reply_and_score(comment_text, username, level, memory_context, channel="comment"):
+def generate_reply_and_score(comment_text, username, level, memory_context,
+                             channel="comment", video_context="", no_content=False):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     level_prompt = _get_level_prompts()[level]
     memory_section = f"\n\n【记忆参考（仅在与当前话题直接相关时参考，否则忽略）】\n{memory_context}" if memory_context else ""
+    # 当前视频必须独立成段，不能混进上面的「记忆参考」。
+    # 记忆的抬头写着「不相关就忽略」，而「只 @ 不说话」的评论没有任何话题，
+    # 视频信息一旦被塞进记忆里，模型就有了忽略它的理由 —— 实测回复会退化成
+    # 「就@我呀？有话直说喵」这种空话，明明标题已经拿到了。
+    video_section = ""
+    if video_context:
+        video_section = ("\n\n【对方所在的视频】\n" + video_context +
+                         "\n（对方是在这个视频的评论区里说话的，可以自然引用上面的内容，"
+                         "但不要照抄标题）")
+    # 「只 @ 不说话」时给一条明确的引导，否则模型面对无话题输入只会反问「有什么事」。
+    no_content_section = ""
+    if no_content:
+        if video_context:
+            no_content_section = (
+                "\n\n【对方一个字都没写】\n"
+                "对方只 @ 了你，没写任何内容。不要回「有什么事」「有话直说」这类空话；"
+                "请直接结合上面的视频信息主动抛出一个具体话题（点评视频里的内容、"
+                "问对方为什么看这个、聊这个UP主或这个系列等），让对方有得可接。"
+            )
+        else:
+            no_content_section = (
+                "\n\n【对方一个字都没写】\n"
+                "对方只 @ 了你，没写任何内容，而且这次也没拿到视频信息。"
+                "不要回「有什么事」「有话直说」这类空话；"
+                "自己起一个轻松的具体话题开场，让对方有得可接。"
+            )
     mood, mood_prompt = get_today_mood()
     festival = get_festival_prompt()
     festival_section = f"\n特殊日期提示：{festival}" if festival else ""
@@ -1221,8 +1328,8 @@ def generate_reply_and_score(comment_text, username, level, memory_context, chan
 
 【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}
 
-当前时间：{now}{memory_section}{search_section}
-
+当前时间：{now}{video_section}{memory_section}{search_section}
+{no_content_section}
 「{username}」的{_channel_name}：「{comment_text}」
 
 请以JSON格式回复，不要加任何多余内容：
@@ -1249,6 +1356,13 @@ impression简短描述用户性格/说话风格，如"友善健谈，喜欢聊�
     )
 
 def send_reply(oid, rpid, content_type, reply_text, root_rpid=None):
+    """发送回复。成功时返回新评论的 rpid（拿不到则返回 True），失败返回 None。
+
+    返回 rpid 而不是布尔值的原因：B站对「@我」这类评论的回复会作为**二级评论**
+    挂在被 @ 的那条评论下面，在网页上是折叠的（要点开「N 条回复」才看得到），
+    很容易被误判成「没回复成功」。有了 rpid 就能直接定位到那条回复核验，
+    不再需要靠推断。
+    """
     url = "https://api.bilibili.com/x/v2/reply/add"
     data = {
         "oid": oid, "type": content_type,
@@ -1266,7 +1380,10 @@ def send_reply(oid, rpid, content_type, reply_text, root_rpid=None):
         raise SystemExit("❌ bili_jct 错误！程序停止，请检查 Cookie 后重启")
     if code == -101:
         raise SystemExit("❌ 未登录！SESSDATA 失效，程序停止，请更新 Cookie 后重启")
-    return code == 0
+    if code != 0:
+        return None
+    # code==0 只代表接口受理，新评论的 rpid 是「真的建出来了」的直接凭据
+    return (result.get("data") or {}).get("rpid") or True
 
 def block_user(mid, config=None):
     config = config or get_raw_config()
@@ -1594,7 +1711,9 @@ def run():
                 _shown = reply["content"]
                 if reply.get("via") == "at" and reply.get("raw_content") != _shown:
                     _shown = f"{_shown}（原文：{reply['raw_content']}）"
-                print(f"\n📩 [{_src}] {reply['username']}（{LEVEL_NAMES[level]} | {current_score}分）：{_shown}")
+                # 带上 rpid：日志行要能对应到具体某条评论，否则「这条到底回了没」无法追查
+                print(f"\n📩 [{_src}] rpid={rpid} {reply['username']}"
+                      f"（{LEVEL_NAMES[level]} | {current_score}分）：{_shown}")
 
                 # 获取视频上下文
                 video_context = get_video_context(reply["oid"], reply["type"])
@@ -1602,8 +1721,7 @@ def run():
                     print(f"📹 已获取视频上下文")
 
                 memory_context = build_memory_context(
-                    memory, thread_id, mid, reply["content"],
-                    video_context=video_context
+                    memory, thread_id, mid, reply["content"]
                 )
                 if memory_context:
                     print(f"🧠 调取记忆：{memory_context[:80]}...")
@@ -1620,9 +1738,15 @@ def run():
                 comment_text = reply["content"]
                 if image_desc:
                     comment_text += f"\n[用户发送了图片，内容是：{image_desc}]"
+                # 「只 @ 不说话」时正文是占位符：直接留空，由 no_content_section
+                # 统一说明并给引导，避免同一件事在提示词里说两遍
+                if reply.get("no_content"):
+                    comment_text = ""
 
                 score_delta, ai_reply, impression, perm_mem, user_facts = generate_reply_and_score(
-                    comment_text, reply["username"], level, memory_context
+                    comment_text, reply["username"], level, memory_context,
+                    video_context=video_context,
+                    no_content=bool(reply.get("no_content")),
                 )
 
                 max_score = 100 if str(mid) == str(OWNER_MID) else 99
@@ -1648,7 +1772,9 @@ def run():
 
                 delta_str = f"+{score_delta}" if score_delta >= 0 else str(score_delta)
                 print(f"💛 好感度：{current_score} → {new_score}（{delta_str}）| {LEVEL_NAMES[get_level(new_score, mid)]}")
-                print(f"💬 Bot：{ai_reply}")
+                # 回复正文的打印挪到 send_reply 之后（见下方「已发送 / 发送失败」两处）：
+                # 原来在这里无条件打印「💬 Bot：xxx」，而发送发生在其后，
+                # 发送失败时那行照样出现，看起来像「已经回了」。日志必须反映实际结果。
 
                 if score_delta <= -3:
                     log_security_event("negative_interaction", mid, reply["username"], reply["content"],
@@ -1708,10 +1834,15 @@ def run():
                                      reply.get("root_rpid"))
 
                 if success:
+                    # 带上真实 rpid：@ 类回复是二级评论、网页上默认折叠，
+                    # 只有拿到 rpid 才能直接核验「到底上屏了没有」
+                    rid = "" if success is True else f"，rpid={success}"
+                    print(f"💬 Bot（已发送{rid}）：{ai_reply}")
                     save_memory_record(memory, rpid, thread_id, mid, reply["username"], reply["content"], ai_reply)
                     count += 1
                     memory = compress_user_memory(memory, mid, reply["username"])
                 else:
+                    print(f"💬 Bot（发送失败，内容未上屏）：{ai_reply}")
                     print(f"⚠️ 回复发送失败，跳过此条，不再重试")
 
                 # 不管成功失败都标记，防止重复处理烧钱

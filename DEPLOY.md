@@ -314,6 +314,48 @@ tail -n 20 /var/log/bilibili-panel.log
 
 > **排查问题时先看日志里的真实异常**：面板把未预期异常收敛成 JSON 错误返回给前端，前端只会显示一句「出了点问题」，真实原因一定在 `/var/log/bilibili-panel.log` 里。
 
+### 升级时的数据清理
+
+从旧版本升级时有两处**运行数据**需要手工处理，否则改动看着生效、实际行为不变：
+
+```bash
+cd /opt/bilibili-ai-bot
+
+# 1) 视频缓存里的「假分析」：旧版视觉分析 400 失败时拼的元信息串
+#    识别特征：analysis 以「视频《…》，UP主：…，分区：」开头
+./venv/bin/python - <<'PY'
+import json, shutil, time
+p = "data/video_memory.json"
+d = json.load(open(p, encoding="utf-8"))
+bad = [k for k, e in d.items()
+       if (e.get("analysis") or "").startswith(
+           "视频《%s》，UP主：%s，分区：" % (e.get("title", ""), e.get("owner_name", "")))]
+if bad:
+    shutil.copy2(p, "%s.bak.%s" % (p, time.strftime("%Y%m%d-%H%M%S")))
+    for k in bad:
+        d.pop(k, None)
+    json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+print("清理降级缓存 %d 条" % len(bad))
+PY
+
+# 2) config.json 补齐新增键（缺失时后端会走默认值，但补齐后设置页才能正确回显）
+./venv/bin/python - <<'PY'
+import json
+p = "config.json"
+d = json.load(open(p, encoding="utf-8"))
+add = {"AT_REPLY_MAX_AGE": 3600}
+for k in ("CHAT", "VISION", "SEARCH", "IMAGE"):
+    add["PRICE_%s_INPUT" % k] = 0
+    add["PRICE_%s_OUTPUT" % k] = 0
+miss = {k: v for k, v in add.items() if k not in d}
+d.update(miss)
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+print("补齐配置键 %d 个：%s" % (len(miss), sorted(miss)))
+PY
+```
+
+> 清理视频缓存只影响**可再生的分析缓存**，不会动 Cookie、账号、好感度、记忆等任何不可再生数据。备份文件保留在 `data/` 下，可随时还原。
+
 ---
 
 ## 10. 安全加固清单

@@ -359,24 +359,14 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def log_cost(source, input_tokens, output_tokens, model=""):
-    """记录API调用费用，价格从config读取"""
-    from config import get_raw_config
-    cfg = get_raw_config()
-    # 从config读取用户自定义价格（$/1M tokens），默认0
-    # 根据model参数或source匹配模型类型
-    model_lower = (model or source or "").lower()
-    if "vision" in model_lower or "vision" in source.lower():
-        inp_price = cfg.get("PRICE_VISION_INPUT", 0)
-        out_price = cfg.get("PRICE_VISION_OUTPUT", 0)
-    elif "search" in model_lower or "搜索" in source or "search" in source.lower():
-        inp_price = cfg.get("PRICE_SEARCH_INPUT", 0)
-        out_price = cfg.get("PRICE_SEARCH_OUTPUT", 0)
-    elif "image" in model_lower or "图片" in source or "image" in source.lower():
-        inp_price = cfg.get("PRICE_IMAGE_INPUT", 0)
-        out_price = cfg.get("PRICE_IMAGE_OUTPUT", 0)
-    else:
-        inp_price = cfg.get("PRICE_CHAT_INPUT", 0)
-        out_price = cfg.get("PRICE_CHAT_OUTPUT", 0)
+    """记录API调用费用，价格从config读取。
+
+    价格解析与 ai.py 共用 config.resolve_model_price —— 原本两处各写一套匹配规则，
+    面板侧只认英文关键词（"vision"），于是「视频识别」既不匹配 vision、
+    也不匹配 search/image，一律落到对话价格，设置页里「视觉模型」下的价格输入框形同虚设。
+    """
+    from config import resolve_model_price
+    inp_price, out_price = resolve_model_price(source, model)
     cost = input_tokens * inp_price / 1_000_000 + output_tokens * out_price / 1_000_000
     today = datetime.now().strftime("%Y-%m-%d")
     logs = load_json(COST_LOG_FILE, {})

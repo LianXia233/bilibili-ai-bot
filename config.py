@@ -54,6 +54,20 @@ _DEFAULTS = {
     "EMBED_BASE_URL": "",
     "EMBED_MODEL": "",
 
+    # ===== 计费价格（$/1M tokens）=====
+    # 面板「费用统计」按这些值换算金额；前端提示语明确写着「留空=不计费」。
+    # 四个类别与设置页的四组价格输入框一一对应：对话 / 视觉 / 搜索 / 图片。
+    # 注意：这些键必须在这里声明，否则 /api/config 不会下发它们，
+    # 面板的价格输入框永远是空的，且 Bot 侧无从读取用户填的价格。
+    "PRICE_CHAT_INPUT": 0,
+    "PRICE_CHAT_OUTPUT": 0,
+    "PRICE_VISION_INPUT": 0,
+    "PRICE_VISION_OUTPUT": 0,
+    "PRICE_SEARCH_INPUT": 0,
+    "PRICE_SEARCH_OUTPUT": 0,
+    "PRICE_IMAGE_INPUT": 0,
+    "PRICE_IMAGE_OUTPUT": 0,
+
     # ===== 功能开关 =====
     "ENABLE_WEB_SEARCH": True,
     "ENABLE_PROACTIVE": True,
@@ -325,6 +339,51 @@ def get_config():
 def get_raw_config():
     """获取原始配置（不脱敏，仅后端使用）"""
     return _load_config()
+
+# ========== 计费价格解析（前后端共用的单一实现） ==========
+# 为什么放在这里：ai.py（Bot 工作进程）与 local-chat.py（面板进程）都要按价格换算金额。
+# 两处各写一套匹配规则时，会出现「在面板里改了价格，但 Bot 的调用仍按写死的价格计费」——
+# 面板显示与后端真实行为不一致。收敛成一份实现，两边的换算口径才不会再漂移。
+_PRICE_SOURCE_KEYWORDS = (
+    # 先按「调用来源」判定：来源比模型名更能说明这次调用实际在做什么
+    ("PRICE_VISION", ("视频", "识别", "视觉")),
+    ("PRICE_SEARCH", ("搜索",)),
+    ("PRICE_IMAGE", ("图片", "画图", "绘图")),
+)
+_PRICE_MODEL_KEYWORDS = (
+    # 来源无法判定时，再按模型名兜底
+    ("PRICE_VISION", ("vision", "gemini")),
+    ("PRICE_IMAGE", ("image", "dall")),
+    ("PRICE_SEARCH", ("search",)),
+)
+
+def _price_of(cfg, prefix):
+    """读取某类别的（输入价, 输出价），单位 $/1M tokens。缺失或非法一律按 0 处理。"""
+    out = []
+    for suffix in ("_INPUT", "_OUTPUT"):
+        try:
+            v = float(cfg.get(prefix + suffix, 0) or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        out.append(max(0.0, v))
+    return tuple(out)
+
+def resolve_model_price(source, model=""):
+    """按调用来源/模型名解析出 (输入价, 输出价)，单位 $/1M tokens。
+
+    匹配顺序：来源关键词 -> 模型关键词 -> 对话类兜底。
+    来源优先很关键：联网搜索走的是 gemini，若先看模型名会被误判成视觉类。
+    """
+    cfg = get_raw_config()
+    src = str(source or "").lower()
+    mdl = str(model or "").lower()
+    for prefix, kws in _PRICE_SOURCE_KEYWORDS:
+        if any(k in src for k in kws):
+            return _price_of(cfg, prefix)
+    for prefix, kws in _PRICE_MODEL_KEYWORDS:
+        if any(k in mdl for k in kws):
+            return _price_of(cfg, prefix)
+    return _price_of(cfg, "PRICE_CHAT")
 
 # ========== 获取各模型的 API 配置 ==========
 def get_model_config(model_type):
