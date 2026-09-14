@@ -350,6 +350,33 @@ python local-chat.py
 
 > `SLEEP_START=24 / SLEEP_END=0` 表示全天活跃。**不要用 `0/0`** —— 该组合会走跨午夜分支得到恒假条件，等于永久休眠。详见 [FIXES.md](FIXES.md)。
 
+### Token 预算
+
+面板「Token 预算」卡片可按场景调整 `max_tokens`，无需改代码。**换用推理型模型（先思考、再回答）时最需要它**：这类模型的预算是「思考过程 + 正文」共用的，填太小会被思考过程吃光，正文为空、日志报「模型返回空正文」或 `Expecting value`。
+
+| 配置 | 覆盖场景 | 默认 |
+|------|----------|:----:|
+| `MAX_TOKENS_CHAT` | Bot 对话、面板聊天、面板记忆总结 | 300 |
+| `MAX_TOKENS_REPLY` | 评论回复 / 私信回复 | 400 |
+| `MAX_TOKENS_MEMORY_COMPRESS` | 记忆压缩（摘要 + 标签 + 用户事实） | 400 |
+| `MAX_TOKENS_THREAD_COMPRESS` | 历史线程压缩 | 150 |
+| `MAX_TOKENS_EVOLVE` | 性格演化 | 1024 |
+| `MAX_TOKENS_SEARCH` | 联网搜索 | 500 |
+| `MAX_TOKENS_VISION` | 视频 / 截图理解 | 250 |
+| `MAX_TOKENS_RECOGNIZE` | 评论配图识别 | 100 |
+| `MAX_TOKENS_DYNAMIC` | 动态文案 | 500 |
+| `MAX_TOKENS_PROACTIVE_COMMENT` | 主动评论 / 推荐语 | 350 |
+| `MAX_TOKENS_IMAGE_PROMPT` | 生图 prompt 精炼 | 200 |
+| `MAX_TOKENS_REASONING_FLOOR` | 预算被吃光时的重试上限，**0 = 不重试** | 3000 |
+
+三点行为约定：
+
+1. **留空 = 沿用默认值**。面板输入框留空则该项不写入 `config.json`，由 `config.py` 的默认值兜住。
+2. **改完立即生效**，不需要重启 Bot（`get_max_tokens()` 每次读盘，不是启动时快照）。
+3. **调大只抬高上限**，不会凭空增加费用 —— 实际计费仍按模型真实产出的 token 数。
+
+> 面板「测试连接」所用的极小预算（图片模态探测 1 token、文本通道探测 5 token）刻意不纳入配置：它们只验证通道是否可用，调大只会拖慢测试。详见 [FIXES.md 第十二节](FIXES.md#十二模型返回空正文从缓解到根治)。
+
 ### 自定义提示词
 
 面板中可编辑 7 个提示词模板：
@@ -413,6 +440,7 @@ Web 面板完整适配手机浏览器：
 - 聊天界面全屏优化
 - 设置表单触屏友好
 - 兼容 iPhone SE 等小屏设备
+- 底部输入框避让地址栏、软键盘与 Home Indicator（`visualViewport` 同步真实可视高度 + `safe-area-inset-bottom`，见 [FIXES.md 第十三节](FIXES.md#十三移动端底部输入框被遮挡)）
 
 ---
 
@@ -437,6 +465,8 @@ Web 面板完整适配手机浏览器：
 | 搜索模型 | 需要支持联网搜索（online）的模型 |
 | 图片生成 | 需要支持图片输出的模型 |
 | Embedding | 支持中文的 embedding 模型（用于记忆检索） |
+
+> **选推理型模型时**：这类模型会先产出思考过程再产出正文，两者共用 `max_tokens`。默认预算是按普通模型估的，换成推理型后若日志出现「返回空正文」或 `Expecting value`，请到面板「Token 预算」把对应场景调大（对话类建议先试 2000~4000）。机制与排查手法见 [FIXES.md 第十二节](FIXES.md#十二模型返回空正文从缓解到根治)。
 
 ---
 

@@ -278,6 +278,9 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5000/                 
 
 # 6) 自动拉黑开关符合预期（默认应为 False）
 ./venv/bin/python -c "import json;c=json.load(open('config.json'));print(c.get('AUTO_BLOCK_ON_AFFECTION'), c.get('PRIVATE_MESSAGE_AUTO_BLOCK'))"
+
+# 7) Token 预算可读（面板「Token 预算」卡片的取值来源）
+./venv/bin/python -c "import config;print({r: config.get_max_tokens(r) for r in ('chat','reply','search','vision','recognize','evolve')}, config.get_max_tokens('reasoning_floor', minimum=0))"
 ```
 
 预期的自检结果：
@@ -291,6 +294,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5000/                 
 | `/`（登录页） | `200` |
 | `py_compile` | 无输出（即无语法错误） |
 | 自动拉黑开关 | `False False` |
+| Token 预算 | `{'chat': 300, 'reply': 400, 'search': 500, 'vision': 250, 'recognize': 100, 'evolve': 1024} 3000` |
 
 浏览器侧再确认三件事：能登录、能发一条消息并收到回复、侧栏「安全中心」能打开。
 
@@ -347,12 +351,30 @@ add = {"AT_REPLY_MAX_AGE": 3600}
 for k in ("CHAT", "VISION", "SEARCH", "IMAGE"):
     add["PRICE_%s_INPUT" % k] = 0
     add["PRICE_%s_OUTPUT" % k] = 0
+# Token 预算（面板「Token 预算」卡片）。换用推理型模型时按场景调大即可，无需改代码。
+add.update({
+    "MAX_TOKENS_CHAT": 300,
+    "MAX_TOKENS_REPLY": 400,
+    "MAX_TOKENS_MEMORY_COMPRESS": 400,
+    "MAX_TOKENS_THREAD_COMPRESS": 150,
+    "MAX_TOKENS_EVOLVE": 1024,
+    "MAX_TOKENS_SEARCH": 500,
+    "MAX_TOKENS_VISION": 250,
+    "MAX_TOKENS_RECOGNIZE": 100,
+    "MAX_TOKENS_DYNAMIC": 500,
+    "MAX_TOKENS_PROACTIVE_COMMENT": 350,
+    "MAX_TOKENS_IMAGE_PROMPT": 200,
+    # 0 表示不抬升重试（默认 3000）
+    "MAX_TOKENS_REASONING_FLOOR": 3000,
+})
 miss = {k: v for k, v in add.items() if k not in d}
 d.update(miss)
 json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 print("补齐配置键 %d 个：%s" % (len(miss), sorted(miss)))
 PY
 ```
+
+> 不补这 12 个 `MAX_TOKENS_*` 键也能跑 —— `config.py` 的 `_DEFAULTS` 会兜住，`get_max_tokens()` 按内置默认值返回。补齐的意义是设置页能显示当前值（否则输入框是空的，看着像没生效）。
 
 > 清理视频缓存只影响**可再生的分析缓存**，不会动 Cookie、账号、好感度、记忆等任何不可再生数据。备份文件保留在 `data/` 下，可随时还原。
 

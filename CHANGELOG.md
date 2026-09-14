@@ -20,6 +20,8 @@
 
 | 日期 | 类型 | 标题 | 影响面 |
 |------|------|------|--------|
+| 2026-09-14 | `fix(bot)` | 模型返回空正文：改为就地抬升预算重试，Token 预算全面板可配 | 故障修复 |
+| 2026-09-14 | `fix(ui)` | 移动端底部输入框被地址栏 / 软键盘遮挡 | 故障修复 |
 | 2026-09-14 | `docs` | 实测样例脱敏：B 站用户名与业务标识改为占位符 | 文档 |
 | 2026-09-14 | `fix(bot)` | 两条消息流正文统一归一化：剥「回复 @昵称 :」前缀与 @ 噪声 | 故障修复 |
 | 2026-09-14 | `fix(bot)` | 视频上下文与模型通道：@ 类评论改为结合视频标题回复 | 故障修复 |
@@ -42,6 +44,43 @@
 ---
 
 ## [2026-09-14]
+
+### fix(bot) — 模型返回空正文：改为就地抬升预算重试，Token 预算全面板可配
+
+现象：面板报「模型返回空正文（推理型模型可能吃完了 max_tokens）」，Bot 日志同时抛 `json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)`。
+
+根因：推理型模型的 `max_tokens` 是「思考过程 + 正文」共用的预算。调用方按短回复估的 100~400 会被思考过程吃光（实测 `reasoning_len=400`、`finish_reason=length`、`content=''`）。而原实现的预算按候选下标划分 —— 首选通道 `budget = max_tokens`，只有非首选通道才 `max(max_tokens, 1500)`。于是没配备用模型时首选通道直接返回空串；配了备用模型也只是白等一轮并丢掉主模型，病根（预算不足）没解决。空串最终由 `json.loads('')` 抛出，报错文案完全看不出真因。
+
+改动：
+
+| 项 | 说明 |
+|----|------|
+| 每候选两轮 | 首轮用请求预算；`finish_reason == "length"` 时就地抬升到兜底预算重试**同一模型**；仍失败才换候选 |
+| 重试判据 | 用 `finish == "length"` 而非 `not text` —— 区分「预算被吃光」（可解）与「模型确实无话可说」（重试只是烧钱） |
+| 兜底预算可配 | 常量改为面板键 `MAX_TOKENS_REASONING_FLOOR`（默认 3000），**设为 0 即关闭抬升** |
+| 新增 `_usage_of()` | 兼容不返回 `usage` 的网关（按 0 计），避免 `AttributeError` 盖掉真实错误 |
+| 新增 `_reasoning_len()` | 读 `reasoning_content` / `reasoning` 长度，仅用于日志诊断，不作判据 |
+| `json.loads` 容错 | 空正文抛可读 `RuntimeError`；非 JSON 附带原文前 120 字 |
+| 预算全面板可配 | 12 个 `MAX_TOKENS_*` 键，`config.get_max_tokens(reason)` 每次读盘，改完无需重启 Bot |
+
+面板「Token 预算」卡片按场景分组（对话与回复 / 记忆与人格 / 联网与视觉 / 推理兜底）暴露 12 项；面板「测试连接」用的 `max_tokens=1` / `5` 刻意不纳入（只验证通道可用，调大只会拖慢测试）。
+
+线上实测：重启后此前必崩的联网搜索链路完整跑通 —— 先抬升 500 → 3000 拿到搜索结果正文，回复链路再抬升 400 → 3000，崩溃计数 0。
+
+### fix(ui) — 移动端底部输入框被地址栏 / 软键盘遮挡
+
+现象：手机浏览器打开面板，「对话」页底部输入框与发送按钮被地址栏或软键盘盖住，打字时输入框不可见。
+
+三层根因：`100vh` 在移动端取的是「地址栏隐藏时」的大视口；`dvh` 跟随浏览器 UI 但**不跟随软键盘**（键盘不属于浏览器 UI）；Home Indicator 需要 `env(safe-area-inset-bottom)`，而该变量只在 `viewport-fit=cover` 下才非 0。
+
+| 项 | 做法 |
+|----|------|
+| viewport | 补 `viewport-fit=cover, interactive-widget=resizes-content` |
+| `.app` 高度 | `height: 100vh; height: var(--app-height, 100dvh);` 回退链 |
+| 输入区内边距 | 桌面 / 768px / 380px 三档各加 `padding-bottom: calc(Npx + env(safe-area-inset-bottom, 0px))` |
+| JS | `syncAppHeight()` 监听 `visualViewport` 的 `resize` / `scroll`，把真实可视高度同步到 `--app-height` |
+
+三档都要改的原因：媒体查询里的 `.chat-input-area` 是独立规则，会整体覆盖桌面那条声明；只改一处，窄屏依旧被盖。
 
 ### docs — 实测样例脱敏：B 站用户名与业务标识改为占位符
 
