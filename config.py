@@ -73,6 +73,12 @@ _DEFAULTS = {
     "PRIVATE_MESSAGE_MAX_MESSAGE_AGE": 3600,
     "PRIVATE_MESSAGE_MAX_PER_POLL": 3,
 
+    # ===== 评论参数 =====
+    # 「@我的」消息的时效上限（秒）：超过这个时长的 @ 直接跳过、不回复。
+    # 与私信侧的 PRIVATE_MESSAGE_MAX_MESSAGE_AGE 同理：B站消息流按时间倒序返回固定条数，
+    # 且不读即不消，若不加时效判断，首次启用会对着历史 @ 一次性补发一批回复。
+    "AT_REPLY_MAX_AGE": 3600,
+
     # ===== 主动行为开关 =====
     "PROACTIVE_LIKE": True,
     "PROACTIVE_COIN": False,

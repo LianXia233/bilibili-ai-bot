@@ -968,9 +968,158 @@ def get_new_replies():
             "type":      r["business_id"],
             "content":   r["source_content"],
             "username":  item["user"]["nickname"],
-            "mid":       item["user"]["mid"]
+            "mid":       item["user"]["mid"],
+            "via":       "reply",
         })
     return replies
+
+def _strip_at_mentions(text, at_details):
+    """剥掉评论正文里的 @昵称，只留实际说的话。
+
+    昵称直接取自 at_details，不用 "@\\S+" 这类正则 —— B站昵称允许含空格，
+    正则会切错边界。按长度倒序替换，避免短昵称先命中把长昵称切碎。
+    """
+    out = text or ""
+    nicks = sorted({(u.get("nickname") or "").strip() for u in (at_details or [])},
+                   key=len, reverse=True)
+    for nick in nicks:
+        if nick:
+            out = out.replace("@" + nick, " ")
+    return " ".join(out.split())
+
+_AT_EMPTY_CONTENT = "（对方在评论里 @ 了我，但没有写别的内容）"
+
+def _merge_pending(*streams):
+    """合并多个消息流并按 rpid 去重，靠前的流优先。
+
+    同一条评论可能既「回复了我」又「在正文 @ 了我」，会同时出现在两个流里；
+    不合并会导致同一条评论被回复两次（重复烧 token，且用户会看到两条回复）。
+    抽成独立函数是为了能脱离主循环单测。
+    """
+    seen = set()
+    merged = []
+    for stream in streams:
+        for r in (stream or []):
+            rpid = r.get("rpid")
+            if not rpid or rpid in seen:
+                continue
+            seen.add(rpid)
+            merged.append(r)
+    return merged
+
+def get_new_at_replies():
+    """拉取「@我的」消息（/x/msgfeed/at）。
+
+    B站把「别人回复我」和「别人在评论里 @ 我」拆成两套独立的消息流：
+    回复落在 /x/msgfeed/reply，@ 落在 /x/msgfeed/at。此前只轮询了前者，
+    所以在评论区被 @ 完全无响应。
+
+    实测 100 条样本的字段特征（与 reply 流的差异）：
+      - type 恒为 "reply"、business_id 恒为 1（视频评论）
+      - root_id 恒为 0 —— 被 @ 的那条评论本身就是根评论，故回落到 source_id
+      - at_details 恒非空，且必然包含本账号 mid（反例 0 条）
+    只读取，不产生写操作。
+    """
+    try:
+        from config import DEDE_USER_ID as _my_mid   # 取模块当前值，兼容配置热重载
+    except Exception:
+        _my_mid = DEDE_USER_ID
+    me = str(_my_mid or "").strip()
+    if not me or me == "0":
+        print("⚠️ DEDE_USER_ID 未配置，无法判定 @ 是否指向本账号，本轮跳过 @ 消息")
+        return []
+
+    url = "https://api.bilibili.com/x/msgfeed/at"
+    params = {"ps": 20, "pn": 1}
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        print(f"⚠️ @消息接口请求失败：{e}")
+        return []
+
+    code = data.get("code")
+    if code != 0:
+        print(f"⚠️ @消息接口返回错误: code={code}, msg={data.get('message', '')}")
+        return []
+
+    items = data.get("data", {}).get("items", []) or []
+
+    # 时效上限：B站消息流固定返回最新 N 条且「不读即不消」，如果不判时效，
+    # 首次启用会对历史 @ 一次性补发一批回复。默认 1 小时，与私信侧口径一致；
+    # 配成 0 或负数表示不限时效。
+    try:
+        from config import get_raw_config as _raw_cfg
+        max_age = int(_raw_cfg().get("AT_REPLY_MAX_AGE", 3600) or 0)
+    except Exception:
+        max_age = 3600
+    max_age = max_age if max_age > 0 else None
+
+    ats = []
+    skipped_business = 0
+    skipped_not_me = 0
+    skipped_stale = 0
+    now_ts = time.time()
+    for item in items:
+        r = item.get("item") or {}
+        user = item.get("user") or {}
+
+        # 只处理视频评论。其它业务（专栏 / 动态等）调回复接口时 type 参数
+        # 口径与 business_id 并非一一对应，未经取证不贸然发写操作。
+        if r.get("business_id") != 1:
+            skipped_business += 1
+            continue
+
+        # 跳过过期的 @；at_time 缺失时不做时效判断，宁可回一条也不漏
+        at_time = item.get("at_time")
+        if max_age and at_time:
+            try:
+                if now_ts - float(at_time) > max_age:
+                    skipped_stale += 1
+                    continue
+            except (TypeError, ValueError):
+                pass
+
+        # 一条评论可以 @ 很多人，at_details 里是全部被 @ 者。
+        # 只有确实 @ 到本账号才回复，否则会去回复只是顺带 @ 了别人的评论。
+        at_details = r.get("at_details") or []
+        if at_details and me not in {str(u.get("mid")) for u in at_details}:
+            skipped_not_me += 1
+            continue
+
+        rpid = r.get("source_id")
+        oid = r.get("subject_id")
+        if not rpid or not oid:
+            continue
+
+        # at 流的 root_id 恒为 0，用 or 回落到 source_id，
+        # 与 reply 流的取值口径保持一致（回复挂在正确的评论串上）
+        root_rpid = r.get("root_id") or rpid
+        raw_content = r.get("source_content", "") or ""
+        ats.append({
+            "rpid":        rpid,
+            "root_rpid":   root_rpid,
+            "oid":         oid,
+            "thread_id":   f"{root_rpid}:{user.get('mid')}",
+            "type":        r["business_id"],
+            "content":     _strip_at_mentions(raw_content, at_details) or _AT_EMPTY_CONTENT,
+            "raw_content": raw_content,
+            "username":    user.get("nickname"),
+            "mid":         user.get("mid"),
+            "via":         "at",
+        })
+
+    if ats or skipped_business or skipped_not_me or skipped_stale:
+        detail = []
+        if skipped_not_me:
+            detail.append(f"未 @ 到本账号 {skipped_not_me} 条")
+        if skipped_stale:
+            detail.append(f"超过时效 {skipped_stale} 条")
+        if skipped_business:
+            detail.append(f"非视频评论 {skipped_business} 条")
+        print(f"📣 @我的评论 {len(ats)} 条待处理"
+              + (f"（跳过：{'、'.join(detail)}）" if detail else ""))
+    return ats
 
 def get_comment_images(oid, rpid, comment_type):
     url = "https://api.bilibili.com/x/v2/reply/detail"
@@ -1411,10 +1560,18 @@ def run():
             except Exception as exc:
                 print(f"⚠️ 私信轮询失败，本轮继续处理评论：{exc}")
 
+            # 两个消息流都要拉：「回复我的」+「@我的」。
+            # 只拉前者时，在评论区 @ bot 不会触发任何回复。
             replies = get_new_replies()
+            at_replies = get_new_at_replies()
+
+            # 同一条评论可能同时出现在两个流里（既回复了我又在正文 @ 了我），
+            # 由 _merge_pending 按 rpid 去重；放在前面的一侧优先，
+            # 「回复我的」的 root_id 上下文更完整。
+            pending = _merge_pending(replies, at_replies)
             count = 0
 
-            for reply in replies:
+            for reply in pending:
                 rpid = reply["rpid"]
                 mid = str(reply["mid"])
                 thread_id = str(reply["thread_id"])
@@ -1431,7 +1588,13 @@ def run():
 
                 current_score = affection.get(mid, 0)
                 level = get_level(current_score, mid)
-                print(f"\n📩 {reply['username']}（{LEVEL_NAMES[level]} | {current_score}分）：{reply['content']}")
+                # 标明来源：回复我的 / 评论里 @ 我。两条链路的日志文案此前无法区分，
+                # 而 @ 消息的正文里可能只有一串 @昵称，排查时需要知道原文长相。
+                _src = "被@" if reply.get("via") == "at" else "回复"
+                _shown = reply["content"]
+                if reply.get("via") == "at" and reply.get("raw_content") != _shown:
+                    _shown = f"{_shown}（原文：{reply['raw_content']}）"
+                print(f"\n📩 [{_src}] {reply['username']}（{LEVEL_NAMES[level]} | {current_score}分）：{_shown}")
 
                 # 获取视频上下文
                 video_context = get_video_context(reply["oid"], reply["type"])
