@@ -18,6 +18,7 @@
 
 | 日期 | 类型 | 标题 | 影响面 |
 |------|------|------|--------|
+| 2026-09-14 | `fix(ui)` | 移动端点菜单后遮罩压住侧栏导致无法操作 | 故障修复 |
 | 2026-09-14 | `feat(security)` | 关闭自动拉黑，改为「拉黑建议 + 人工确认」 | 行为变更 |
 | 2026-09-14 | `fix(panel)` | 首页聊天 500：Embedding 不可用改为降级 | 故障修复 |
 | 2026-09-14 | `feat(security)` | 面板口令密封、代理感知 TLS 与默认拒绝鉴权 | 安全加固 |
@@ -32,6 +33,48 @@
 ---
 
 ## [2026-09-14]
+
+### fix(ui) — 移动端点菜单后遮罩压住侧栏导致无法操作
+
+手机浏览器上点汉堡按钮打开侧栏后，页面出现一层「看不见的墙」：侧栏看得见却点不动，任何导航项都无响应，只能刷新页面。
+
+根因是 **CSS 层叠上下文**嵌套错位，而非样式缺失。
+
+| 项 | 修复前 | 修复后 |
+|------|--------|--------|
+| `.mobile-overlay` 的 DOM 位置 | `<body>` 直接子元素（与 `.app` 平级） | `.app` 的最后一个子元素 |
+| `.mobile-overlay` 的 `position` | `fixed` | `absolute`（相对 `.app`，尺寸仍为满屏） |
+| 移动端 `.sidebar` 的 `z-index` | `100` | `110` |
+| 层叠比较对象 | 遮罩(90) vs `.app`(1) → 遮罩胜 | 遮罩(90) vs 侧栏(110) / `.main`(0) |
+
+`.app` 声明了 `position: relative` + `z-index: 1`，这会**创建层叠上下文**。于是 `.sidebar` 的 `z-index: 100` 只在 `.app` 内部有效，对外只体现 `.app` 的 `z-index: 1`。遮罩作为兄弟节点，`90 > 1`，**永久压在包含侧栏在内的整个 `.app` 之上**。把遮罩移入 `.app` 后，它才与侧栏、`.main` 处于同一个层叠上下文，层级比较才有意义。
+
+最终层级：`壁纸(0) < .main(0) < 遮罩(90) < 侧栏(110)` —— 遮罩盖住主内容、不盖侧栏。
+
+<details>
+<summary><b>验证方式</b></summary>
+
+<br>
+
+移动视口（390×844，`is_mobile` + `has_touch`）走真实公网入口，登录后逐点断言：
+
+- 层级断言：打开侧栏后 `elementFromPoint` 在侧栏中央返回 `DIV.nav-item`（修复前返回 `DIV.mobile-overlay`），遮罩的 `parentElement` 为 `DIV.app`（修复前为 `BODY`）
+- 交互断言：`page.click('.sidebar .nav-item')` 成功（修复前 Playwright 报 `intercepts pointer events` 超时），且遮罩与侧栏同步收起
+- 功能保留断言：遮罩显示时主内容区中央仍命中遮罩，说明它依然拦截主内容点击，没有退化成无效元素
+- 重复打开、二次点击、无 JS 报错
+
+</details>
+
+<details>
+<summary><b>附带修正：改模板必须重启进程</b></summary>
+
+<br>
+
+`local-chat.py` 以 `debug=False` 运行（`app.run(..., debug=False, ...)`），且通过 `Flask(__name__, template_folder=".")` 直接加载仓库根目录的 `chat.html`。此时 Jinja 会**缓存已编译模板**，仅替换磁盘上的 `chat.html` 不会生效，必须 `systemctl restart bilibili-panel`。
+
+本次排查中曾据此误判为「浏览器缓存」，实际是服务端模板缓存：回源 `GET /` 返回的 HTML 长度与旧版一致，重启后立即变为新版。
+
+</details>
 
 ### feat(security) — 关闭自动拉黑，改为「拉黑建议 + 人工确认」
 

@@ -356,7 +356,7 @@ html[data-theme="dark"] .char-dark  { display: block; }
   display: flex;
   height: 100vh;
   position: relative;
-  z-index: 1;
+  z-index: 1;                  /* 创建层叠上下文：.sidebar / .mobile-overlay 的层级在此内部比较 */
 }
 
 /* ============================================================
@@ -1000,10 +1000,14 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
   padding: 32px;
 }
 
-/* ===== 移动端遮罩 ===== */
+/* ===== 移动端遮罩 =====
+   注意：本节点必须位于 .app 内部（.app 因 position:relative + z-index:1
+   创建了层叠上下文），否则其 z-index 会与 .app 整体比较，
+   直接压住包括侧栏在内的全部内容，导致导航项无法点击。
+   层级期望：壁纸(0) < .main(0) < 遮罩(90) < 侧栏(110) */
 .mobile-overlay {
   display: none;
-  position: fixed;
+  position: absolute;
   top: 0; left: 0; right: 0; bottom: 0;
   background: rgba(11, 33, 54, 0.45);
   backdrop-filter: blur(2px);
@@ -1427,7 +1431,7 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
     position: fixed;
     left: -280px;
     top: 0; bottom: 0;
-    z-index: 100;
+    z-index: 110;              /* 必须高于 .mobile-overlay(90)，否则遮罩会挡住导航项 */
     transition: left 0.3s var(--ease);
   }
   .sidebar.open {
@@ -1584,7 +1588,6 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
   <p id="loginError" style="color:#e74c3c; font-size:13px; display:none;"></p>
 </div>
 
-<div class="mobile-overlay" id="mobileOverlay" onclick="closeSidebar()"></div>
 <div class="toast-container" id="toastContainer"></div>
 
 <div class="app">
@@ -2453,6 +2456,7 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
 </div>
 
   </div>
+  <div class="mobile-overlay" id="mobileOverlay" onclick="closeSidebar()"></div>
 </div>
 
 <div class="modal-overlay" id="modalOverlay" onclick="if(event.target===this)closeModal()">
