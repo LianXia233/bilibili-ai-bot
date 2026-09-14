@@ -5,6 +5,7 @@ import math
 import subprocess
 import random
 import base64
+import re
 import sys
 import os
 from datetime import datetime
@@ -1030,6 +1031,11 @@ def get_new_replies():
     for item in items:
         r = item["item"]
         _root_rpid = r.get("root_id") or r["source_id"]
+        # 两条流用同一套正文归一化：先剥 B站 自动加的「回复 @昵称 :」前缀，
+        # 再剥正文里 @ 到的昵称。否则模型会把「回复 @我自己」当成用户的话。
+        source_content = r.get("source_content") or ""
+        stripped = _strip_at_mentions(
+            _strip_reply_prefix(source_content), r.get("at_details") or [])
         replies.append({
             "rpid":      r["source_id"],
             "root_rpid": _root_rpid,
@@ -1038,10 +1044,14 @@ def get_new_replies():
             # 同一用户的连续对话仍保留上下文
             "thread_id": f"{_root_rpid}:{item['user']['mid']}",
             "type":      r["business_id"],
-            "content":   r["source_content"],
+            "content":   stripped or _AT_EMPTY_CONTENT,
+            "raw_content": source_content,
             "username":  item["user"]["nickname"],
             "mid":       item["user"]["mid"],
             "via":       "reply",
+            # 剥完之后什么都不剩（例如只有「回复 @我 :」+ 表情），
+            # 与只 @ 不说话是同一种情况，提示词要走同一套引导
+            "no_content": not stripped,
         })
     return replies
 
@@ -1060,6 +1070,20 @@ def _strip_at_mentions(text, at_details):
     return " ".join(out.split())
 
 _AT_EMPTY_CONTENT = "（对方在评论里 @ 了我，但没有写别的内容）"
+
+# B站 会给「回复某条评论」的正文自动加前缀，实测形态为「回复 @昵称 :正文」
+# （昵称可含空格，故用 [^:：] 而不是 \S 去界定边界）。
+# 必须要求出现冒号才剥离 —— 否则用户真写「回复你一下」这种正文会被吃掉开头。
+_BILI_REPLY_PREFIX = re.compile(r"^\s*回复\s*(?:@[^:：]{0,80})?\s*[:：]\s*")
+
+def _strip_reply_prefix(text):
+    """去掉 B站 自动加的「回复 @昵称 :」前缀。
+
+    reply 流的 source_content 实测形如「回复 @<Bot昵称> :凑卡奴[…]」。
+    前缀里的「回复」和机器人自己的昵称都是噪声，直接喂给模型会让它看到
+    「有人在回复 @我自己」，比「有人对我说了句什么」多一层无关信息。
+    """
+    return _BILI_REPLY_PREFIX.sub("", text or "", count=1)
 
 def _merge_pending(*streams):
     """合并多个消息流并按 rpid 去重，靠前的流优先。
@@ -1709,7 +1733,8 @@ def run():
                 # 而 @ 消息的正文里可能只有一串 @昵称，排查时需要知道原文长相。
                 _src = "被@" if reply.get("via") == "at" else "回复"
                 _shown = reply["content"]
-                if reply.get("via") == "at" and reply.get("raw_content") != _shown:
+                # 归一化后正文与原文字面不同时附上原文，方便排查「模型到底看到了什么」
+                if reply.get("raw_content") and reply.get("raw_content") != _shown:
                     _shown = f"{_shown}（原文：{reply['raw_content']}）"
                 # 带上 rpid：日志行要能对应到具体某条评论，否则「这条到底回了没」无法追查
                 print(f"\n📩 [{_src}] rpid={rpid} {reply['username']}"
