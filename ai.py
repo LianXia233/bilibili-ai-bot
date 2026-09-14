@@ -252,11 +252,59 @@ def _reasoning_len(choice):
     return 0
 
 
-def _complete_with(candidates, content, max_tokens, label):
+# ========== 模型速率限制（TPM 滑窗） ==========
+# 与面板的 RATE_LIMIT_*_TPM 一一对应，默认值取各模型的网关配额：
+# 对白类（spark-x2.5-4b）1,000,000 TPM；视觉类（DeepSeek-OCR）不限 —— OCR 单次
+# 输出只有一两百 token，给它限流只会让视频分析平白多等一个窗口。
+# 数值是「防超配额」的保险而非节流阀：换成小配额模型时不必改代码。
+_RATE_WINDOW = 60.0
+_rate_usage = {}  # scene -> [(timestamp, tokens), ...]
+
+
+def _rate_limit_of(scene):
+    """读面板配置的 TPM 上限；配置读取异常时视为不限，避免拖垮调用链。"""
+    try:
+        from config import get_rate_limit
+        return get_rate_limit(scene)
+    except Exception:
+        return 0
+
+
+def _rate_limit_wait(scene, est_tokens):
+    """窗口内累计消耗将超上限时先等待窗口滑出。返回等待秒数（0 = 未触发）。"""
+    limit = _rate_limit_of(scene)
+    if not limit:
+        return 0.0
+    now = time.time()
+    hist = _rate_usage.setdefault(scene, [])
+    hist[:] = [item for item in hist if now - item[0] < _RATE_WINDOW]
+    used = sum(n for _, n in hist)
+    if used + est_tokens <= limit:
+        return 0.0
+    # 等到最早那笔滑出窗口为止
+    wait = max(0.0, min(_RATE_WINDOW - (now - hist[0][0]) if hist else 0.0, _RATE_WINDOW))
+    if wait > 0:
+        print(f"  ⏳ {scene} 触发 TPM 限流（窗口内 {used}/{limit} token），等待 {wait:.1f}s")
+        time.sleep(wait)
+        now2 = time.time()
+        hist[:] = [item for item in hist if now2 - item[0] < _RATE_WINDOW]
+    return wait
+
+
+def _rate_limit_record(scene, tokens):
+    """记一次实际消耗（输入 + 输出）。"""
+    if not scene or not tokens:
+        return
+    _rate_usage.setdefault(scene, []).append((time.time(), int(tokens)))
+
+
+def _complete_with(candidates, content, max_tokens, label, scene=None):
     """按候选链依次尝试，返回 (正文, 输入tokens, 输出tokens, 实际模型名)。
 
     content 可以是纯文本字符串，也可以是 OpenAI 的多模态 content 数组
     （图文混合），对话 / 联网搜索 / 视觉三类调用共用这一条链路。
+
+    scene 用于 TPM 限流归组（chat / search / vision / image），留空则不限流。
 
     推理型模型的预算策略：
     调用方传的 max_tokens 是按「短回复」估的（100~400），推理型模型会先把预算
@@ -280,6 +328,8 @@ def _complete_with(candidates, content, max_tokens, label):
             if _b > budgets[-1]:
                 budgets.append(_b)
         for attempt, budget in enumerate(budgets):
+            # 每次真正发起请求前过一次 TPM 检查（用本次预算作保守估计）
+            _rate_limit_wait(scene, budget)
             try:
                 resp = _chat_client(base_url, api_key).chat.completions.create(
                     model=model,
@@ -289,6 +339,8 @@ def _complete_with(candidates, content, max_tokens, label):
                 choice = resp.choices[0]
                 text = (choice.message.content or "").strip()
                 in_tok, out_tok = _usage_of(resp)
+                # 记录实际消耗（含被截断那轮 —— 截断同样占用了配额）
+                _rate_limit_record(scene, in_tok + out_tok)
                 finish = getattr(choice, "finish_reason", "") or ""
                 # 判据必须是「有正文 **且** 不是被截断」。只看 text 非空，会把被
                 # 截断的半截 JSON（如 {"reply": "… 断在这里）当成成功返回；上层
@@ -332,7 +384,7 @@ def claude_chat(prompt, max_tokens=None):
         from config import get_max_tokens
         max_tokens = get_max_tokens("chat")
     text, in_tok, out_tok, _model = _complete_with(
-        _chat_candidates(), prompt, max_tokens, "对话")
+        _chat_candidates(), prompt, max_tokens, "对话", scene="chat")
     return text, in_tok, out_tok
 
 SEARCH_KEYWORDS = [
@@ -361,7 +413,7 @@ def web_search(query):
         print(f"🔍 联网搜索：{query}")
         result, in_tok, out_tok, model = _complete_with(
             _search_candidates(), f"{search_prefix}{query}",
-            get_max_tokens("search"), "联网搜索")
+            get_max_tokens("search"), "联网搜索", scene="search")
         if not result:
             print("⚠️ 联网搜索失败：候选通道都没返回内容")
             return ""
@@ -457,7 +509,8 @@ def analyze_video_with_gemini(video_info):
             content.append({"type": "text", "text":
                             "请提取这张图片中的所有文字，并用中文简要描述画面内容（50字以内）。"})
             cover_text, _it, _ot, _m = _complete_with(
-                _vision_candidates(), content, get_max_tokens("vision"), "封面识别")
+                _vision_candidates(), content, get_max_tokens("vision"), "封面识别",
+                scene="vision")
             if not cover_text:
                 print("  ⚠️ 封面未识别出内容，仅凭标题与简介生成概括")
 
@@ -480,7 +533,8 @@ UP主：{video_info.get('owner_name', '未知')}
 
 直接输出概括内容，不要加前缀。"""
         result, in_tok, out_tok, model = _complete_with(
-            _chat_candidates(), text_prompt, get_max_tokens("chat"), "视频概括")
+            _chat_candidates(), text_prompt, get_max_tokens("chat"), "视频概括",
+            scene="chat")
         if not result:
             return _video_fallback_text(video_info)
         log_cost("视频识别", in_tok, out_tok, model=model)
@@ -570,7 +624,19 @@ def update_user_profile(mid, impression=None, new_facts=None, new_tags=None):
 
 # ========== 时间判断 ==========
 def is_active_time():
-    from config import SLEEP_START, SLEEP_END
+    """是否处于工作时间。休眠总开关关闭时直接返回 True（全天在线）。
+
+    ENABLE_SLEEP（面板「调度参数」里的开关，默认关闭）只是总开关，
+    SLEEP_START / SLEEP_END 的时段判断完整保留：
+      - 关闭 = 全天在线，完全不看时段
+      - 打开 = 按 SLEEP_START ~ SLEEP_END 休息，跨午夜写法（如 24 ~ 8）也支持
+    默认关闭的原因：休眠窗口内主循环直接 continue，既不拉取也不回复，
+    而「@我的」消息受 AT_REPLY_MAX_AGE 时效约束，睡满一夜会把这段时间的
+    消息全部作废 —— 需要机器人按点休息时，把开关打开即可。
+    """
+    from config import ENABLE_SLEEP, SLEEP_START, SLEEP_END
+    if not ENABLE_SLEEP:
+        return True
     hour = datetime.now().hour
     if SLEEP_START < SLEEP_END:
         return hour < SLEEP_START or hour >= SLEEP_END
@@ -1374,7 +1440,8 @@ def recognize_images(image_urls):
         # 走视觉候选通道（视觉类没配则回落对话类）；此前写死 OR_VISION_MODEL，
         # 该键为空时图片识别 100% 失败，「只 @ + 发图」的评论等于没有图片信息。
         result, in_tok, out_tok, model = _complete_with(
-            _vision_candidates(), content, get_max_tokens("recognize"), "图片识别")
+            _vision_candidates(), content, get_max_tokens("recognize"), "图片识别",
+            scene="vision")
         if not result:
             return ""
         # 来源名带「识别」二字 -> 按视觉价计费（见 config.resolve_model_price）

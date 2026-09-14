@@ -106,8 +106,13 @@ _DEFAULTS = {
     "PROACTIVE_TIMES_COUNT": 2,    # 每天触发几次主动评论
     "DYNAMIC_ENABLED": True,
     "EVOLVE_HOUR": 1,              # 性格演化时间（0-23）
-    "SLEEP_START": 24,              # 休眠开始
+    "SLEEP_START": 24,              # 休眠开始（仅在启用休眠时生效）
     "SLEEP_END": 0,                # 休眠结束
+    # 休眠总开关。默认 False = 不休眠，机器人全天在线。
+    # 为什么要有这个开关：休眠窗口内主循环会直接 continue，既不拉取也不回复，
+    # 而「@我的」消息有 AT_REPLY_MAX_AGE 时效，睡 8 小时会把夜间消息全部作废。
+    # 要让机器人按 SLEEP_START/SLEEP_END 休息，把这里设为 True。
+    "ENABLE_SLEEP": False,
 
     # ===== 权重参数 =====
     "MOOD_WEIGHT": 0.5,            # 心情对回复的影响程度 0-1
@@ -169,6 +174,15 @@ _DEFAULTS = {
     # 推理型模型被截断时的兜底抬升预算：正文为空且 finish_reason == "length" 时，
     # 用这个值对同一模型重试一轮。设 0 = 不抬升，完全按上面的场景预算执行。
     "MAX_TOKENS_REASONING_FLOOR": 6000,
+
+    # ===== 模型速率限制（TPM = 每分钟 token 上限，0 = 不限） =====
+    # 取值来自各模型在网关侧的实际配额：对白类（spark-x2.5-4b）1,000,000 TPM；
+    # 视觉类（DeepSeek-OCR）不做限制 —— 它单次输出仅一两百 token，限流只会
+    # 白白拖慢视频分析。真到超配额时表现为 429，届时再往下调。
+    "RATE_LIMIT_CHAT_TPM": 1000000,
+    "RATE_LIMIT_SEARCH_TPM": 1000000,
+    "RATE_LIMIT_VISION_TPM": 0,
+    "RATE_LIMIT_IMAGE_TPM": 0,
 }
 
 # ========== 加载/保存 ==========
@@ -253,6 +267,7 @@ DYNAMIC_ENABLED = _cfg.get("DYNAMIC_ENABLED", True)
 EVOLVE_HOUR = _cfg.get("EVOLVE_HOUR", 1)
 SLEEP_START = _cfg.get("SLEEP_START", 24)
 SLEEP_END = _cfg.get("SLEEP_END", 0)
+ENABLE_SLEEP = _cfg.get("ENABLE_SLEEP", False)
 
 # 权重
 MOOD_WEIGHT = _cfg.get("MOOD_WEIGHT", 0.5)
@@ -284,7 +299,7 @@ def reload_config():
     global ENABLE_PRIVATE_MESSAGES, PRIVATE_MESSAGE_AUTO_REPLY, PRIVATE_MESSAGE_AUTO_BLOCK
     global PROACTIVE_LIKE, PROACTIVE_COIN, PROACTIVE_FAV, PROACTIVE_FOLLOW, PROACTIVE_COMMENT
     global PROACTIVE_VIDEO_COUNT, PROACTIVE_COMMENT_COUNT, PROACTIVE_TIMES_COUNT
-    global DYNAMIC_ENABLED, EVOLVE_HOUR, SLEEP_START, SLEEP_END
+    global DYNAMIC_ENABLED, EVOLVE_HOUR, SLEEP_START, SLEEP_END, ENABLE_SLEEP
     global MOOD_WEIGHT, ACTIVE_PERSONA
     global PROMPT_DYNAMIC, PROMPT_PROACTIVE_COMMENT, PROMPT_VIDEO_EVALUATE
     global PROMPT_PERSONALITY_EVOLVE, PROMPT_SEARCH_PREFIX, PROMPT_IMAGINE
@@ -336,6 +351,7 @@ def reload_config():
     EVOLVE_HOUR = _cfg.get("EVOLVE_HOUR", 1)
     SLEEP_START = _cfg.get("SLEEP_START", 24)
     SLEEP_END = _cfg.get("SLEEP_END", 0)
+    ENABLE_SLEEP = _cfg.get("ENABLE_SLEEP", False)
     MOOD_WEIGHT = _cfg.get("MOOD_WEIGHT", 0.5)
     ACTIVE_PERSONA = _cfg.get("ACTIVE_PERSONA", "default")
     PROMPT_DYNAMIC = _cfg.get("PROMPT_DYNAMIC", "")
@@ -458,6 +474,35 @@ def get_max_tokens(reason, minimum=1):
     except (TypeError, ValueError):
         v = fallback
     return max(minimum, v)
+
+# ========== 模型速率限制解析（面板可调，改完即时生效） ==========
+# 与 Token 预算同理：ai.py（Bot 进程）与 local-chat.py（面板进程）读同一份配置，
+# 每次都读盘而不是缓存快照，面板改完无需重启即生效。
+# 0 表示「不限」—— 视觉/OCR 类默认不限，因为单次输出只有一两百 token，
+# 给它限流只会让视频分析平白多等一轮窗口。
+_RATE_LIMIT_DEFAULT = {
+    "chat": 1000000,
+    "search": 1000000,
+    "vision": 0,
+    "image": 0,
+}
+
+def get_rate_limit(scene):
+    """读取某场景的 TPM 上限（每分钟 token 数）。返回 0 表示不限。
+
+    scene: chat / search / vision / image
+    """
+    key = str(scene or "chat").lower()
+    fallback = _RATE_LIMIT_DEFAULT.get(key, 0)
+    raw = get_raw_config().get("RATE_LIMIT_%s_TPM" % key.upper(), fallback)
+    # 与 get_max_tokens 同款：0 是合法值（不限），不能用 `or fallback` 把它吃掉
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = fallback
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        v = fallback
+    return max(0, v)
 
 # ========== 获取各模型的 API 配置 ==========
 def get_model_config(model_type):

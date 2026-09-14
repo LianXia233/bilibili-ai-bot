@@ -1605,6 +1605,8 @@ def api_get_schedule():
         "EVOLVE_HOUR": cfg.get("EVOLVE_HOUR", 1),
         "SLEEP_START": cfg.get("SLEEP_START", 2),
         "SLEEP_END": cfg.get("SLEEP_END", 8),
+        # 休眠总开关：默认关闭 = 全天在线。面板「调度参数」里的勾选框对应它。
+        "ENABLE_SLEEP": cfg.get("ENABLE_SLEEP", False),
         "MOOD_WEIGHT": cfg.get("MOOD_WEIGHT", 0.5),
     })
 
@@ -1614,7 +1616,7 @@ def api_update_schedule():
     data = request.json
     allowed = {
         "PROACTIVE_VIDEO_COUNT", "PROACTIVE_COMMENT_COUNT", "PROACTIVE_TIMES_COUNT",
-        "EVOLVE_HOUR", "SLEEP_START", "SLEEP_END", "MOOD_WEIGHT",
+        "EVOLVE_HOUR", "SLEEP_START", "SLEEP_END", "MOOD_WEIGHT", "ENABLE_SLEEP",
     }
     updates = {k: v for k, v in data.items() if k in allowed}
     if not updates:

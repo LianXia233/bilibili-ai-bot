@@ -346,9 +346,10 @@ python local-chat.py
 | `PROACTIVE_VIDEO_COUNT` | 每天刷几个视频 | 3 |
 | `PROACTIVE_COMMENT_COUNT` | 每天评论几条 | 2 |
 | `PROACTIVE_TIMES_COUNT` | 每天触发几次 | 2 |
-| `SLEEP_START` ~ `SLEEP_END` | 休眠时间段 | 2:00 ~ 8:00 |
+| `ENABLE_SLEEP` | 休眠总开关，`false` = 全天在线，不看时段 | `false` |
+| `SLEEP_START` ~ `SLEEP_END` | 休眠时间段（总开关打开后才生效） | 2:00 ~ 8:00 |
 
-> `SLEEP_START=24 / SLEEP_END=0` 表示全天活跃。**不要用 `0/0`** —— 该组合会走跨午夜分支得到恒假条件，等于永久休眠。详见 [FIXES.md](FIXES.md)。
+> 休眠默认**关闭**（`ENABLE_SLEEP=false`，机器人 24 小时在线），面板「调度参数」里有对应勾选框。打开后才按 `SLEEP_START` ~ `SLEEP_END` 判定；`24 / 0` 也表示全天活跃，但**不要用 `0/0`** —— 该组合会走跨午夜分支得到恒假条件，等于永久休眠。详见 [FIXES.md 第十六节](FIXES.md#十六休眠总开关与模型-tpm-限速)。
 
 ### Token 预算
 
@@ -376,6 +377,24 @@ python local-chat.py
 3. **调大只抬高上限**，不会凭空增加费用 —— 实际计费仍按模型真实产出的 token 数。
 
 > 面板「测试连接」所用的极小预算（图片模态探测 1 token、文本通道探测 5 token）刻意不纳入配置：它们只验证通道是否可用，调大只会拖慢测试。详见 [FIXES.md 第十二节](FIXES.md#十二模型返回空正文从缓解到根治)。
+
+### 模型速率限制（TPM）
+
+面板「🚦 模型速率限制」卡片按场景限制每分钟 token 数，用来兜住网关侧配额（超出会返回 429）。
+
+| 配置 | 覆盖场景 | 默认 |
+|------|----------|:----:|
+| `RATE_LIMIT_CHAT_TPM` | 对话回复、视频信息文本归纳 | 1000000 |
+| `RATE_LIMIT_SEARCH_TPM` | 联网搜索 | 1000000 |
+| `RATE_LIMIT_VISION_TPM` | 视频封面 / 评论配图读图 | 0（不限） |
+| `RATE_LIMIT_IMAGE_TPM` | 生图 prompt | 0（不限） |
+
+**`0` 表示不限。** 视觉 / 生图类默认不限：OCR 单次输出只有一两百 token，
+限流换不来配额保护，只会让视频分析平白多等一个窗口。
+
+与 Token 预算同样是**每次读盘**，改完立即生效；面板留空 = 沿用默认值。
+窗口按固定 60 秒滑动，累计将超限时先等到最早一笔滑出再发请求。
+机制与坑见 [FIXES.md 第十六节](FIXES.md#十六休眠总开关与模型-tpm-限速)。
 
 ### 自定义提示词
 
@@ -538,7 +557,7 @@ Embedding 模型没配置（`EMBED_MODEL` 为空串）导致记忆检索抛异�
 按顺序检查：
 
 1. Cookie 是否有效（面板中检查状态）
-2. 是否在休眠时间段内（默认 2:00-8:00 不工作；注意 `SLEEP_START=24 / SLEEP_END=0` 才是全天活跃）
+2. 休眠总开关是否被打开（`ENABLE_SLEEP`，默认 `false` = 全天在线；打开后才按 `SLEEP_START` ~ `SLEEP_END` 判定）
 3. 是否有新评论（Bot 只回复启动后的新评论）
 4. 终端日志是否有报错 —— 尤其注意 `NameError` 这类只在特定分支才暴露的漏导入
 

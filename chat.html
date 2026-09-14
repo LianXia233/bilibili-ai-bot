@@ -2374,9 +2374,17 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
           <input type="number" id="sch_evolve_hour" min="0" max="23" value="1">
         </div>
         <div class="settings-field">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" id="sch_enable_sleep" style="width:auto;margin:0;">
+            <span>启用休眠（默认关闭 = 全天在线）</span>
+          </label>
+          <p style="font-size:11px;color:var(--text-dim);margin:4px 0 8px;line-height:1.6;">
+            关闭时机器人 24 小时在线；打开后按下面的时段休息。休眠期间既不拉取也不回复，
+            而「@我」的消息有 AT_REPLY_MAX_AGE（默认 3600 秒）时效，睡满一夜会把这段时间的消息作废。
+          </p>
           <label>休眠时段（开始-结束）</label>
           <div style="display:flex;gap:8px;align-items:center;">
-            <input type="number" id="sch_sleep_start" min="0" max="23" value="2" style="width:80px;">
+            <input type="number" id="sch_sleep_start" min="0" max="23" value="24" style="width:80px;">
             <span style="color:var(--text-dim)">点 ~ </span>
             <input type="number" id="sch_sleep_end" min="0" max="23" value="8" style="width:80px;">
             <span style="color:var(--text-dim)">点</span>
@@ -2479,11 +2487,43 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
           <label>预算被吃光时的重试上限（0 = 不重试）</label>
           <input type="number" id="tok_reasoning_floor" min="0" placeholder="6000">
           <p style="font-size:11px;color:var(--text-dim);margin-top:2px;line-height:1.6;">
-            正文为空且 finish_reason=length 时，用这个预算对同一模型重试一轮。默认 3000 足够多数推理模型。
+            正文为空或被截断时，用这个预算对同一模型重试一轮。默认 6000（实测对白类真实提示词需要 1500~2000 才够一轮成功，兜底值留一档余量）。
           </p>
         </div>
 
         <button class="settings-btn primary" onclick="saveMaxTokens()" style="margin-top:8px;">保存 Token 预算</button>
+      </div>
+    </div>
+
+    <!-- 模型速率限制 -->
+    <div class="settings-card">
+      <div class="settings-card-header">
+        <span class="settings-card-title">🚦 模型速率限制</span>
+      </div>
+      <div class="settings-card-body">
+        <p style="font-size:12px;color:var(--text-dim);margin:0 0 12px;line-height:1.7;">
+          TPM = 每分钟 token 上限，用来兜住网关侧的配额（超出会返回 429）。
+          <strong>0 表示不限</strong>。默认按当前模型的实际配额给：对白类（spark-x2.5-4b）1,000,000；
+          视觉 / 生图类不限 —— OCR 单次输出只有一两百 token，限流只会白白拖慢视频分析。
+          留空 = 不写入，沿用服务端默认值。
+        </p>
+        <div class="settings-field">
+          <label>对话类 TPM</label>
+          <input type="number" id="rl_chat" min="0" placeholder="1000000">
+        </div>
+        <div class="settings-field">
+          <label>联网搜索 TPM</label>
+          <input type="number" id="rl_search" min="0" placeholder="1000000">
+        </div>
+        <div class="settings-field">
+          <label>视觉类 TPM（0 = 不限）</label>
+          <input type="number" id="rl_vision" min="0" placeholder="0">
+        </div>
+        <div class="settings-field">
+          <label>生图类 TPM（0 = 不限）</label>
+          <input type="number" id="rl_image" min="0" placeholder="0">
+        </div>
+        <button class="settings-btn primary" onclick="saveRateLimits()" style="margin-top:8px;">保存速率限制</button>
       </div>
     </div>
 
@@ -4276,8 +4316,11 @@ async function loadSchedule() {
     document.getElementById('sch_comment_count').value = data.PROACTIVE_COMMENT_COUNT || 2;
     document.getElementById('sch_times_count').value = data.PROACTIVE_TIMES_COUNT || 2;
     document.getElementById('sch_evolve_hour').value = data.EVOLVE_HOUR || 1;
-    document.getElementById('sch_sleep_start').value = data.SLEEP_START || 2;
-    document.getElementById('sch_sleep_end').value = data.SLEEP_END || 8;
+    // 用 ?? 而不是 ||：SLEEP_START / SLEEP_END 的 0 是合法值，
+    // `0 || 2` 会把它悄悄改成 2（例如「24~0」这种全天写法会被改坏）
+    document.getElementById('sch_sleep_start').value = data.SLEEP_START ?? 24;
+    document.getElementById('sch_sleep_end').value = data.SLEEP_END ?? 0;
+    document.getElementById('sch_enable_sleep').checked = !!data.ENABLE_SLEEP;
     document.getElementById('sch_mood_weight').value = data.MOOD_WEIGHT || 0.5;
     document.getElementById('mood_weight_val').textContent = data.MOOD_WEIGHT || 0.5;
     // 加载UIDs和TIDs
@@ -4311,6 +4354,7 @@ async function saveSchedule() {
     EVOLVE_HOUR: parseInt(document.getElementById('sch_evolve_hour').value),
     SLEEP_START: parseInt(document.getElementById('sch_sleep_start').value),
     SLEEP_END: parseInt(document.getElementById('sch_sleep_end').value),
+    ENABLE_SLEEP: document.getElementById('sch_enable_sleep').checked,
     MOOD_WEIGHT: parseFloat(document.getElementById('sch_mood_weight').value),
   };
   try {
@@ -4373,6 +4417,49 @@ async function saveMaxTokens() {
     const resp = await apiFetch('/api/config/update', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(updates)});
     const data = await resp.json();
     data.ok ? toast(`Token 预算已保存（${Object.keys(updates).length} 项）`, 'success', 3000) : toast('保存失败', 'error');
+  } catch(e) { toast('保存失败', 'error'); }
+}
+
+// ===== 模型速率限制（TPM）=====
+// 与 config.py 的 RATE_LIMIT_*_TPM / get_rate_limit() 场景名一一对应。
+const RATE_LIMIT_FIELDS = {
+  RATE_LIMIT_CHAT_TPM: 'rl_chat',
+  RATE_LIMIT_SEARCH_TPM: 'rl_search',
+  RATE_LIMIT_VISION_TPM: 'rl_vision',
+  RATE_LIMIT_IMAGE_TPM: 'rl_image',
+};
+
+async function loadRateLimits() {
+  try {
+    const resp = await apiFetch('/api/config/raw');
+    const cfg = (await resp.json()).config || {};
+    for (const [key, id] of Object.entries(RATE_LIMIT_FIELDS)) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      const v = cfg[key];
+      // 空值留空 -> 保存时跳过，语义为「沿用服务端默认值」
+      el.value = (v === undefined || v === null || v === '') ? '' : v;
+    }
+  } catch(e) { console.error(e); }
+}
+
+async function saveRateLimits() {
+  const updates = {};
+  for (const [key, id] of Object.entries(RATE_LIMIT_FIELDS)) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    const raw = String(el.value).trim();
+    if (raw === '') continue;   // 留空 = 不写入
+    const n = parseInt(raw, 10);
+    // 下限是 0（不限），不是 1 —— 0 在这里是有意义的值
+    if (isNaN(n) || n < 0) { toast('TPM 需为不小于 0 的整数（0 = 不限）', 'error'); return; }
+    updates[key] = n;
+  }
+  if (!Object.keys(updates).length) { toast('没有填写任何限制，未做改动', 'error'); return; }
+  try {
+    const resp = await apiFetch('/api/config/update', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(updates)});
+    const data = await resp.json();
+    data.ok ? toast(`速率限制已保存（${Object.keys(updates).length} 项）`, 'success', 3000) : toast('保存失败', 'error');
   } catch(e) { toast('保存失败', 'error'); }
 }
 
@@ -4586,6 +4673,7 @@ loadSettings = async function() {
   loadPrompts();
   loadBrandingSettings();
   loadMaxTokens();
+  loadRateLimits();
 };
 
 // ===== 后端健康检测 =====
