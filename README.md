@@ -356,18 +356,18 @@ python local-chat.py
 
 | 配置 | 覆盖场景 | 默认 |
 |------|----------|:----:|
-| `MAX_TOKENS_CHAT` | Bot 对话、面板聊天、面板记忆总结 | 300 |
-| `MAX_TOKENS_REPLY` | 评论回复 / 私信回复 | 400 |
-| `MAX_TOKENS_MEMORY_COMPRESS` | 记忆压缩（摘要 + 标签 + 用户事实） | 400 |
-| `MAX_TOKENS_THREAD_COMPRESS` | 历史线程压缩 | 150 |
-| `MAX_TOKENS_EVOLVE` | 性格演化 | 1024 |
-| `MAX_TOKENS_SEARCH` | 联网搜索 | 500 |
-| `MAX_TOKENS_VISION` | 视频 / 截图理解 | 250 |
-| `MAX_TOKENS_RECOGNIZE` | 评论配图识别 | 100 |
-| `MAX_TOKENS_DYNAMIC` | 动态文案 | 500 |
-| `MAX_TOKENS_PROACTIVE_COMMENT` | 主动评论 / 推荐语 | 350 |
-| `MAX_TOKENS_IMAGE_PROMPT` | 生图 prompt 精炼 | 200 |
-| `MAX_TOKENS_REASONING_FLOOR` | 预算被吃光时的重试上限，**0 = 不重试** | 3000 |
+| `MAX_TOKENS_CHAT` | Bot 对话、面板聊天、面板记忆总结 | 3000 |
+| `MAX_TOKENS_REPLY` | 评论回复 / 私信回复 | 3000 |
+| `MAX_TOKENS_MEMORY_COMPRESS` | 记忆压缩（摘要 + 标签 + 用户事实） | 3000 |
+| `MAX_TOKENS_THREAD_COMPRESS` | 历史线程压缩 | 1000 |
+| `MAX_TOKENS_EVOLVE` | 性格演化 | 3000 |
+| `MAX_TOKENS_SEARCH` | 联网搜索 | 3000 |
+| `MAX_TOKENS_VISION` | 视频 / 截图理解 | 4096 |
+| `MAX_TOKENS_RECOGNIZE` | 评论配图识别 | 4096 |
+| `MAX_TOKENS_DYNAMIC` | 动态文案 | 2000 |
+| `MAX_TOKENS_PROACTIVE_COMMENT` | 主动评论 / 推荐语 | 2000 |
+| `MAX_TOKENS_IMAGE_PROMPT` | 生图 prompt 精炼 | 1000 |
+| `MAX_TOKENS_REASONING_FLOOR` | 预算被吃光时的重试上限，**0 = 不重试** | 6000 |
 
 三点行为约定：
 
@@ -466,7 +466,7 @@ Web 面板完整适配手机浏览器：
 | 图片生成 | 需要支持图片输出的模型 |
 | Embedding | 支持中文的 embedding 模型（用于记忆检索） |
 
-> **选推理型模型时**：这类模型会先产出思考过程再产出正文，两者共用 `max_tokens`。默认预算是按普通模型估的，换成推理型后若日志出现「返回空正文」或 `Expecting value`，请到面板「Token 预算」把对应场景调大（对话类建议先试 2000~4000）。机制与排查手法见 [FIXES.md 第十二节](FIXES.md#十二模型返回空正文从缓解到根治)。
+> **选推理型模型时**：这类模型会先产出思考过程再产出正文，两者共用 `max_tokens`。默认预算是按普通模型估的，换成推理型后若日志出现「返回空正文」或 `Expecting value`，请到面板「Token 预算」把对应场景调大（对白类建议 3000；视觉 / OCR 场景别超过 4096 —— 部分网关在 8192 会直接返回 500）。机制与排查手法见 [FIXES.md 第十二节](FIXES.md#十二模型返回空正文从缓解到根治)。
 
 ---
 

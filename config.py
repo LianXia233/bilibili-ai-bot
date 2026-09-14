@@ -146,20 +146,29 @@ _DEFAULTS = {
     # finish_reason 停在 "length"，上层看到的就是「模型返回空正文」。把预算交给面板，
     # 换模型 / 换网关时不必改代码就能调大，是这条链路的根治手段。
     # 单位：token。数值越小越省 token 但越容易截断；调大只影响上限，不会凭空涨费用。
-    "MAX_TOKENS_CHAT": 300,              # 对话回复（Bot 对话 + 面板聊天/记忆总结）
-    "MAX_TOKENS_REPLY": 400,             # 评论回复 / 私信回复
-    "MAX_TOKENS_MEMORY_COMPRESS": 400,   # 记忆压缩（摘要 + 标签 + 用户事实）
-    "MAX_TOKENS_THREAD_COMPRESS": 150,   # 历史线程压缩（纯摘要）
-    "MAX_TOKENS_EVOLVE": 1024,           # 性格演化（结构化 JSON）
-    "MAX_TOKENS_SEARCH": 500,            # 联网搜索
-    "MAX_TOKENS_VISION": 250,            # 视频 / 截图理解
-    "MAX_TOKENS_RECOGNIZE": 100,         # 评论配图识别
-    "MAX_TOKENS_DYNAMIC": 500,           # 动态文案生成
-    "MAX_TOKENS_PROACTIVE_COMMENT": 350, # 主动评论 / 推荐语
-    "MAX_TOKENS_IMAGE_PROMPT": 200,      # 生图 prompt 精炼
+    # 数值取「一轮成功」而非「最省」：推理型模型被截断时会触发抬升重试，
+    # 抬升意味着同一条要调用两次模型，既慢一倍又烧两倍 token。
+    # 实测 spark-x2.5-4b：预算 400 必然截断（正文空），2000 一轮成功，8000 反而
+    # 因模型「预算越大思考越久」慢到 100 秒以上 —— 所以对白类场景取 2000 附近，
+    # 而不是无脑调大。
+    "MAX_TOKENS_CHAT": 3000,             # 对话回复（Bot 对话 + 面板聊天/记忆总结）
+    "MAX_TOKENS_REPLY": 3000,            # 评论回复 / 私信回复
+    "MAX_TOKENS_MEMORY_COMPRESS": 3000,  # 记忆压缩（摘要 + 标签 + 用户事实）
+    "MAX_TOKENS_THREAD_COMPRESS": 1000,  # 历史线程压缩（纯摘要）
+    "MAX_TOKENS_EVOLVE": 3000,           # 性格演化（结构化 JSON）
+    "MAX_TOKENS_SEARCH": 3000,           # 联网搜索
+    # 视觉（OCR）类模型不走「思考过程 + 正文」那套推理预算，而是直接产出识别文本，
+    # 且 xopdeepseekocr 在 250 预算下实测返回空正文（out_tokens=1, finish=stop）。
+    # 注意不能给 8192：实测该网关在 max_tokens=8192 时直接返回 500
+    # (server_error code 1001)，4096 才是这个模型的安全上界。
+    "MAX_TOKENS_VISION": 4096,           # 视频 / 截图理解
+    "MAX_TOKENS_RECOGNIZE": 4096,        # 评论配图识别（同一 OCR 模型）
+    "MAX_TOKENS_DYNAMIC": 2000,          # 动态文案生成
+    "MAX_TOKENS_PROACTIVE_COMMENT": 2000,# 主动评论 / 推荐语
+    "MAX_TOKENS_IMAGE_PROMPT": 1000,     # 生图 prompt 精炼
     # 推理型模型被截断时的兜底抬升预算：正文为空且 finish_reason == "length" 时，
     # 用这个值对同一模型重试一轮。设 0 = 不抬升，完全按上面的场景预算执行。
-    "MAX_TOKENS_REASONING_FLOOR": 3000,
+    "MAX_TOKENS_REASONING_FLOOR": 6000,
 }
 
 # ========== 加载/保存 ==========
@@ -411,18 +420,18 @@ def resolve_model_price(source, model=""):
 # 两处各写一套默认值必然漂移。这里收成单一实现。
 # 场景名 -> _DEFAULTS 里的键名 / 兜底默认值（键缺失时用）。
 _MAX_TOKENS_DEFAULT = {
-    "chat": 300,
-    "reply": 400,
-    "memory_compress": 400,
-    "thread_compress": 150,
-    "evolve": 1024,
-    "search": 500,
-    "vision": 250,
-    "recognize": 100,
-    "dynamic": 500,
-    "proactive_comment": 350,
-    "image_prompt": 200,
-    "reasoning_floor": 3000,
+    "chat": 3000,
+    "reply": 3000,
+    "memory_compress": 3000,
+    "thread_compress": 1000,
+    "evolve": 3000,
+    "search": 3000,
+    "vision": 4096,
+    "recognize": 4096,
+    "dynamic": 2000,
+    "proactive_comment": 2000,
+    "image_prompt": 1000,
+    "reasoning_floor": 6000,
 }
 
 def get_max_tokens(reason, minimum=1):

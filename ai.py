@@ -89,6 +89,9 @@ def save_schedule_state():
         pass
 
 MAX_REPLIES_PER_RUN = 3
+# 同一条消息最多重试几次。达到上限即放弃并标记为已处理 —— 宁可漏掉一条，
+# 也不能让整条队列停在这一条上（模型网关长时间不可用时的最后一道闸）。
+MAX_REPLY_ATTEMPTS = 3
 REPLIED_FILE = "data/replied.json"
 AFFECTION_FILE = "data/affection.json"
 MEMORY_FILE = "data/memory.json"
@@ -199,7 +202,12 @@ def _search_candidates():
 # 调用方按「短回复」估的 100~400 预算会被思考过程吃光，正文留空且
 # finish_reason 停在 "length"。见 _complete_with 的抬升重试。
 # 面板把该键设为 0 即表示「不抬升」，完全按各场景预算执行。
-_REASONING_BUDGET_FLOOR_DEFAULT = 3000
+_REASONING_BUDGET_FLOOR_DEFAULT = 6000
+
+# 抬升重试的预算硬上限。实测 spark-x2.5-4b：max_tokens=2000 时 10.6s 拿到完整
+# JSON；给到 8000 不但没更稳，反而因为「预算越大、思考过程越长」把单次响应拖到
+# 112.7s。抬升必须有天花板，否则「修好截断」的代价是把消息全部拖死。
+_MAX_BUDGET_CAP = 8192
 
 
 def _reasoning_floor():
@@ -259,14 +267,18 @@ def _complete_with(candidates, content, max_tokens, label):
     耗尽」就地抬升到面板配置的兜底预算（MAX_TOKENS_REASONING_FLOOR）重试**同一
     个模型**，仍失败才换候选。兜底预算设为 0 时不抬升。
     """
-    last_err = "未配置任何可用模型"
+    errors = []
     for idx, (base_url, api_key, model) in enumerate(candidates):
         # 备用通道本就承担「放宽预算以兜住截断」的职责，保持该语义
         first_budget = max_tokens if idx == 0 else max(max_tokens, 1500)
-        floor = _reasoning_floor()
+        # 预算档位：起始预算 -> 兜底抬升值 -> 硬上限。之所以要多档而不是只抬一次：
+        # 实测出现过「抬到 3000 仍被截断」，只给一档时第二轮的截断结果会被当成
+        # 成功返回，半截 JSON 交到上层 json.loads 立刻抛错。
         budgets = [first_budget]
-        if floor and first_budget < floor:
-            budgets.append(floor)
+        for _b in (_reasoning_floor(), _MAX_BUDGET_CAP):
+            _b = min(_b, _MAX_BUDGET_CAP) if _b else 0
+            if _b > budgets[-1]:
+                budgets.append(_b)
         for attempt, budget in enumerate(budgets):
             try:
                 resp = _chat_client(base_url, api_key).chat.completions.create(
@@ -277,14 +289,23 @@ def _complete_with(candidates, content, max_tokens, label):
                 choice = resp.choices[0]
                 text = (choice.message.content or "").strip()
                 in_tok, out_tok = _usage_of(resp)
-                if text:
+                finish = getattr(choice, "finish_reason", "") or ""
+                # 判据必须是「有正文 **且** 不是被截断」。只看 text 非空，会把被
+                # 截断的半截 JSON（如 {"reply": "… 断在这里）当成成功返回；上层
+                # json.loads 随即抛 JSONDecodeError，而 run() 的异常分支不标记
+                # 已回复 —— 同一条评论每 30 秒重试一次，形成死循环，后面的
+                # @ 消息流和私信永远轮不到，表现出来就是「全都不回复」。
+                if text and finish != "length":
                     if idx > 0:
                         print(f"  \u21a9\ufe0f {label}已切换到备用通道 {model}")
                     return text, in_tok, out_tok, model
-                finish = getattr(choice, "finish_reason", "") or ""
                 reasoning_len = _reasoning_len(choice)
-                last_err = (f"{model} 返回空正文(finish={finish}, "
-                            f"out_tokens={out_tok}, reasoning_len={reasoning_len})")
+                if text:
+                    errors.append(f"{model} 输出被截断(finish=length, "
+                                  f"out_tokens={out_tok}, 已得{len(text)}字)")
+                else:
+                    errors.append(f"{model} 返回空正文(finish={finish}, "
+                                  f"out_tokens={out_tok}, reasoning_len={reasoning_len})")
                 # finish=length 是「预算被吃光」的确凿判据，而非模型真的无话可说
                 if finish == "length" and attempt + 1 < len(budgets):
                     print(f"  \u21bb {label}预算被推理吃光（{budget} → "
@@ -292,9 +313,13 @@ def _complete_with(candidates, content, max_tokens, label):
                     continue
                 break
             except Exception as e:
-                last_err = f"{model}: {str(e)[:120]}"
+                errors.append(f"{model}: {str(e)[:120]}")
                 break
-    print(f"  \u26a0\ufe0f {label}全部候选通道失败（{last_err}）")
+    # 只保留最后一个候选的错误，会把首选通道的真实成败一并盖掉：首选正常、
+    # 备用通道因额度耗尽返回 429 时，日志里只剩那句 429，看起来像「全通道失败」，
+    # 排查时会被带到完全错误的方向。按顺序列全所有通道的错误。
+    print(f"  \u26a0\ufe0f {label}全部候选通道失败："
+          + ("；".join(errors) or "未配置任何可用模型"))
     return "", 0, 0, ""
 
 
@@ -395,43 +420,67 @@ def _video_fallback_text(video_info):
             f"分区：{video_info.get('tname') or '未知'}。简介：{desc[:100]}")
 
 def analyze_video_with_gemini(video_info):
-    """把视频封面 + 标题 / 分区 / 简介交给视觉模型，产出一段内容概括。
+    """看封面 + 标题/简介，产出一段中文内容概括。
 
-    函数名沿用历史叫法；实际走的是「视觉候选通道」，且视觉类没配模型时会
-    自动回落到对话模型（见 _vision_candidates），不再必然失败。
+    函数名沿用历史叫法。这里刻意分成两步：
+      1) 视觉通道只做它擅长的事 —— 读图取字、描述画面。
+         实测视觉通道配的是 DeepSeek-OCR 这类 OCR 模型，把「写150字内容概括」
+         直接丢给它，它会返回空正文（finish=stop, out_tokens=1），
+         视频分析就 100% 退化成「标题+简介」的降级串 —— 表面看标题读到了，
+         那个「内容概括」其实只是简介原文。
+      2) 归纳与中文表达交给文本模型（视觉候选为空时自动回落对话候选）。
+    这样分工后，封面上的文字（标题特效字、UP主水印、关键信息）才真正进入
+    回复上下文，而不是被丢掉。
     """
     try:
         content = []
+        pic_ok = False
         if video_info.get("pic"):
             pic_url = video_info["pic"]
             if not pic_url.startswith("http"):
                 pic_url = "https:" + pic_url
             try:
                 resp = requests.get(pic_url, headers={"Referer": "https://www.bilibili.com"}, timeout=10)
-                if resp.status_code == 200:
+                if resp.status_code == 200 and resp.content:
                     img_b64 = base64.b64encode(resp.content).decode()
                     content.append({
                         "type": "image_url",
                         "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
                     })
-            except:
+                    pic_ok = True
+            except Exception:
                 pass
+
+        # 第一步：读图。提示词按 OCR 模型的能力来写，不要让它去「归纳」。
+        cover_text = ""
+        if pic_ok:
+            content.append({"type": "text", "text":
+                            "请提取这张图片中的所有文字，并用中文简要描述画面内容（50字以内）。"})
+            cover_text, _it, _ot, _m = _complete_with(
+                _vision_candidates(), content, get_max_tokens("vision"), "封面识别")
+            if not cover_text:
+                print("  ⚠️ 封面未识别出内容，仅凭标题与简介生成概括")
 
         duration_min = video_info.get("duration", 0) // 60
         duration_sec = video_info.get("duration", 0) % 60
-        text_prompt = f"""请根据以下B站视频信息，写一段简洁的内容概括（150字以内），包括：这个视频大概在讲什么、是什么类型/风格、可能的受众。
-
-视频标题：{video_info.get('title', '未知')}
+        facts = f"""视频标题：{video_info.get('title', '未知')}
 UP主：{video_info.get('owner_name', '未知')}
 分区：{video_info.get('tname', '未知')}
 时长：{duration_min}分{duration_sec}秒
 简介：{video_info.get('desc', '无')[:500]}
+封面文字与画面：{cover_text or '（未能识别）'}"""
+
+        # 第二步：归纳。交给文本模型，保证输出是中文且是一段像样的概括。
+        # 预算用 chat（与回复同级）而不是 vision：这一步是纯文本归纳，
+        # 沿用 vision 的 4096 会让推理型文本模型「预算越大思考越久」——
+        # 实测用 4096 时单次视频分析被拖到 185 秒，改成 2000 附近即可。
+        text_prompt = f"""请根据以下B站视频信息，用中文写一段简洁的内容概括（150字以内），包括：这个视频大概在讲什么、是什么类型/风格、可能的受众。
+
+{facts}
 
 直接输出概括内容，不要加前缀。"""
-        content.append({"type": "text", "text": text_prompt})
-
         result, in_tok, out_tok, model = _complete_with(
-            _vision_candidates(), content, get_max_tokens("vision"), "视频分析")
+            _chat_candidates(), text_prompt, get_max_tokens("chat"), "视频概括")
         if not result:
             return _video_fallback_text(video_info)
         log_cost("视频识别", in_tok, out_tok, model=model)
@@ -439,7 +488,6 @@ UP主：{video_info.get('owner_name', '未知')}
     except Exception as e:
         print(f"⚠️ 视频分析失败：{e}")
         return _video_fallback_text(video_info)
-
 def get_video_context(oid, comment_type):
     if comment_type != 1:
         return ""
@@ -1319,7 +1367,10 @@ def recognize_images(image_urls):
                 })
         if not content:
             return ""
-        content.append({"type": "text", "text": "请用50字以内描述这些图片的内容。"})
+        # 提示词按 OCR 模型的能力写：实测「描述图片」这种开放式任务会被
+        # 答成表格结构的 OCR 碎片，改成「取字 + 一句画面描述」更贴合。
+        content.append({"type": "text", "text":
+                        "请提取图片中的所有文字，并用一句中文简要描述画面内容。"})
         # 走视觉候选通道（视觉类没配则回落对话类）；此前写死 OR_VISION_MODEL，
         # 该键为空时图片识别 100% 失败，「只 @ + 发图」的评论等于没有图片信息。
         result, in_tok, out_tok, model = _complete_with(
@@ -1707,6 +1758,9 @@ def run():
 
     last_config_reload = time.time()
     last_cookie_check = time.time()
+    # 每条待处理消息的连续失败次数（内存态，进程重启即清零）。
+    # 既给「模型临时抽风」留重试余地，又保证不会无限重试同一条。
+    failed_attempts = {}
     while True:
         try:
             now = datetime.now()
@@ -1800,163 +1854,187 @@ def run():
                 if rpid in replied_rpids:
                     continue
 
-                if is_blocked(reply["content"]):
-                    print(f"🚫 屏蔽评论 from {reply['username']}：{reply['content']}")
-                    log_security_event("keyword_blocked", mid, reply["username"], reply["content"], "触发关键词过滤")
-                    replied_rpids.add(rpid)
-                    save_replied(replied_rpids)
-                    continue
+                try:
+                    if is_blocked(reply["content"]):
+                        print(f"🚫 屏蔽评论 from {reply['username']}：{reply['content']}")
+                        log_security_event("keyword_blocked", mid, reply["username"], reply["content"], "触发关键词过滤")
+                        replied_rpids.add(rpid)
+                        save_replied(replied_rpids)
+                        continue
 
-                current_score = affection.get(mid, 0)
-                level = get_level(current_score, mid)
-                # 标明来源：回复我的 / 评论里 @ 我。两条链路的日志文案此前无法区分，
-                # 而 @ 消息的正文里可能只有一串 @昵称，排查时需要知道原文长相。
-                _src = "被@" if reply.get("via") == "at" else "回复"
-                _shown = reply["content"]
-                # 归一化后正文与原文字面不同时附上原文，方便排查「模型到底看到了什么」
-                if reply.get("raw_content") and reply.get("raw_content") != _shown:
-                    _shown = f"{_shown}（原文：{reply['raw_content']}）"
-                # 带上 rpid：日志行要能对应到具体某条评论，否则「这条到底回了没」无法追查
-                print(f"\n📩 [{_src}] rpid={rpid} {reply['username']}"
-                      f"（{LEVEL_NAMES[level]} | {current_score}分）：{_shown}")
+                    current_score = affection.get(mid, 0)
+                    level = get_level(current_score, mid)
+                    # 标明来源：回复我的 / 评论里 @ 我。两条链路的日志文案此前无法区分，
+                    # 而 @ 消息的正文里可能只有一串 @昵称，排查时需要知道原文长相。
+                    _src = "被@" if reply.get("via") == "at" else "回复"
+                    _shown = reply["content"]
+                    # 归一化后正文与原文字面不同时附上原文，方便排查「模型到底看到了什么」
+                    if reply.get("raw_content") and reply.get("raw_content") != _shown:
+                        _shown = f"{_shown}（原文：{reply['raw_content']}）"
+                    # 带上 rpid：日志行要能对应到具体某条评论，否则「这条到底回了没」无法追查
+                    print(f"\n📩 [{_src}] rpid={rpid} {reply['username']}"
+                          f"（{LEVEL_NAMES[level]} | {current_score}分）：{_shown}")
 
-                # 获取视频上下文
-                video_context = get_video_context(reply["oid"], reply["type"])
-                if video_context:
-                    print(f"📹 已获取视频上下文")
+                    # 获取视频上下文
+                    video_context = get_video_context(reply["oid"], reply["type"])
+                    if video_context:
+                        print(f"📹 已获取视频上下文")
 
-                memory_context = build_memory_context(
-                    memory, thread_id, mid, reply["content"]
-                )
-                if memory_context:
-                    print(f"🧠 调取记忆：{memory_context[:80]}...")
+                    memory_context = build_memory_context(
+                        memory, thread_id, mid, reply["content"]
+                    )
+                    if memory_context:
+                        print(f"🧠 调取记忆：{memory_context[:80]}...")
 
-                # 检测评论中的图片
-                image_urls = get_comment_images(reply["oid"], rpid, reply["type"])
-                image_desc = ""
-                if image_urls:
-                    print(f"🖼️ 发现 {len(image_urls)} 张图片，识别中...")
-                    image_desc = recognize_images(image_urls)
+                    # 检测评论中的图片
+                    image_urls = get_comment_images(reply["oid"], rpid, reply["type"])
+                    image_desc = ""
+                    if image_urls:
+                        print(f"🖼️ 发现 {len(image_urls)} 张图片，识别中...")
+                        image_desc = recognize_images(image_urls)
+                        if image_desc:
+                            print(f"🖼️ 图片内容：{image_desc[:50]}...")
+
+                    comment_text = reply["content"]
                     if image_desc:
-                        print(f"🖼️ 图片内容：{image_desc[:50]}...")
+                        comment_text += f"\n[用户发送了图片，内容是：{image_desc}]"
+                    # 「只 @ 不说话」时正文是占位符：直接留空，由 no_content_section
+                    # 统一说明并给引导，避免同一件事在提示词里说两遍
+                    if reply.get("no_content"):
+                        comment_text = ""
 
-                comment_text = reply["content"]
-                if image_desc:
-                    comment_text += f"\n[用户发送了图片，内容是：{image_desc}]"
-                # 「只 @ 不说话」时正文是占位符：直接留空，由 no_content_section
-                # 统一说明并给引导，避免同一件事在提示词里说两遍
-                if reply.get("no_content"):
-                    comment_text = ""
-
-                score_delta, ai_reply, impression, perm_mem, user_facts = generate_reply_and_score(
-                    comment_text, reply["username"], level, memory_context,
-                    video_context=video_context,
-                    no_content=bool(reply.get("no_content")),
-                )
-
-                max_score = 100 if str(mid) == str(OWNER_MID) else 99
-                new_score = max(0, min(max_score, current_score + score_delta))
-                affection[mid] = new_score
-                save_json(AFFECTION_FILE, affection)
-
-                milestone_msg = check_milestone(mid, current_score, new_score, reply["username"])
-                if milestone_msg:
-                    ai_reply = milestone_msg
-
-                # 更新用户档案
-                if impression or user_facts:
-                    update_user_profile(
-                        mid,
-                        impression=impression if impression else None,
-                        new_facts=user_facts if user_facts else None
+                    score_delta, ai_reply, impression, perm_mem, user_facts = generate_reply_and_score(
+                        comment_text, reply["username"], level, memory_context,
+                        video_context=video_context,
+                        no_content=bool(reply.get("no_content")),
                     )
-                    if user_facts:
-                        print(f"📝 记录用户信息：{'；'.join(user_facts)}")
 
-                _save_permanent_memory(perm_mem)
+                    max_score = 100 if str(mid) == str(OWNER_MID) else 99
+                    new_score = max(0, min(max_score, current_score + score_delta))
+                    affection[mid] = new_score
+                    save_json(AFFECTION_FILE, affection)
 
-                delta_str = f"+{score_delta}" if score_delta >= 0 else str(score_delta)
-                print(f"💛 好感度：{current_score} → {new_score}（{delta_str}）| {LEVEL_NAMES[get_level(new_score, mid)]}")
-                # 回复正文的打印挪到 send_reply 之后（见下方「已发送 / 发送失败」两处）：
-                # 原来在这里无条件打印「💬 Bot：xxx」，而发送发生在其后，
-                # 发送失败时那行照样出现，看起来像「已经回了」。日志必须反映实际结果。
+                    milestone_msg = check_milestone(mid, current_score, new_score, reply["username"])
+                    if milestone_msg:
+                        ai_reply = milestone_msg
 
-                if score_delta <= -3:
-                    log_security_event("negative_interaction", mid, reply["username"], reply["content"],
-                        f"好感度 {current_score}→{new_score}({delta_str})，回复：{ai_reply[:50]}")
+                    # 更新用户档案
+                    if impression or user_facts:
+                        update_user_profile(
+                            mid,
+                            impression=impression if impression else None,
+                            new_facts=user_facts if user_facts else None
+                        )
+                        if user_facts:
+                            print(f"📝 记录用户信息：{'；'.join(user_facts)}")
 
-                # 触发条件照常统计（block_count 继续累计），
-                # 但"是否真的拉黑"交给开关决定，默认关闭 —— 拉黑只允许人工在面板执行。
-                should_block = False
-                block_reason = ""
-                if new_score <= -30:
-                    block_reason = f"好感度过低（{new_score}）"
+                    _save_permanent_memory(perm_mem)
 
-                if score_delta <= -3:
-                    block_count = load_json("data/block_count.json", {})
-                    block_count[mid] = block_count.get(mid, 0) + 1
-                    save_json("data/block_count.json", block_count)
-                    if block_count[mid] >= 5:
-                        block_reason = block_reason or f"连续辱骂{block_count.get(mid, 0)}次"
-                else:
-                    block_count = load_json("data/block_count.json", {})
-                    if mid in block_count:
-                        block_count[mid] = 0
+                    delta_str = f"+{score_delta}" if score_delta >= 0 else str(score_delta)
+                    print(f"💛 好感度：{current_score} → {new_score}（{delta_str}）| {LEVEL_NAMES[get_level(new_score, mid)]}")
+                    # 回复正文的打印挪到 send_reply 之后（见下方「已发送 / 发送失败」两处）：
+                    # 原来在这里无条件打印「💬 Bot：xxx」，而发送发生在其后，
+                    # 发送失败时那行照样出现，看起来像「已经回了」。日志必须反映实际结果。
+
+                    if score_delta <= -3:
+                        log_security_event("negative_interaction", mid, reply["username"], reply["content"],
+                            f"好感度 {current_score}→{new_score}({delta_str})，回复：{ai_reply[:50]}")
+
+                    # 触发条件照常统计（block_count 继续累计），
+                    # 但"是否真的拉黑"交给开关决定，默认关闭 —— 拉黑只允许人工在面板执行。
+                    should_block = False
+                    block_reason = ""
+                    if new_score <= -30:
+                        block_reason = f"好感度过低（{new_score}）"
+
+                    if score_delta <= -3:
+                        block_count = load_json("data/block_count.json", {})
+                        block_count[mid] = block_count.get(mid, 0) + 1
                         save_json("data/block_count.json", block_count)
+                        if block_count[mid] >= 5:
+                            block_reason = block_reason or f"连续辱骂{block_count.get(mid, 0)}次"
+                    else:
+                        block_count = load_json("data/block_count.json", {})
+                        if mid in block_count:
+                            block_count[mid] = 0
+                            save_json("data/block_count.json", block_count)
 
-                if block_reason and auto_block_on_affection_enabled() and str(mid) != str(OWNER_MID):
-                    should_block = True
+                    if block_reason and auto_block_on_affection_enabled() and str(mid) != str(OWNER_MID):
+                        should_block = True
 
-                if should_block:
-                    block_log = load_json("data/block_log.json", {})
-                    reason = block_reason
-                    block_log[mid] = {
-                        "username": reply["username"], "reason": reason,
-                        "last_comment": reply["content"], "score": new_score,
-                        "time": datetime.now().strftime("%Y-%m-%d %H:%M")
-                    }
-                    save_json("data/block_log.json", block_log)
-                    log_security_event("user_blocked", mid, reply["username"], reply["content"],
-                        f"原因：{reason}，好感度：{new_score}")
-                    send_reply(reply["oid"], rpid, reply["type"], "我不想和你说话了。",
-                               reply.get("root_rpid"))
-                    block_user(int(mid))
-                    print(f"🚫 已拉黑用户 {reply['username']}（{mid}）| 原因：{reason}")
+                    if should_block:
+                        block_log = load_json("data/block_log.json", {})
+                        reason = block_reason
+                        block_log[mid] = {
+                            "username": reply["username"], "reason": reason,
+                            "last_comment": reply["content"], "score": new_score,
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M")
+                        }
+                        save_json("data/block_log.json", block_log)
+                        log_security_event("user_blocked", mid, reply["username"], reply["content"],
+                            f"原因：{reason}，好感度：{new_score}")
+                        send_reply(reply["oid"], rpid, reply["type"], "我不想和你说话了。",
+                                   reply.get("root_rpid"))
+                        block_user(int(mid))
+                        print(f"🚫 已拉黑用户 {reply['username']}（{mid}）| 原因：{reason}")
+                        replied_rpids.add(rpid)
+                        save_replied(replied_rpids)
+                        continue
+
+                    if block_reason and str(mid) != str(OWNER_MID):
+                        # 命中自动拉黑条件但开关关闭：只记录，不拉黑，决定权留给人工
+                        log_security_event(
+                            "auto_block_suppressed", mid, reply["username"], reply["content"],
+                            f"命中拉黑阈值：{block_reason}（自动拉黑已关闭，未执行，"
+                            f"可在 WebUI「安全中心」一键拉黑）"
+                        )
+                        print(f"命中自动拉黑条件（{block_reason}），按配置未拉黑，仅记录安全日志")
+
+                    success = send_reply(reply["oid"], rpid, reply["type"], ai_reply,
+                                         reply.get("root_rpid"))
+
+                    if success:
+                        # 带上真实 rpid：@ 类回复是二级评论、网页上默认折叠，
+                        # 只有拿到 rpid 才能直接核验「到底上屏了没有」
+                        rid = "" if success is True else f"，rpid={success}"
+                        print(f"💬 Bot（已发送{rid}）：{ai_reply}")
+                        save_memory_record(memory, rpid, thread_id, mid, reply["username"], reply["content"], ai_reply)
+                        count += 1
+                        memory = compress_user_memory(memory, mid, reply["username"])
+                    else:
+                        print(f"💬 Bot（发送失败，内容未上屏）：{ai_reply}")
+                        print(f"⚠️ 回复发送失败，跳过此条，不再重试")
+
+                    # 不管成功失败都标记，防止重复处理烧钱
                     replied_rpids.add(rpid)
                     save_replied(replied_rpids)
+
+                    time.sleep(5)
+                    if count >= MAX_REPLIES_PER_RUN:
+                        break
+                except Exception as exc:
+                    # 单条失败绝不能拖住整轮。此前异常会直接冒泡到 while 的外层
+                    # except：整个 for 被打断，且该 rpid 从未写进 replied_rpids
+                    # —— 30 秒后重新拉到同一条、再次抛错，同一条消息无限重试，
+                    # 后面排队的所有 @ 消息与私信永远轮不到。
+                    attempts = failed_attempts.get(rpid, 0) + 1
+                    failed_attempts[rpid] = attempts
+                    print(f"⚠️ 处理 rpid={rpid} 失败（第 {attempts}/{MAX_REPLY_ATTEMPTS} 次）：{exc}")
+                    if attempts >= MAX_REPLY_ATTEMPTS:
+                        # 达到上限就放弃并标记：宁可漏掉一条，也不能让整条队列停摆
+                        replied_rpids.add(rpid)
+                        save_replied(replied_rpids)
+                        print(f"⏭️ 已放弃 rpid={rpid}（连续 {MAX_REPLY_ATTEMPTS} 次失败），"
+                              f"标记为已处理以免阻塞后续消息")
+                        try:
+                            log_security_event(
+                                "reply_processing_failed", mid,
+                                reply.get("username", ""),
+                                str(reply.get("content", ""))[:200],
+                                f"连续 {attempts} 次处理失败已跳过：{str(exc)[:200]}")
+                        except Exception:
+                            pass
                     continue
-
-                if block_reason and str(mid) != str(OWNER_MID):
-                    # 命中自动拉黑条件但开关关闭：只记录，不拉黑，决定权留给人工
-                    log_security_event(
-                        "auto_block_suppressed", mid, reply["username"], reply["content"],
-                        f"命中拉黑阈值：{block_reason}（自动拉黑已关闭，未执行，"
-                        f"可在 WebUI「安全中心」一键拉黑）"
-                    )
-                    print(f"命中自动拉黑条件（{block_reason}），按配置未拉黑，仅记录安全日志")
-
-                success = send_reply(reply["oid"], rpid, reply["type"], ai_reply,
-                                     reply.get("root_rpid"))
-
-                if success:
-                    # 带上真实 rpid：@ 类回复是二级评论、网页上默认折叠，
-                    # 只有拿到 rpid 才能直接核验「到底上屏了没有」
-                    rid = "" if success is True else f"，rpid={success}"
-                    print(f"💬 Bot（已发送{rid}）：{ai_reply}")
-                    save_memory_record(memory, rpid, thread_id, mid, reply["username"], reply["content"], ai_reply)
-                    count += 1
-                    memory = compress_user_memory(memory, mid, reply["username"])
-                else:
-                    print(f"💬 Bot（发送失败，内容未上屏）：{ai_reply}")
-                    print(f"⚠️ 回复发送失败，跳过此条，不再重试")
-
-                # 不管成功失败都标记，防止重复处理烧钱
-                replied_rpids.add(rpid)
-                save_replied(replied_rpids)
-
-                time.sleep(5)
-                if count >= MAX_REPLIES_PER_RUN:
-                    break
 
             print(f"\n⏳ 等待 {POLL_INTERVAL} 秒后再次检查...")
             time.sleep(POLL_INTERVAL)

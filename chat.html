@@ -2418,21 +2418,21 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
         <div style="display:flex;gap:8px;">
           <div class="settings-field" style="flex:1;">
             <label>对话回复</label>
-            <input type="number" id="tok_chat" min="1" placeholder="300">
+            <input type="number" id="tok_chat" min="1" placeholder="3000">
           </div>
           <div class="settings-field" style="flex:1;">
             <label>评论 / 私信回复</label>
-            <input type="number" id="tok_reply" min="1" placeholder="400">
+            <input type="number" id="tok_reply" min="1" placeholder="3000">
           </div>
         </div>
         <div style="display:flex;gap:8px;">
           <div class="settings-field" style="flex:1;">
             <label>动态文案</label>
-            <input type="number" id="tok_dynamic" min="1" placeholder="500">
+            <input type="number" id="tok_dynamic" min="1" placeholder="2000">
           </div>
           <div class="settings-field" style="flex:1;">
             <label>主动评论 / 推荐语</label>
-            <input type="number" id="tok_proactive_comment" min="1" placeholder="350">
+            <input type="number" id="tok_proactive_comment" min="1" placeholder="2000">
           </div>
         </div>
 
@@ -2440,44 +2440,44 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
         <div style="display:flex;gap:8px;">
           <div class="settings-field" style="flex:1;">
             <label>记忆压缩</label>
-            <input type="number" id="tok_memory_compress" min="1" placeholder="400">
+            <input type="number" id="tok_memory_compress" min="1" placeholder="3000">
           </div>
           <div class="settings-field" style="flex:1;">
             <label>历史线程压缩</label>
-            <input type="number" id="tok_thread_compress" min="1" placeholder="150">
+            <input type="number" id="tok_thread_compress" min="1" placeholder="1000">
           </div>
         </div>
         <div class="settings-field">
           <label>性格演化</label>
-          <input type="number" id="tok_evolve" min="1" placeholder="1024">
+          <input type="number" id="tok_evolve" min="1" placeholder="3000">
         </div>
 
         <div style="font-size:12px;color:var(--ice-blue);font-weight:600;margin:14px 0 8px;">联网与视觉</div>
         <div style="display:flex;gap:8px;">
           <div class="settings-field" style="flex:1;">
             <label>联网搜索</label>
-            <input type="number" id="tok_search" min="1" placeholder="500">
+            <input type="number" id="tok_search" min="1" placeholder="3000">
           </div>
           <div class="settings-field" style="flex:1;">
             <label>视频 / 截图理解</label>
-            <input type="number" id="tok_vision" min="1" placeholder="250">
+            <input type="number" id="tok_vision" min="1" placeholder="4096">
           </div>
         </div>
         <div style="display:flex;gap:8px;">
           <div class="settings-field" style="flex:1;">
             <label>评论配图识别</label>
-            <input type="number" id="tok_recognize" min="1" placeholder="100">
+            <input type="number" id="tok_recognize" min="1" placeholder="4096">
           </div>
           <div class="settings-field" style="flex:1;">
             <label>生图 prompt 精炼</label>
-            <input type="number" id="tok_image_prompt" min="1" placeholder="200">
+            <input type="number" id="tok_image_prompt" min="1" placeholder="1000">
           </div>
         </div>
 
         <div style="font-size:12px;color:var(--ice-blue);font-weight:600;margin:14px 0 8px;">推理型模型兜底</div>
         <div class="settings-field">
           <label>预算被吃光时的重试上限（0 = 不重试）</label>
-          <input type="number" id="tok_reasoning_floor" min="0" placeholder="3000">
+          <input type="number" id="tok_reasoning_floor" min="0" placeholder="6000">
           <p style="font-size:11px;color:var(--text-dim);margin-top:2px;line-height:1.6;">
             正文为空且 finish_reason=length 时，用这个预算对同一模型重试一轮。默认 3000 足够多数推理模型。
           </p>
