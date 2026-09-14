@@ -457,7 +457,7 @@ def analyze_video(video_path, title, desc):
         response = or_client.chat.completions.create(
             model=OR_VISION_MODEL,
             messages=[{"role": "user", "content": content}],
-            max_tokens=200
+            max_tokens=get_max_tokens("vision")
         )
         return response.choices[0].message.content.strip()
 
@@ -485,7 +485,7 @@ def analyze_video(video_path, title, desc):
             response = or_client.chat.completions.create(
                 model=OR_VISION_MODEL,
                 messages=[{"role": "user", "content": content}],
-                max_tokens=200
+                max_tokens=get_max_tokens("vision")
             )
             for fp in frames:
                 try: os.remove(fp)
@@ -533,7 +533,7 @@ comment要求：
     try:
         resp = or_client.chat.completions.create(
             model=OR_CHAT_MODEL,
-            max_tokens=350,
+            max_tokens=get_max_tokens("proactive_comment"),
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}]
         )
@@ -606,7 +606,7 @@ def generate_proactive_comment(video_info, video_description):
     try:
         resp = or_client.chat.completions.create(
             model=OR_CHAT_MODEL,
-            max_tokens=100,
+            max_tokens=get_max_tokens("proactive_comment"),
             messages=[{"role": "user", "content": prompt}]
         )
         return resp.choices[0].message.content.strip()
@@ -897,7 +897,7 @@ def run():
 - 不要带@、不要带任何人名或称呼
 - 直接输出推荐语"""
                         _rec_resp = or_client.chat.completions.create(
-                            model=OR_CHAT_MODEL, max_tokens=60,
+                            model=OR_CHAT_MODEL, max_tokens=get_max_tokens("proactive_comment"),
                             messages=[
                                 {"role": "system", "content": _rec_system},
                                 {"role": "user", "content": _rec_prompt}

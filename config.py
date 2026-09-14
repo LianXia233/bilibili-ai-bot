@@ -139,6 +139,27 @@ _DEFAULTS = {
     # ===== 主人信息 =====
     "OWNER_NAME": "",
     "OWNER_BILI_NAME": "",
+
+    # ===== Token 预算（面板可调）=====
+    # 为什么这些要可配：推理型模型（reasoning）的 max_tokens 是「思考过程 + 正文」
+    # 共用的预算。调用方按「短回复」估的 100~400 会被思考过程吃光，结果是正文为空、
+    # finish_reason 停在 "length"，上层看到的就是「模型返回空正文」。把预算交给面板，
+    # 换模型 / 换网关时不必改代码就能调大，是这条链路的根治手段。
+    # 单位：token。数值越小越省 token 但越容易截断；调大只影响上限，不会凭空涨费用。
+    "MAX_TOKENS_CHAT": 300,              # 对话回复（Bot 对话 + 面板聊天/记忆总结）
+    "MAX_TOKENS_REPLY": 400,             # 评论回复 / 私信回复
+    "MAX_TOKENS_MEMORY_COMPRESS": 400,   # 记忆压缩（摘要 + 标签 + 用户事实）
+    "MAX_TOKENS_THREAD_COMPRESS": 150,   # 历史线程压缩（纯摘要）
+    "MAX_TOKENS_EVOLVE": 1024,           # 性格演化（结构化 JSON）
+    "MAX_TOKENS_SEARCH": 500,            # 联网搜索
+    "MAX_TOKENS_VISION": 250,            # 视频 / 截图理解
+    "MAX_TOKENS_RECOGNIZE": 100,         # 评论配图识别
+    "MAX_TOKENS_DYNAMIC": 500,           # 动态文案生成
+    "MAX_TOKENS_PROACTIVE_COMMENT": 350, # 主动评论 / 推荐语
+    "MAX_TOKENS_IMAGE_PROMPT": 200,      # 生图 prompt 精炼
+    # 推理型模型被截断时的兜底抬升预算：正文为空且 finish_reason == "length" 时，
+    # 用这个值对同一模型重试一轮。设 0 = 不抬升，完全按上面的场景预算执行。
+    "MAX_TOKENS_REASONING_FLOOR": 3000,
 }
 
 # ========== 加载/保存 ==========
@@ -384,6 +405,50 @@ def resolve_model_price(source, model=""):
         if any(k in mdl for k in kws):
             return _price_of(cfg, prefix)
     return _price_of(cfg, "PRICE_CHAT")
+
+# ========== Token 预算解析（面板可调，改完即时生效） ==========
+# 与计费价格同理：ai.py（Bot 进程）与 local-chat.py（面板进程）都要读同一份预算，
+# 两处各写一套默认值必然漂移。这里收成单一实现。
+# 场景名 -> _DEFAULTS 里的键名 / 兜底默认值（键缺失时用）。
+_MAX_TOKENS_DEFAULT = {
+    "chat": 300,
+    "reply": 400,
+    "memory_compress": 400,
+    "thread_compress": 150,
+    "evolve": 1024,
+    "search": 500,
+    "vision": 250,
+    "recognize": 100,
+    "dynamic": 500,
+    "proactive_comment": 350,
+    "image_prompt": 200,
+    "reasoning_floor": 3000,
+}
+
+def get_max_tokens(reason, minimum=1):
+    """读取某场景的 max_tokens 预算（单位 token）。
+
+    每次读盘而非用模块级快照：面板改完预算后 Bot 进程无需重启即生效，
+    与 resolve_model_price 的证据口径一致。
+
+    reason: chat / reply / memory_compress / thread_compress / evolve /
+            search / vision / recognize / dynamic / proactive_comment /
+            image_prompt / reasoning_floor
+    minimum: 下限。默认 1（预算至少 1 token）；reasoning_floor 场景传 0，
+             表示允许「不抬升」这一语义。
+    """
+    key = str(reason or "chat")
+    fallback = _MAX_TOKENS_DEFAULT.get(key, 300)
+    raw = get_raw_config().get(f"MAX_TOKENS_{key.upper()}", fallback)
+    # 注意：不能用 `or fallback`——0 是合法取值（reasoning_floor=0 表示不抬升），
+    # 而 `0 or fallback` 会把它替换成兜底值，语义被悄悄改掉。只把真正的空值视为缺失。
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = fallback
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        v = fallback
+    return max(minimum, v)
 
 # ========== 获取各模型的 API 配置 ==========
 def get_model_config(model_type):

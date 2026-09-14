@@ -93,7 +93,7 @@ def generate_dynamic_content():
             print("🔍 动态发布前联网搜索热点...")
             resp = or_client.chat.completions.create(
                 model=OR_SEARCH_MODEL,
-                max_tokens=500,
+                max_tokens=get_max_tokens("search"),
                 messages=[{"role": "user", "content": "今天B站或互联网上有什么有趣的热点话题？简要列出3个，每个一句话。"}]
             )
             hot_info = resp.choices[0].message.content.strip()
@@ -151,7 +151,7 @@ def generate_dynamic_content():
     try:
         message = or_client.chat.completions.create(
             model=OR_CHAT_MODEL,
-            max_tokens=500,
+            max_tokens=get_max_tokens("dynamic"),
             messages=[{"role": "user", "content": prompt}]
         )
         text = message.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()

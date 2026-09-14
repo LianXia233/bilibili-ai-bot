@@ -194,6 +194,22 @@ def _search_candidates():
     return _model_candidates("search") or _model_candidates("chat")
 
 
+# 推理型模型的兜底抬升预算（面板可调，键 MAX_TOKENS_REASONING_FLOOR）。
+# 这类模型先产出思考过程（reasoning tokens）再产出正文，两者共用 max_tokens。
+# 调用方按「短回复」估的 100~400 预算会被思考过程吃光，正文留空且
+# finish_reason 停在 "length"。见 _complete_with 的抬升重试。
+# 面板把该键设为 0 即表示「不抬升」，完全按各场景预算执行。
+_REASONING_BUDGET_FLOOR_DEFAULT = 3000
+
+
+def _reasoning_floor():
+    """读面板配置的兜底抬升预算。配置读取异常时退回内置默认，避免拖垮调用链。"""
+    try:
+        from config import get_max_tokens
+        return get_max_tokens("reasoning_floor", minimum=0)
+    except Exception:
+        return _REASONING_BUDGET_FLOOR_DEFAULT
+
 _CHAT_CLIENTS = {}
 
 
@@ -205,40 +221,91 @@ def _chat_client(base_url, api_key):
     return _CHAT_CLIENTS[key]
 
 
+def _usage_of(resp):
+    """取 (输入tokens, 输出tokens)。部分兼容网关不返回 usage，按 0 计。"""
+    usage = getattr(resp, "usage", None)
+    if not usage:
+        return 0, 0
+    return (getattr(usage, "prompt_tokens", 0) or 0,
+            getattr(usage, "completion_tokens", 0) or 0)
+
+
+def _reasoning_len(choice):
+    """推理型模型把思考过程放在 reasoning_content / reasoning 字段里。
+
+    该字段与正文分开返回，只用于日志诊断：它能区分「模型没说话」和
+    「模型的思考过程把预算吃完了」这两种同样表现为空正文的情况。
+    """
+    msg = getattr(choice, "message", None)
+    for attr in ("reasoning_content", "reasoning"):
+        val = getattr(msg, attr, None)
+        if val:
+            return len(str(val))
+    return 0
+
+
 def _complete_with(candidates, content, max_tokens, label):
     """按候选链依次尝试，返回 (正文, 输入tokens, 输出tokens, 实际模型名)。
 
     content 可以是纯文本字符串，也可以是 OpenAI 的多模态 content 数组
     （图文混合），对话 / 联网搜索 / 视觉三类调用共用这一条链路。
-    非首选通道放宽 token 预算：推理型模型会先把预算消耗在推理过程上，正文可能为空串。
+
+    推理型模型的预算策略：
+    调用方传的 max_tokens 是按「短回复」估的（100~400），推理型模型会先把预算
+    消耗在思考过程上，预算见底时正文为空、finish_reason 停在 "length"。原实现
+    只在候选之间切换、且首选通道不放宽预算，于是要么白等一轮备用通道，要么在
+    没配备用模型时直接返回空正文（上层 JSON 解析随即抛错）。
+    现在：每个候选最多两轮 —— 首轮用请求预算，一旦 finish=length 确认「预算
+    耗尽」就地抬升到面板配置的兜底预算（MAX_TOKENS_REASONING_FLOOR）重试**同一
+    个模型**，仍失败才换候选。兜底预算设为 0 时不抬升。
     """
     last_err = "未配置任何可用模型"
     for idx, (base_url, api_key, model) in enumerate(candidates):
-        budget = max(max_tokens, 1500) if idx > 0 else max_tokens
-        try:
-            resp = _chat_client(base_url, api_key).chat.completions.create(
-                model=model,
-                max_tokens=budget,
-                messages=[{"role": "user", "content": content}]
-            )
-            choice = resp.choices[0]
-            text = (choice.message.content or "").strip()
-            if text:
-                if idx > 0:
-                    print(f"  \u21a9\ufe0f {label}已切换到备用通道 {model}")
-                return (text,
-                        (resp.usage.prompt_tokens if resp.usage else 0),
-                        (resp.usage.completion_tokens if resp.usage else 0),
-                        model)
-            last_err = f"{model} 返回空正文(finish={choice.finish_reason})"
-        except Exception as e:
-            last_err = f"{model}: {str(e)[:120]}"
+        # 备用通道本就承担「放宽预算以兜住截断」的职责，保持该语义
+        first_budget = max_tokens if idx == 0 else max(max_tokens, 1500)
+        floor = _reasoning_floor()
+        budgets = [first_budget]
+        if floor and first_budget < floor:
+            budgets.append(floor)
+        for attempt, budget in enumerate(budgets):
+            try:
+                resp = _chat_client(base_url, api_key).chat.completions.create(
+                    model=model,
+                    max_tokens=budget,
+                    messages=[{"role": "user", "content": content}]
+                )
+                choice = resp.choices[0]
+                text = (choice.message.content or "").strip()
+                in_tok, out_tok = _usage_of(resp)
+                if text:
+                    if idx > 0:
+                        print(f"  \u21a9\ufe0f {label}已切换到备用通道 {model}")
+                    return text, in_tok, out_tok, model
+                finish = getattr(choice, "finish_reason", "") or ""
+                reasoning_len = _reasoning_len(choice)
+                last_err = (f"{model} 返回空正文(finish={finish}, "
+                            f"out_tokens={out_tok}, reasoning_len={reasoning_len})")
+                # finish=length 是「预算被吃光」的确凿判据，而非模型真的无话可说
+                if finish == "length" and attempt + 1 < len(budgets):
+                    print(f"  \u21bb {label}预算被推理吃光（{budget} → "
+                          f"{budgets[attempt + 1]}），抬升预算重试 {model}")
+                    continue
+                break
+            except Exception as e:
+                last_err = f"{model}: {str(e)[:120]}"
+                break
     print(f"  \u26a0\ufe0f {label}全部候选通道失败（{last_err}）")
     return "", 0, 0, ""
 
 
-def claude_chat(prompt, max_tokens=300):
-    """对话调用：主模型 -> 兜底模型 -> 备用通道，任一返回非空正文即采纳。"""
+def claude_chat(prompt, max_tokens=None):
+    """对话调用：主模型 -> 兜底模型 -> 备用通道，任一返回非空正文即采纳。
+
+    max_tokens 留空时取面板配置的 MAX_TOKENS_CHAT（默认 300）。
+    """
+    if max_tokens is None:
+        from config import get_max_tokens
+        max_tokens = get_max_tokens("chat")
     text, in_tok, out_tok, _model = _complete_with(
         _chat_candidates(), prompt, max_tokens, "对话")
     return text, in_tok, out_tok
@@ -264,11 +331,12 @@ def needs_search(text):
 
 def web_search(query):
     try:
-        from config import get_raw_config
+        from config import get_raw_config, get_max_tokens
         search_prefix = get_raw_config().get("PROMPT_SEARCH_PREFIX", "").strip() or "请搜索并简要回答（200字以内，中文）："
         print(f"🔍 联网搜索：{query}")
         result, in_tok, out_tok, model = _complete_with(
-            _search_candidates(), f"{search_prefix}{query}", 500, "联网搜索")
+            _search_candidates(), f"{search_prefix}{query}",
+            get_max_tokens("search"), "联网搜索")
         if not result:
             print("⚠️ 联网搜索失败：候选通道都没返回内容")
             return ""
@@ -363,7 +431,7 @@ UP主：{video_info.get('owner_name', '未知')}
         content.append({"type": "text", "text": text_prompt})
 
         result, in_tok, out_tok, model = _complete_with(
-            _vision_candidates(), content, 250, "视频分析")
+            _vision_candidates(), content, get_max_tokens("vision"), "视频分析")
         if not result:
             return _video_fallback_text(video_info)
         log_cost("视频识别", in_tok, out_tok, model=model)
@@ -718,7 +786,7 @@ def compress_user_memory(memory, user_id, username):
 user_facts：只提取用户明确说过的事实信息，不要瞎猜。没有就留空数组。"""
 
     try:
-        text, in_tok, out_tok = claude_chat(prompt, max_tokens=400)
+        text, in_tok, out_tok = claude_chat(prompt, max_tokens=get_max_tokens("memory_compress"))
         log_cost("记忆压缩", in_tok, out_tok)
         text = text.replace("```json", "").replace("```", "").strip()
         try:
@@ -797,7 +865,7 @@ def compress_thread(docs):
 {"".join(to_compress)}
 
 直接输出摘要内容。"""
-    text, in_tok, out_tok = claude_chat(compress_prompt, max_tokens=150)
+    text, in_tok, out_tok = claude_chat(compress_prompt, max_tokens=get_max_tokens("thread_compress"))
     log_cost("线程压缩", in_tok, out_tok)
     return text, recent
 
@@ -970,7 +1038,7 @@ def maybe_evolve_personality(memory):
 
     for attempt in range(max_retries):
         try:
-            text, in_tok, out_tok = claude_chat(prompt, max_tokens=1024)
+            text, in_tok, out_tok = claude_chat(prompt, max_tokens=get_max_tokens("evolve"))
             log_cost("性格演化", in_tok, out_tok)
             result = _parse_evolve_json(text, old_habits, old_opinions)
 
@@ -1255,7 +1323,7 @@ def recognize_images(image_urls):
         # 走视觉候选通道（视觉类没配则回落对话类）；此前写死 OR_VISION_MODEL，
         # 该键为空时图片识别 100% 失败，「只 @ + 发图」的评论等于没有图片信息。
         result, in_tok, out_tok, model = _complete_with(
-            _vision_candidates(), content, 100, "图片识别")
+            _vision_candidates(), content, get_max_tokens("recognize"), "图片识别")
         if not result:
             return ""
         # 来源名带「识别」二字 -> 按视觉价计费（见 config.resolve_model_price）
@@ -1367,10 +1435,22 @@ score_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。
 reply简短自然，一般15-40字，像B站真人回复，不要写得像作文。
 impression简短描述用户性格/说话风格，如"友善健谈，喜欢聊游戏"。"""
 
-    text, in_tok, out_tok = claude_chat(prompt, max_tokens=400)
+    text, in_tok, out_tok = claude_chat(prompt, max_tokens=get_max_tokens("reply"))
     log_cost("私信回复" if channel == "private" else "评论回复", in_tok, out_tok)
     text = text.replace("```json", "").replace("```", "").strip()
-    result = json.loads(text)
+    if not text:
+        # 候选通道全部返回空正文。此前这里会把空串直接交给 json.loads，
+        # 抛出的 JSONDecodeError 只说「Expecting value: line 1 column 1」，
+        # 完全看不出真正原因。改为给出可读结论，逐通道诊断见上方 _complete_with 日志。
+        raise RuntimeError("模型返回空正文（全部候选通道均无有效输出，"
+                           "详见上方各通道的 finish/预算日志）")
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"模型正文不是合法 JSON（{exc.msg} @ 第 {exc.lineno} 行第 {exc.colno} 列）；"
+            f"原文前 120 字：{text[:120]!r}"
+        ) from exc
     return (
         result.get("score_delta", 1),
         result.get("reply", ""),

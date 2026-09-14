@@ -174,7 +174,7 @@ def web_search(query):
         search_prefix = get_raw_config().get("PROMPT_SEARCH_PREFIX", "").strip() or "请搜索并简要回答（200字以内，中文）："
         client, model, fallback = get_or_client("search")
         resp = client.chat.completions.create(
-            model=model, max_tokens=500,
+            model=model, max_tokens=get_max_tokens("search"),
             messages=[{"role": "user", "content": f"{search_prefix}{query}"}]
         )
         result = resp.choices[0].message.content.strip()
@@ -187,7 +187,7 @@ def web_search(query):
         if fallback:
             try:
                 resp = client.chat.completions.create(
-                    model=fallback, max_tokens=500,
+                    model=fallback, max_tokens=get_max_tokens("search"),
                     messages=[{"role": "user", "content": f"{search_prefix}{query}"}])
                 return resp.choices[0].message.content.strip()
             except:
@@ -696,7 +696,7 @@ def chat_imagine():
             chat_client, chat_model, _ = get_or_client("chat")
             refine_resp = chat_client.chat.completions.create(
                 model=chat_model,
-                max_tokens=200,
+                max_tokens=get_max_tokens("image_prompt"),
                 messages=[{"role": "user", "content": refine_prompt}]
             )
             refined = refine_resp.choices[0].message.content.strip()
@@ -928,7 +928,7 @@ def _generate_reply(user_msg, image_filename, context_history):
         mtype = "vision" if image_path else "chat"
         client, model, fallback = get_or_client(mtype)
         message = client.chat.completions.create(
-            model=model, max_tokens=250,
+            model=model, max_tokens=get_max_tokens(mtype),
             messages=messages
         )
         in_tok = message.usage.prompt_tokens if message.usage else 0
@@ -944,7 +944,7 @@ def _generate_reply(user_msg, image_filename, context_history):
         if fallback:
             try:
                 message = client.chat.completions.create(
-                    model=fallback, max_tokens=250, messages=messages)
+                    model=fallback, max_tokens=get_max_tokens(mtype), messages=messages)
                 reply = (message.choices[0].message.content or "").strip()
                 if not reply:
                     raise RuntimeError("回退模型返回空正文")
@@ -1020,7 +1020,7 @@ def summary():
     try:
         client, model, fallback = get_or_client("chat")
         message = client.chat.completions.create(
-            model=model, max_tokens=300,
+            model=model, max_tokens=get_max_tokens("chat"),
             messages=[{"role": "user", "content": prompt}]
         )
         in_tok = message.usage.prompt_tokens if message.usage else 0
@@ -1830,6 +1830,8 @@ def api_model_test():
                     "model": model_id,
                     "messages": [{"role": "user", "content": "test pixel"}],
                     "modalities": ["image"],
+                    # 连通性测试：只验证通道是否可用，1 个 token 足够。
+                    # 故意不并入面板 Token 预算——调大它只会拖慢测试、增加费用。
                     "max_tokens": 1
                 }
                 resp = req.post(test_url, json=test_payload, headers=test_headers, timeout=30)
@@ -1853,6 +1855,8 @@ def api_model_test():
             # 文本模型: 发一条最简消息
             resp = client.chat.completions.create(
                 model=model,
+                # 连通性测试：只验证通道是否可用，5 个 token 足够。
+                # 故意不并入面板 Token 预算——调大它只会拖慢测试、增加费用。
                 max_tokens=5,
                 messages=[{"role": "user", "content": "hi"}]
             )

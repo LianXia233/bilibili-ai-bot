@@ -24,7 +24,7 @@ function brandMarkSvg(w, h) {
     + 'fill="currentColor" aria-hidden="true">' + '<path d="M24 2 34 19H14Z"></path><path d="m12 22 10 17H2Z"></path><path d="M36 22 46 39H26Z"></path><path d="M14 21h20L24 38Z"></path>' + '</svg>';
 }
 </script>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
 <title>本地聊天</title>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
 
@@ -354,7 +354,12 @@ html[data-theme="dark"] .char-dark  { display: block; }
 
 .app {
   display: flex;
+  /* 移动端 100vh 取的是「浏览器地址栏隐藏时」的大视口，实际可视区更小，
+     底部输入区会被地址栏 / 工具栏截掉。首选 --app-height（由 JS 依
+     visualViewport 同步，兼容 iOS 软键盘），其次 100dvh（跟随浏览器 UI
+     动态变化），最后回退 100vh。 */
   height: 100vh;
+  height: var(--app-height, 100dvh);
   position: relative;
   z-index: 1;                  /* 创建层叠上下文：.sidebar / .mobile-overlay 的层级在此内部比较 */
 }
@@ -764,6 +769,9 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
    ============================================================ */
 .chat-input-area {
   padding: 18px 32px 20px;
+  /* iPhone 底部 Home Indicator 会盖住输入框：按安全区补足下内边距。
+     未开启 viewport-fit=cover 时该值为 0，回退值 0px 保证观感不变。 */
+  padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
   border-top: 1px solid var(--border);
   background: color-mix(in srgb, var(--card) 78%, transparent);
   backdrop-filter: var(--glass-blur);
@@ -1485,7 +1493,10 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
   .gen-image { max-width: 240px; max-height: 240px; }
 
   /* 输入区 */
-  .chat-input-area { padding: 12px; }
+  .chat-input-area {
+    padding: 12px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  }
   .input-wrapper { padding: 6px 8px; border-radius: 14px; gap: 6px; }
   .chat-input { font-size: 14px; padding: 6px 4px; }
   .send-btn { width: 34px; height: 34px; font-size: 15px; }
@@ -1550,7 +1561,10 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
   .panel-header { padding: 12px; }
   .panel-content { padding: 12px; }
   .chat-messages { padding: 12px 8px; }
-  .chat-input-area { padding: 8px; }
+  .chat-input-area {
+    padding: 8px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  }
   .message { max-width: 92%; }
   .msg-bubble { font-size: 13px; padding: 8px 11px; }
   .settings-card-body { padding: 10px; }
@@ -2388,6 +2402,91 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
       </div>
     </div>
 
+    <!-- Token 预算 -->
+    <div class="settings-card">
+      <div class="settings-card-header">
+        <span class="settings-card-title">🎚 Token 预算（max_tokens）</span>
+      </div>
+      <div class="settings-card-body">
+        <p style="font-size:11px;color:var(--text-dim);margin:0 0 12px;line-height:1.7;">
+          推理型模型（先思考、再回答）的预算是「思考过程 + 正文」共用的：填太小会被思考过程吃光，
+          正文留空并报「模型返回空正文」。换用这类模型时，把对应场景调大即可，不必改代码。
+          调大只抬高上限，不会凭空增加费用；留空则沿用该场景的默认值。
+        </p>
+
+        <div style="font-size:12px;color:var(--ice-blue);font-weight:600;margin:4px 0 8px;">对话与回复</div>
+        <div style="display:flex;gap:8px;">
+          <div class="settings-field" style="flex:1;">
+            <label>对话回复</label>
+            <input type="number" id="tok_chat" min="1" placeholder="300">
+          </div>
+          <div class="settings-field" style="flex:1;">
+            <label>评论 / 私信回复</label>
+            <input type="number" id="tok_reply" min="1" placeholder="400">
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <div class="settings-field" style="flex:1;">
+            <label>动态文案</label>
+            <input type="number" id="tok_dynamic" min="1" placeholder="500">
+          </div>
+          <div class="settings-field" style="flex:1;">
+            <label>主动评论 / 推荐语</label>
+            <input type="number" id="tok_proactive_comment" min="1" placeholder="350">
+          </div>
+        </div>
+
+        <div style="font-size:12px;color:var(--ice-blue);font-weight:600;margin:14px 0 8px;">记忆与人格</div>
+        <div style="display:flex;gap:8px;">
+          <div class="settings-field" style="flex:1;">
+            <label>记忆压缩</label>
+            <input type="number" id="tok_memory_compress" min="1" placeholder="400">
+          </div>
+          <div class="settings-field" style="flex:1;">
+            <label>历史线程压缩</label>
+            <input type="number" id="tok_thread_compress" min="1" placeholder="150">
+          </div>
+        </div>
+        <div class="settings-field">
+          <label>性格演化</label>
+          <input type="number" id="tok_evolve" min="1" placeholder="1024">
+        </div>
+
+        <div style="font-size:12px;color:var(--ice-blue);font-weight:600;margin:14px 0 8px;">联网与视觉</div>
+        <div style="display:flex;gap:8px;">
+          <div class="settings-field" style="flex:1;">
+            <label>联网搜索</label>
+            <input type="number" id="tok_search" min="1" placeholder="500">
+          </div>
+          <div class="settings-field" style="flex:1;">
+            <label>视频 / 截图理解</label>
+            <input type="number" id="tok_vision" min="1" placeholder="250">
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <div class="settings-field" style="flex:1;">
+            <label>评论配图识别</label>
+            <input type="number" id="tok_recognize" min="1" placeholder="100">
+          </div>
+          <div class="settings-field" style="flex:1;">
+            <label>生图 prompt 精炼</label>
+            <input type="number" id="tok_image_prompt" min="1" placeholder="200">
+          </div>
+        </div>
+
+        <div style="font-size:12px;color:var(--ice-blue);font-weight:600;margin:14px 0 8px;">推理型模型兜底</div>
+        <div class="settings-field">
+          <label>预算被吃光时的重试上限（0 = 不重试）</label>
+          <input type="number" id="tok_reasoning_floor" min="0" placeholder="3000">
+          <p style="font-size:11px;color:var(--text-dim);margin-top:2px;line-height:1.6;">
+            正文为空且 finish_reason=length 时，用这个预算对同一模型重试一轮。默认 3000 足够多数推理模型。
+          </p>
+        </div>
+
+        <button class="settings-btn primary" onclick="saveMaxTokens()" style="margin-top:8px;">保存 Token 预算</button>
+      </div>
+    </div>
+
     <!-- 心情管理 -->
     <div class="settings-card">
       <div class="settings-card-header">
@@ -2850,6 +2949,21 @@ function viewImage(src) {
   document.getElementById('viewerImg').src = src;
   document.getElementById('imageViewer').classList.add('show');
 }
+
+// ===== 移动端可视高度同步 =====
+// iOS Safari 的 100vh / 100dvh 不随软键盘变化：键盘弹出时布局视口不变，
+// 底部输入区会被键盘盖住。visualViewport 给出的是真实可视高度，直接同步到
+// --app-height，键盘进出时聊天区随之收缩，输入框始终留在可视范围内。
+(function syncAppHeight() {
+  const vv = window.visualViewport;
+  if (!vv) return;                       // 不支持则交给 CSS 的 dvh 回退链
+  const apply = () => {
+    document.documentElement.style.setProperty('--app-height', vv.height + 'px');
+  };
+  vv.addEventListener('resize', apply);
+  vv.addEventListener('scroll', apply);
+  apply();
+})();
 
 document.addEventListener('DOMContentLoaded', () => {
   const chatArea = document.querySelector('.chat-input-area');
@@ -4206,6 +4320,62 @@ async function saveSchedule() {
   } catch(e) { toast('保存失败', 'error'); }
 }
 
+// ===== Token 预算（max_tokens）=====
+// 配置键 -> 面板输入框 id，与 config.py 的 MAX_TOKENS_* 及 get_max_tokens() 的场景名一一对应。
+// 新增场景时改这一张表 + 上面的输入框即可，读写逻辑不用动。
+const MAX_TOKEN_FIELDS = {
+  MAX_TOKENS_CHAT: 'tok_chat',
+  MAX_TOKENS_REPLY: 'tok_reply',
+  MAX_TOKENS_DYNAMIC: 'tok_dynamic',
+  MAX_TOKENS_PROACTIVE_COMMENT: 'tok_proactive_comment',
+  MAX_TOKENS_MEMORY_COMPRESS: 'tok_memory_compress',
+  MAX_TOKENS_THREAD_COMPRESS: 'tok_thread_compress',
+  MAX_TOKENS_EVOLVE: 'tok_evolve',
+  MAX_TOKENS_SEARCH: 'tok_search',
+  MAX_TOKENS_VISION: 'tok_vision',
+  MAX_TOKENS_RECOGNIZE: 'tok_recognize',
+  MAX_TOKENS_IMAGE_PROMPT: 'tok_image_prompt',
+  MAX_TOKENS_REASONING_FLOOR: 'tok_reasoning_floor',
+};
+// 允许 0 的键只有兜底预算（0 = 不抬升重试）；其余场景的预算至少 1。
+const MAX_TOKEN_ALLOW_ZERO = new Set(['MAX_TOKENS_REASONING_FLOOR']);
+
+async function loadMaxTokens() {
+  try {
+    const resp = await apiFetch('/api/config/raw');
+    const cfg = (await resp.json()).config || {};
+    for (const [key, id] of Object.entries(MAX_TOKEN_FIELDS)) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      const v = cfg[key];
+      // 空值留空 -> 保存时跳过，语义为「沿用该场景默认值」
+      el.value = (v === undefined || v === null || v === '') ? '' : v;
+    }
+  } catch(e) { console.error(e); }
+}
+
+async function saveMaxTokens() {
+  const updates = {};
+  const bad = [];
+  for (const [key, id] of Object.entries(MAX_TOKEN_FIELDS)) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    const raw = String(el.value).trim();
+    if (raw === '') continue;   // 留空 = 不写入，沿用服务端默认值
+    const n = parseInt(raw, 10);
+    const min = MAX_TOKEN_ALLOW_ZERO.has(key) ? 0 : 1;
+    if (isNaN(n) || n < min) { bad.push(el.previousElementSibling ? el.previousElementSibling.textContent : id); continue; }
+    updates[key] = n;
+  }
+  if (bad.length) { toast('预算需为不小于 1 的整数（兜底预算可填 0）：' + bad.join('、'), 'error'); return; }
+  if (!Object.keys(updates).length) { toast('没有填写任何预算，未做改动', 'error'); return; }
+  try {
+    const resp = await apiFetch('/api/config/update', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(updates)});
+    const data = await resp.json();
+    data.ok ? toast(`Token 预算已保存（${Object.keys(updates).length} 项）`, 'success', 3000) : toast('保存失败', 'error');
+  } catch(e) { toast('保存失败', 'error'); }
+}
+
 // ===== 心情管理 =====
 async function loadMood() {
   try {
@@ -4415,6 +4585,7 @@ loadSettings = async function() {
   loadMood();
   loadPrompts();
   loadBrandingSettings();
+  loadMaxTokens();
 };
 
 // ===== 后端健康检测 =====
