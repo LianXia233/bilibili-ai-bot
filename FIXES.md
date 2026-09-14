@@ -19,8 +19,9 @@
 | [二](#二评论楼层归属与上下文串台) | 评论楼层归属与上下文串台 | `thread_id` 粒度太粗 | 观察同串多用户回复 |
 | [三](#三模型兜底与记忆检索降级) | 模型兜底与记忆检索降级 | 推理型模型吃光 token | 看 `finish_reason` |
 | [四](#四移动端遮罩压住侧栏) | 移动端点菜单后无法操作 | CSS 层叠上下文嵌套错位 | `elementFromPoint` 命中链 + 读 `parentElement` |
-| [五](#五user-agent-不完整触发风控) | User-Agent 不完整触发风控 | UA 缺版本号 | 看错误码 + 异常类型 |
-| [六](#六部署注意事项) | 部署注意事项 | — | — |
+| [五](#五移动端汉堡按钮随面板消失) | 切面板后无法回到侧栏 | 按钮被放在单个面板内部 | 逐面板遍历断言按钮可见性 |
+| [六](#六user-agent-不完整触发风控) | User-Agent 不完整触发风控 | UA 缺版本号 | 看错误码 + 异常类型 |
+| [七](#七部署注意事项) | 部署注意事项 | — | — |
 
 ---
 
@@ -212,7 +213,93 @@ el.parentElement;   // 修复前是 BODY，修复后是 DIV.app
 
 ---
 
-## 五、User-Agent 不完整触发风控
+## 五、移动端汉堡按钮随面板消失
+
+现象：手机上点侧栏里的「安全中心」切过去之后，左上角的汉堡按钮就没了，**再也打不开侧栏**，只能刷新页面。
+
+### 根因：按钮被放在了单个面板内部
+
+汉堡按钮的原始位置是 `#panel-chat` 里的 `.chat-header`：
+
+```html
+<div id="panel-chat" class="panel active">
+  <div class="chat-panel">
+    <div class="chat-header">
+      <button class="mobile-menu-btn" ...>   <!-- 只在这里 -->
+```
+
+而面板切换靠 `display` 控制：
+
+```css
+.panel        { display: none; }
+.panel.active { display: flex; }
+```
+
+切到任何非聊天面板时，`#panel-chat` 立刻 `display: none`，**按钮作为它的后代一起消失**。其余 14 个面板只有 `.panel-header`（标题 + 描述），压根没有汉堡按钮。
+
+这不是样式错误，而是**元素归属位置错误** —— 一个「全局导航入口」被放进了「其中一个页面的局部容器」里。
+
+### 修复：把入口提到所有面板之外
+
+在 `.main` 下、所有 `.panel` 之前插入独立顶栏：
+
+```html
+<div class="main">
+  <div class="mobile-topbar">          <!-- 面板之外，与切换逻辑解耦 -->
+    <button class="mobile-menu-btn" ...>
+    <span class="mobile-topbar-title" id="mobileTopbarTitle">聊天</span>
+  </div>
+  <div id="panel-chat" class="panel active"> ...
+```
+
+配套三处：
+
+1. `.chat-header` 内原有的汉堡按钮删除，否则移动端聊天面板会同时出现两个
+2. `.panel` 由 `height: 100%` 改为 `flex: 1; min-height: 0` —— `.main` 是 flex 列容器，顶栏占了 47px，`height: 100%` 的面板会撑出纵向溢出
+3. `switchPanel()` 里同步顶栏标题，让用户知道自己在哪个面板
+
+> **为什么不给 15 个面板各补一个按钮？** 那要改 15 处，且将来新增面板时极易遗漏，同一个问题会原样复现。把入口提到面板之外，新增面板自动覆盖。
+
+### 顶栏标题的取值顺序
+
+标题优先取**侧栏导航项文案**，而不是面板内部的 `h2`：
+
+1. 首选：匹配 `.sidebar .nav-item` 的 `onclick`，取其文案（去掉尾部角标数字）
+2. 次选：面板自身的 `.panel-header h2`（去掉开头的图标字符）
+3. 兜底：面板的英文名
+
+原因：**聊天面板没有 `.panel-header`**，它的头部是 `.chat-header`，里面只有一个显示 Bot 名的 `h2#chatBotName`。只用次选方案时，聊天面板的顶栏标题会退化成英文的 `chat` —— 这个边界用例是靠遍历全部面板断言标题才发现的。
+
+### 排查手法：遍历断言，而不是只测当前页
+
+这类「只在某些页面上坏」的问题，单测一个页面必然漏掉。做法是**遍历所有需要覆盖的页面状态**，逐个断言：
+
+```python
+for name in ("chat", "summary", "security", "memory", "settings"):
+    switch_panel(name)
+    assert topbar.display == "flex"
+    assert menu_btn.display == "flex" and menu_btn.width > 0
+    assert title.text == expected_label[name]
+```
+
+顺带也能抓住布局副作用 —— 本次就靠它确认了 `顶栏 y(47) + 面板高(797) == 视口高(844)`，即 `.panel` 的高度改动是正确的。
+
+<details>
+<summary><b>踩坑记录：新增顶栏 CSS 时踩到特异性反转</b></summary>
+
+<br>
+
+基础规则是 `.mobile-menu-btn { display: none }`（特异性 `0,1,0`），移动端媒体查询里再用 `.mobile-menu-btn { display: flex }` 打开。
+
+写顶栏时顺手加了 `.mobile-topbar .mobile-menu-btn { display: flex; }`（特异性 `0,2,0`），**它高于基础规则，于是在桌面端也生效**。表现很隐蔽：顶栏本身 `display: none`，所以按钮的 `getBoundingClientRect()` 是 `0×0`，用户既看不见也点不到，但 `getComputedStyle().display` 是 `flex` —— 属于「无害但错误」的状态。
+
+是桌面端回归测试里那条 `assert menuBtn.display == "none"` 把它揪出来的。**修法**：删掉这条多余规则，移动端显示交给媒体查询里既有的那条即可 —— 顶栏 `display: flex` 后，子按钮自然可见，不需要额外声明。
+
+</details>
+
+---
+
+## 六、User-Agent 不完整触发风控
 
 B站写操作会拒收不完整的 User-Agent，返回 `code 30014`（`Token is invalid`）。
 
@@ -229,7 +316,7 @@ B站写操作会拒收不完整的 User-Agent，返回 `code 30014`（`Token is 
 
 ---
 
-## 六、部署注意事项
+## 七、部署注意事项
 
 | # | 事项 | 要点 |
 |:-:|------|------|

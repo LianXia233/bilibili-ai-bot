@@ -606,7 +606,7 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
 }
 
 /* 面板通用 */
-.panel { display: none; flex-direction: column; height: 100%; animation: fadeIn 0.35s var(--ease); }
+.panel { display: none; flex-direction: column; flex: 1; min-height: 0; animation: fadeIn 0.35s var(--ease); }
 .panel.active { display: flex; }
 
 @keyframes fadeIn {
@@ -1029,6 +1029,31 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
 }
 .mobile-menu-btn:hover { background: var(--secondary); }
 
+/* ===== 移动端顶栏 =====
+   汉堡按钮原先只放在 #panel-chat 的 .chat-header 里，切到其他面板后
+   随聊天面板一起 display:none，用户无法再打开侧栏。改为独立顶栏，
+   与面板切换解耦。桌面端隐藏，不影响既有布局。 */
+.mobile-topbar {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 70%, transparent);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  flex-shrink: 0;
+}
+.mobile-topbar-title {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  color: var(--foreground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .mobile-menu-btn svg {
   width: 20px;
   height: 20px;
@@ -1439,6 +1464,7 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
     box-shadow: 10px 0 32px rgba(23, 50, 75, 0.28);
   }
   .mobile-menu-btn { display: flex; }
+  .mobile-topbar { display: flex; }
 
   /* 面板 header/content：缩小边距 */
   .panel-header { padding: 16px 16px; }
@@ -1646,11 +1672,16 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
   </div>
 
   <div class="main">
-    <!-- 聊天面板 -->
-    <div id="panel-chat" class="panel active">
+    <!-- 移动端顶栏：与面板切换解耦，任何面板下都可打开侧栏 -->
+  <div class="mobile-topbar">
+    <button class="mobile-menu-btn" type="button" onclick="toggleSidebar()" aria-label="打开导航"><svg class="lucide lucide-menu" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 5h16" /> <path d="M4 12h16" /> <path d="M4 19h16" /></svg></button>
+    <span class="mobile-topbar-title" id="mobileTopbarTitle">聊天</span>
+  </div>
+
+  <!-- 聊天面板 -->
+  <div id="panel-chat" class="panel active">
       <div class="chat-panel">
         <div class="chat-header">
-          <button class="mobile-menu-btn" type="button" onclick="toggleSidebar()" aria-label="打开导航"><svg class="lucide lucide-menu" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 5h16" /> <path d="M4 12h16" /> <path d="M4 19h16" /></svg></button>
           <div class="avatar" id="chatAvatar">🤖</div>
           <div class="chat-header-info">
             <h2 id="chatBotName">Bot</h2>
@@ -2847,10 +2878,34 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 
+// ===== 移动端顶栏标题：跟随当前面板，让用户知道自己在哪 =====
+function syncMobileTopbar(name) {
+  var title = document.getElementById('mobileTopbarTitle');
+  if (!title) return;
+  // 首选来源：侧栏导航项文案（用户看到的菜单名，与内部命名解耦）
+  var items = document.querySelectorAll('.sidebar .nav-item');
+  for (var i = 0; i < items.length; i++) {
+    var oc = items[i].getAttribute('onclick') || '';
+    if (oc.indexOf("'" + name + "'") === -1) continue;
+    // 去掉尾部角标数字与空白
+    var t = items[i].textContent.replace(/[0-9\s]+/g, ' ').trim();
+    if (t) { title.textContent = t; return; }
+  }
+  // 次选来源：面板自身的 .panel-header h2（去掉开头的图标字符）
+  var panel = document.getElementById('panel-' + name);
+  var h2 = panel ? panel.querySelector('.panel-header h2') : null;
+  if (h2) {
+    var t2 = h2.textContent.replace(/^[^\u4e00-\u9fffA-Za-z0-9]+/, '').trim();
+    if (t2) { title.textContent = t2; return; }
+  }
+  title.textContent = name;
+}
+
 function switchPanel(name) {
   closeSidebar();  // 移动端关闭侧边栏
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  syncMobileTopbar(name);
   document.getElementById('panel-' + name).classList.add('active');
   if (event && event.currentTarget) event.currentTarget.classList.add('active');
   if (name === 'users') loadUsers();
@@ -4471,9 +4526,13 @@ function syncThemeToggle() {
 }
 
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', syncThemeToggle);
+  document.addEventListener('DOMContentLoaded', function () {
+    syncThemeToggle();
+    syncMobileTopbar('chat');
+  });
 } else {
   syncThemeToggle();
+  syncMobileTopbar('chat');
 }
 </script>
 
