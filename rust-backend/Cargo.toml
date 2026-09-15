@@ -1,0 +1,31 @@
+[package]
+name = "bilibili-ai-bot-rs"
+version = "0.1.0"
+edition = "2021"
+description = "B站 AI 角色系统后端 Rust 重构版（Flask → Axum）"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "multipart", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+md-5 = "0.10"
+rsa = { version = "0.9", features = ["pem", "sha2"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+sha2 = "0.10"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+regex = "1"
+futures = "0.3"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+url = "2"
+percent-encoding = "2"
+unicode-normalization = "0.1"
+
+[profile.release]
+lto = true
+strip = true
