@@ -215,7 +215,7 @@ async fn api_change_password(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Va
     if new.is_empty() || new.chars().count() < 3 {
         return json_resp(StatusCode::BAD_REQUEST, json!({"error": "新密码太短"}));
     }
-        let _ = crate::config::update_config(&ctx.config, &json!({"CHAT_PASSWORD": new}));
+    let _ = crate::config::update_config(&ctx.config, &json!({"CHAT_PASSWORD": new}));
     Json(json!({"ok": true})).into_response()
 }
 
@@ -281,7 +281,7 @@ async fn api_qr_login_poll(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Valu
         Ok(mut v) => {
             if v.get("status").and_then(|s| s.as_str()) == Some("confirmed") {
                 if let Some(patch) = v.get("config").cloned() {
-                                        let _ = crate::config::update_config(&ctx.config, &patch);
+                    let _ = crate::config::update_config(&ctx.config, &patch);
                 }
                 v["applied"] = json!(true);
             }
@@ -324,7 +324,7 @@ async fn api_chat(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Re
     let cfg = ctx.config.read().unwrap().clone();
     let history: Vec<Value> = load_json(&ctx.path("local_chat.json"), Vec::new());
     let mut llm_messages: Vec<Value> = Vec::new();
-    let persona = PersonaStore::new(&ctx.base_dir).active_system_prompt();
+    let persona = PersonaStore::new(&ctx.base_dir).active_system_prompt(&cfg.get_str("ACTIVE_PERSONA"));
     if !persona.is_empty() {
         llm_messages.push(json!({"role": "system", "content": persona}));
     }
@@ -637,7 +637,7 @@ async fn api_features_update(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Va
     if updates.is_empty() {
         return json_resp(StatusCode::BAD_REQUEST, json!({"error": "无有效字段"}));
     }
-        let _ = crate::config::update_config(&ctx.config, &Value::Object(updates.clone()));
+    let _ = crate::config::update_config(&ctx.config, &Value::Object(updates.clone()));
     Json(json!({"ok": true, "updated": updates.keys().collect::<Vec<_>>()})).into_response()
 }
 
@@ -678,7 +678,7 @@ async fn api_schedule_update(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Va
     if updates.is_empty() {
         return json_resp(StatusCode::BAD_REQUEST, json!({"error": "无有效字段"}));
     }
-        let _ = crate::config::update_config(&ctx.config, &Value::Object(updates));
+    let _ = crate::config::update_config(&ctx.config, &Value::Object(updates));
     Json(json!({"ok": true})).into_response()
 }
 
@@ -715,7 +715,7 @@ async fn api_prompts_update(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Val
     if updates.is_empty() {
         return json_resp(StatusCode::BAD_REQUEST, json!({"error": "无有效字段"}));
     }
-        let _ = crate::config::update_config(&ctx.config, &Value::Object(updates));
+    let _ = crate::config::update_config(&ctx.config, &Value::Object(updates));
     Json(json!({"ok": true})).into_response()
 }
 
@@ -788,9 +788,7 @@ async fn api_personas_delete(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Va
         return json_resp(StatusCode::BAD_REQUEST, json!({"error": "不能删除默认人格"}));
     }
     let store = PersonaStore::new(&ctx.base_dir);
-    let v = store.load();
-    let personas = v.get("personas").cloned().unwrap_or(json!({}));
-    if personas.get(name).is_none() {
+    if !store.exists(name) {
         return json_resp(StatusCode::NOT_FOUND, json!({"error": "人格不存在"}));
     }
     let _ = store.delete(name);
@@ -803,7 +801,7 @@ async fn api_personas_delete(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Va
 
 async fn api_personas_reset(State(ctx): State<Arc<WebCtx>>) -> Response {
     let _ = PersonaStore::new(&ctx.base_dir).reset();
-        let _ = crate::config::update_config(&ctx.config, &json!({"ACTIVE_PERSONA": "default"}));
+    let _ = crate::config::update_config(&ctx.config, &json!({"ACTIVE_PERSONA": "default"}));
     let _ = save_json(&ctx.path("personality_evolution.json"), &json!({}));
     let _ = save_json(&ctx.path("mood.json"), &json!({}));
     let _ = save_json(&ctx.path("permanent_memory.json"), &json!([]));
@@ -936,7 +934,7 @@ async fn api_chat_imagine(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value
         let texts: Vec<String> = permanent.iter().rev().take(10).filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())).collect();
         format!("\n你的自我认知：{}", texts.join("；"))
     };
-    let persona_brief: String = PersonaStore::new(&ctx.base_dir).active_system_prompt().chars().take(200).collect();
+    let persona_brief: String = PersonaStore::new(&ctx.base_dir).active_system_prompt(&cfg.get_str("ACTIVE_PERSONA")).chars().take(200).collect();
     let custom = cfg.get_str("PROMPT_IMAGINE");
     let refine_prompt = if !custom.is_empty() {
         custom
@@ -995,7 +993,7 @@ async fn api_chat_imagine(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value
 async fn generate_chat_reply(ctx: &WebCtx, user_msg: &str, image_filename: &str, history: &[Value]) -> Result<String> {
     let cfg = ctx.config.read().unwrap().clone();
     let mut llm_messages: Vec<Value> = Vec::new();
-    let persona = PersonaStore::new(&ctx.base_dir).active_system_prompt();
+    let persona = PersonaStore::new(&ctx.base_dir).active_system_prompt(&cfg.get_str("ACTIVE_PERSONA"));
     if !persona.is_empty() {
         llm_messages.push(json!({"role": "system", "content": persona}));
     }
@@ -1065,18 +1063,26 @@ async fn api_watchlog_list(State(ctx): State<Arc<WebCtx>>) -> Response {
 }
 
 async fn api_permanent_list(State(ctx): State<Arc<WebCtx>>) -> Response {
-    Json(json!({"list": ctx.permanent.load()})).into_response()
+    Json(json!({"items": ctx.permanent.load()})).into_response()
 }
 
 async fn api_permanent_add(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
-    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if text.is_empty() {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "内容为空"}));
+    }
+    if ctx.permanent.load().len() >= crate::memory::PERMANENT_MEMORY_LIMIT {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "永久记忆已满20条，请先删除旧的"}));
+    }
     ctx.permanent.add(text);
     Json(json!({"ok": true})).into_response()
 }
 
 async fn api_permanent_delete(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
-    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
-    ctx.permanent.remove(text);
+    let index = body.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if index >= 0 {
+        ctx.permanent.remove_by_index(index as usize);
+    }
     Json(json!({"ok": true})).into_response()
 }
 
@@ -1093,35 +1099,47 @@ async fn api_summary_save(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value
 
 // ---------- personas ----------
 async fn api_personas(State(ctx): State<Arc<WebCtx>>) -> Response {
-    Json(PersonaStore::new(&ctx.base_dir).list()).into_response()
+    let cfg = ctx.config.read().unwrap().clone();
+    Json(json!({
+        "personas": PersonaStore::new(&ctx.base_dir).list(),
+        "active": cfg.get_str("ACTIVE_PERSONA"),
+    }))
+    .into_response()
 }
 
 async fn api_personas_create(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let prompt = body.get("system_prompt").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() {
-        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "缺少名称"}));
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "名称不能为空"}));
     }
-    match PersonaStore::new(&ctx.base_dir).create(name, prompt) {
-        Ok(_) => Json(json!({"ok": true})).into_response(),
+    let display_name = body.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
+    match PersonaStore::new(&ctx.base_dir).create(name, display_name, prompt) {
+        Ok(persona) => Json(json!({"ok": true, "persona": persona})).into_response(),
         Err(e) => json_resp(StatusCode::BAD_REQUEST, json!({"error": e.to_string()})),
     }
 }
 
 async fn api_personas_update(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let prompt = body.get("system_prompt").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() {
         return json_resp(StatusCode::BAD_REQUEST, json!({"error": "缺少名称"}));
     }
-    let _ = PersonaStore::new(&ctx.base_dir).update(name, prompt);
-    Json(json!({"ok": true})).into_response()
+    match PersonaStore::new(&ctx.base_dir).update(name, &body) {
+        Ok(_) => Json(json!({"ok": true})).into_response(),
+        Err(e) => json_resp(StatusCode::NOT_FOUND, json!({"error": e.to_string()})),
+    }
 }
 
 async fn api_personas_switch(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let _ = PersonaStore::new(&ctx.base_dir).switch(name);
-    Json(json!({"ok": true})).into_response()
+    let store = PersonaStore::new(&ctx.base_dir);
+    if !store.exists(name) {
+        return json_resp(StatusCode::NOT_FOUND, json!({"error": "人格不存在"}));
+    }
+    // 与 Python 一致：切换即更新配置 ACTIVE_PERSONA
+    let _ = crate::config::update_config(&ctx.config, &json!({"ACTIVE_PERSONA": name}));
+    Json(json!({"ok": true, "active": name})).into_response()
 }
 
 // ---------- 图片上传 ----------
