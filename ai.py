@@ -103,6 +103,23 @@ PERMANENT_MEMORY_FILE = "data/permanent_memory.json"
 PERMANENT_MEMORY_LIMIT = 40
 # 每次注入上下文时取用的条数上限（按时间倒序取最近 N 条）
 PERMANENT_MEMORY_INJECT = 40
+# 永久记忆注入的**字符预算**上限（默认值；面板可通过 config 的
+# PERMANENT_MEMORY_CHAR_BUDGET 覆盖，见 config.py 的说明）。
+#
+# 为什么条数上限（40）不够：条数不约束单条长度。实测线上 14 条永久记忆合计
+# 9375 字符，其中两条「表情包池·原样保留」清单就占了 2897 字符、五条表情包类
+# 条目合计 4359 字符（占 46.5%）。全量注入后整个提示词膨胀到 18030 字符，
+# 而用户真正说的那句话只有一行、位于提示词最末尾 —— 模型的注意力被前置的
+# 巨量规则与表情包名字清单吃掉，直接表现就是：
+#   * 回复与来信不匹配（「臭猫是大区」→「抱歉，我不能使用侮辱性语言」）
+#   * 复读用户原话（「今天天气怎么样」→「喵，今天天气怎么样呀？」）
+#   * 答非所问（「帮我写首诗」→「好的，我会尽力为你创作一首诗喵」但不写诗）
+# 因此这里再加一道**字符**闸门，按「先保人格规则、后保素材罗列」的优先级裁剪。
+PERMANENT_MEMORY_CHAR_BUDGET = 2500
+# 判定「这条永久记忆是表情包池清单」的特征词。这类条目是**素材索引**而非
+# 行为规则：它对模型的价值集中在「有哪些名字可以用」这个概念上，逐条罗列
+# 几百个名字只会淹没正文。命中后走 _summarize_emoji_pool 摘要注入。
+EMOJI_POOL_MARKERS = ("表情包池", "原始表情包池", "原样保留", "表情包清单")
 COST_LOG_FILE = "data/cost_log.json"
 MOOD_FILE = "data/mood.json"
 VIDEO_MEMORY_FILE = "data/video_memory.json"
@@ -1006,6 +1023,190 @@ def compress_thread(docs):
     log_cost("线程压缩", in_tok, out_tok)
     return text, recent
 
+def _is_emoji_pool_entry(text):
+    """判断一条永久记忆是不是「表情包池清单」类条目。
+
+    这类条目是素材索引，不是行为规则。逐条把几百个表情名注入提示词，会把
+    用户真正说的话挤到最末尾、淹没在名字列表里（见 PERMANENT_MEMORY_CHAR_BUDGET
+    的说明），所以单独摘出来做摘要式注入。
+    """
+    head = str(text or "")[:60]
+    return any(marker in head for marker in EMOJI_POOL_MARKERS)
+
+def _summarize_emoji_pool(entries, sample_per_entry=6):
+    """把表情包池清单压成「可用素材」摘要。
+
+    保留信息价值最高的三件事：池子里有多少条、名字长什么样（给够样例让模型
+    能模仿命名风格）、以及原规则里「必须原样使用、禁止改名」的硬约束。
+    逐条罗列几百个名字对模型没有额外价值 —— 它需要的是「这个名字在池子里
+    存在」这一判断依据，而样例足够建立命名风格。
+    """
+    lines = []
+    total = 0
+    for text in entries:
+        # 池内条目以 [名称] 形式罗列，用左方括号切分即得名字
+        names = [seg for seg in str(text).split("[") if seg.strip()]
+        names = [n.split("]")[0].strip() for n in names if "]" in n]
+        names = [n for n in names if n]
+        total += len(names)
+        if not names:
+            continue
+        sample = names[:sample_per_entry]
+        tail = f" 等 {len(names)} 条" if len(names) > sample_per_entry else ""
+        lines.append("、".join(f"[{n}]" for n in sample) + tail)
+    if not lines:
+        return ""
+    return (
+        "【可用表情包素材（索引摘要）】\n"
+        f"可用表情包池共约 {total} 条，按命名风格分布如下（样例，用的时候从同风格里挑）：\n"
+        + "\n".join(f"- {line}" for line in lines)
+        + "\n使用约束：表情包名必须原样照抄，不得改名、缩写或自行创造；"
+          "写进回复时用 [完整名称] 格式，多个连写不加分隔符。"
+    )
+
+def _rule_tier(text):
+    """给一条永久记忆规则定「装填优先级」，数字越小越先保。
+
+    为什么不能简单按写入时间排序：线上 14 条里后写的恰好是三条表情包细则
+    （【表情包使用规则·总则】842 / 【表情包格式·硬性协议】795 /
+    【表情包识别与理解】561，合计 2198 字符），如果按「新写的优先」装填，
+    预算 4000 会被它们吃掉一半多，把【身份】【人格与行为原则】
+    【禁止复读与复述】这些核心条目全部挤出上下文 —— 等于为了保住「怎么发表情」
+    而丢掉「我是谁」「不准复读」。因此这里按**规则性质**排优先级：
+
+      0 身份 / 人格 / 说话风格   —— 决定「你是谁、用什么语气」，缺了回复立刻走形
+      1 禁止类 / 底线 / 安全     —— 决定「不能做什么」，复读就走这类
+      2 理解用户 / 状态类        —— 决定「怎么读懂对方、今天什么状态」
+      3 表情包相关               —— 只影响装饰，放最后
+      9 其它                     —— 未归类的兜底
+    """
+    head = str(text or "")[:40]
+    if any(k in head for k in ("【身份】", "【人格", "行为原则", "【说话风格】")):
+        return 0
+    if any(k in head for k in ("禁止", "底线", "【安全", "抗越狱", "冲突裁决",
+                               "优先级", "边界")):
+        return 1
+    if any(k in head for k in ("不懂", "不确定", "无法理解", "理解用户",
+                               "今日心情", "短期状态")):
+        return 2
+    if "表情包" in head:
+        return 3
+    return 9
+
+def _perm_char_budget():
+    """取永久记忆注入字符预算：config 覆盖优先，异常时回落到模块默认值。
+
+    读配置包在 try 里：这条路径位于回复主链路上，配置文件损坏 / 该键被填成
+    非数字时不能让「组装上下文」整段抛错 —— 那会让所有回复一起挂掉。
+    宁可退回默认预算，也不能因为一个可调参数而中断回复。
+    """
+    try:
+        from config import get_raw_config
+        raw = get_raw_config().get("PERMANENT_MEMORY_CHAR_BUDGET")
+        value = int(raw)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return PERMANENT_MEMORY_CHAR_BUDGET
+
+def _build_permanent_block(perm):
+    """按字符预算组装「最高优先级规则」段落。
+
+    规则与表情包池分开处理：
+      * 规则类条目**逐条原样注入**（人格、边界、安全规则，一字不能改）；
+      * 表情包池类条目**摘要注入**（只给条数与命名样例），避免几百个名字
+        把正文挤到提示词末尾。
+
+    规则之间再按 _rule_tier 分层装填：同一层内「新写的先保」（新加的规则通常
+    是为修某个正在发生的问题），层与层之间严格按层级顺序 —— 保证预算再紧也是
+    先丢表情包细则，而不是先丢人格身份。
+    """
+    if not perm:
+        return ""
+    budget = _perm_char_budget()
+    items = perm[-PERMANENT_MEMORY_INJECT:]
+    rules = []
+    pools = []
+    for entry in items:
+        text = str(entry.get("text", "") or "").strip()
+        if not text:
+            continue
+        if _is_emoji_pool_entry(text):
+            pools.append(text)
+        else:
+            rules.append(text)
+
+    # 先按层级分组，组内保持「后写的排前面」（即新写的更优先）
+    grouped = {}
+    for idx, text in enumerate(rules):
+        grouped.setdefault(_rule_tier(text), []).append((idx, text))
+
+    # 分层装填：先无条件下满 tier 0/1（人格 + 禁止/安全），再让 tier 2/3 竞争余量。
+    #
+    # 为什么不用「按占比切配额」：单测实测把 2500 按 45%/40%/15% 硬切后，
+    # tier 0 只得 1125 字符却要装 1318（身份+人格+说话风格），tier 1 只得 1000
+    # 却要装 2155（禁止复读+安全+冲突裁决），结果两组都从「最旧的那条」开始丢
+    # ——【身份】与【禁止复读与复述】双双出局，而「禁止复读」恰恰是导致用户反馈
+    # 「复读/串台」的那条规则。**规则出局的顺序必须是重要性，不能是它排第几。**
+    #
+    # 现在的策略：tier 0 与 tier 1 视为「人格底线」，不受 budget 限制、全量注入
+    # （它们的规模由人工维护，通常几十条以内）；budget 只用来约束 tier 2/3 这类
+    # 「锦上添花」的内容。这样即使把 PERMANENT_MEMORY_CHAR_BUDGET 调得很小，
+    # 也只是少注入几条状态/表情包规则，而不会把人格与禁令丢掉。
+    kept = set()
+    core_chars = 0
+    for tier in sorted(grouped):
+        entries = sorted(grouped[tier], key=lambda p: -p[0])   # 组内新的先保
+        if tier in (0, 1):
+            for _, text in entries:
+                kept.add(text)
+                core_chars += len(text) + 3
+            continue
+        quota = max(0, budget - core_chars)
+        if tier == 3 and quota <= 0:
+            # 表情包细则在预算已被人格与禁令占满时不注入，避免反过来挤掉核心
+            continue
+        used = 0
+        for idx, text in entries:
+            cost = len(text) + 3  # "- " 前缀与换行
+            # 首个条目无条件保留：单条规则可能本身就超过配额，若一律执行
+            # `used + cost > quota` 判断，预算极小时会把每条都跳过、规则段
+            # 彻底为空 —— 单测实测预算=200 时曾出现所有规则被跳过、只剩表情包
+            # 摘要，等于把人格约束整个丢掉，比「注入超长」更危险。
+            if used and used + cost > quota:
+                continue
+            kept.add(text)
+            used += cost
+            core_chars += cost
+
+    # 输出时恢复**原始书写顺序**（身份→人格→风格→表情包），
+    # 打乱顺序会让规则读起来像无序清单，模型对「冲突时以本段为准」的
+    # 判断也会变模糊。
+    kept_list = [t for t in rules if t in kept]
+
+    blocks = []
+    if kept_list:
+        blocks.append(
+            "【最高优先级规则（人工设定，必须遵守）】\n"
+            "以下是引航者喵亲手写下的规则，优先级高于本提示词中的其他风格描述；"
+            "若与【说话风格】【今日状态】等段落冲突，一律以本段为准。\n"
+            + "\n".join(f"- {t}" for t in kept_list)
+        )
+    pool_summary = _summarize_emoji_pool(pools)
+    if pool_summary:
+        blocks.append(pool_summary)
+    if not blocks:
+        return ""
+    # 把被预算裁掉的信息如实说清楚，而不是让模型以为规则本来就这么多。
+    # 能被裁的只有 tier 2/3（状态类与表情包类）—— 人格与禁令是无条件注入的，
+    # 所以这里特别点明「被省略的是细节类规则」，避免模型误以为核心约束不全。
+    dropped = len(rules) - len(kept_list)
+    if dropped > 0:
+        blocks.append(f"（另有 {dropped} 条细节类规则（状态/表情包相关）因超出"
+                      f"注入预算未展示；人格与禁令类规则已全部在上方列出。）")
+    return "\n\n".join(blocks)
+
 def build_memory_context(memory, thread_id, user_id, query_text):
     """拼装「记忆参考」段落。
 
@@ -1015,21 +1216,19 @@ def build_memory_context(memory, thread_id, user_id, query_text):
     就等于给了模型一个「可以不看」的理由，回复会退化成「有什么事」这类空话。
     """
     parts = []
-    # 永久记忆：人工维护的人格 / 行为规则，是**最高优先级的约束**，必须全量注入。
+    # 永久记忆：人工维护的人格 / 行为规则，是**最高优先级的约束**，必须注入。
     #
     # 此前这里写的是 perm[-20:]，与写入侧的 20 条上限相同 —— 一旦写满，
     # 「取最近 20 条」就等于「永远只看到最早那批被反复挤兑的条目」，
     # 新加的规则（如「禁止复读」）反而进不了上下文，表现出来就是
-    # 「永久记忆改了但不起作用」。改为全量注入 + 明确的优先级措辞。
-    perm = load_json(PERMANENT_MEMORY_FILE, [])
-    if perm:
-        items = perm[-PERMANENT_MEMORY_INJECT:]
-        parts.append(
-            "【最高优先级规则（人工设定，必须遵守）】\n"
-            "以下是引航者喵亲手写下的规则，优先级高于本提示词中的其他风格描述；"
-            "若与【说话风格】【今日状态】等段落冲突，一律以本段为准。\n"
-            + "\n".join(f"- {p.get('text', '')}" for p in items if p.get("text"))
-        )
+    # 「永久记忆改了但不起作用」。改为按**字符预算**裁剪 + 明确的优先级措辞。
+    #
+    # 为什么不能只加条数上限：条数不约束单条长度。线上实测 14 条合计 9375 字符，
+    # 表情包池清单就占了近一半，全量注入把提示词推到 18030 字符，用户那句话
+    # 被埋在最后一行，回复随即走偏（复读 / 答非所问 / 与来信不匹配）。
+    perm_block = _build_permanent_block(load_json(PERMANENT_MEMORY_FILE, []))
+    if perm_block:
+        parts.append(perm_block)
     # 用户档案
     user_profile_ctx = get_user_profile_context(user_id)
     if user_profile_ctx:
@@ -1495,8 +1694,21 @@ def get_new_at_replies():
             detail.append(f"超过时效 {skipped_stale} 条")
         if skipped_business:
             detail.append(f"非视频评论 {skipped_business} 条")
-        print(f"📣 @我的评论 {len(ats)} 条待处理"
-              + (f"（跳过：{'、'.join(detail)}）" if detail else ""))
+        # 扣除已回复过的：B站消息流「不读即不消」，同一条 @ 会在每一轮里被
+        # 重新返回。此前这里只报「命中 N 条」，于是哪怕全部处理完毕，日志仍
+        # 每 20 秒刷一行「N 条待处理」，看起来像「N 条 @ 卡住不回复」——
+        # 实测排查时正是被这行日志误导。真正待处理数在调用方按 replied 过滤后
+        # 才算得准，这里把「命中 / 已处理」两个数一并给出，避免误读。
+        try:
+            _replied = load_replied()
+        except Exception:
+            _replied = set()
+        _already = sum(1 for a in ats if str(a.get("rpid")) in _replied)
+        _pending = len(ats) - _already
+        print(f"📣 @我的评论 命中 {len(ats)} 条"
+              f"（已处理 {_already} 条，待处理 {_pending} 条"
+              + (f"；跳过：{'、'.join(detail)}" if detail else "")
+              + "）")
     return ats
 
 def get_comment_images(oid, rpid, comment_type):
@@ -1635,7 +1847,22 @@ def generate_reply_and_score(comment_text, username, level, memory_context,
 
 当前时间：{now}{video_section}{memory_section}{search_section}
 {no_content_section}
-「{username}」的{_channel_name}：「{comment_text}」
+════════ 需要你回应的内容（本节唯一）════════
+{username} 的{_channel_name}：
+{comment_text}
+════════════════════════════════════════════
+
+上面这一节是对方这次真正说的话，**回复必须直接针对它**：
+- 不要把这段话复述、改写、翻译或概括后再作答（比如对方说「今天天气怎么样」，
+  不要回「今天天气怎么样呀」，而要真的回答天气或说明自己看不到实时天气）。
+- 不要因为前面有大量规则、设定或素材清单，就把注意力放在那些内容上；它们只是
+  风格约束，本轮要回应的只有上面这一节。
+- 对方提了具体请求（写诗、写文案、解释、推荐、算数等）就当场把成品交出来，
+  不要只回「好的，我来帮你」「我会尽力」这类空承诺 —— 那是没做事。
+  下面「reply 简短自然」的长度要求**不适用于这类成品**，成品该多长就多长，
+  需要分行就分行。写诗就直接把诗句写在 reply 里（例如「好的喵，给你写一首：
+  \\n山高月小，水落石出。\\n清风徐来，水波不兴。」），不要宣布「我要写」，
+  也不要事后再说「你看这样行不行」。
 
 请以JSON格式回复，不要加任何多余内容：
 {{"score_delta": 数字, "reply": "回复内容", "impression": "一句话描述对该用户的印象", "user_facts": ["用户提到的个人信息1", "用户提到的个人信息2"]}}
@@ -1644,6 +1871,8 @@ user_facts：如果用户在这条{_channel_name}中透露了个人信息（喜�
 
 score_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。
 reply简短自然，一般15-40字，像B站真人回复，不要写得像作文。
+（例外：上面「需要你回应的内容」里如果对方点名要一件成品 —— 写诗、写文案、
+解释一段概念、推荐并列出清单等 —— 则不受这个字数限制，先把成品写出来。）
 impression简短描述用户性格/说话风格，如"友善健谈，喜欢聊游戏"。"""
 
     text, in_tok, out_tok = claude_chat(prompt, max_tokens=get_max_tokens("reply"))
