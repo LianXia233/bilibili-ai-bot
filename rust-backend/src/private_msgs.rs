@@ -26,6 +26,10 @@ const ADULT_DOMAIN_MARKERS: [&str; 10] = [
     "porn", "sex", "xxx", "hentai", "jav", "xvideo", "onlyfans", "91porn", "麻豆", "av",
 ];
 
+/// 私信消息去重表保留上限（2026-09-15 从 1000 提升：多会话滚动时旧 key 会被挤出窗口，
+/// 导致旧消息被当新消息重发；3000 与 Python PROCESSED_KEYS_LIMIT 对齐）。
+const PROCESSED_KEYS_LIMIT: usize = 3000;
+
 #[derive(Debug, Clone, Default)]
 pub struct SafetyDecision {
     pub should_block: bool,
@@ -455,8 +459,6 @@ impl PrivateMessageClient {
             };
             let messages = payload.get("messages").and_then(|v| v.as_array()).cloned().unwrap_or_default();
             let payload_max = payload.get("max_seqno").and_then(|v| v.as_i64()).unwrap_or(remote_max.max(last_seqno));
-            let mut examined_max = last_seqno;
-            let mut reached_limit = false;
 
             for message in messages.iter().rev() {
                 // msg_key / msg_seqno 可能是字符串或数字（B站私信 payload 为数字）
@@ -479,9 +481,6 @@ impl PrivateMessageClient {
                 let mut timestamp = message.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(now);
                 if timestamp > 10_000_000_000 {
                     timestamp /= 1000;
-                }
-                if msg_seqno != 0 {
-                    examined_max = examined_max.max(msg_seqno);
                 }
                 let skip = msg_key.is_empty()
                     || processed_set.contains(&msg_key)
@@ -515,24 +514,22 @@ impl PrivateMessageClient {
                 processed.push(msg_key.clone());
                 processed_set.insert(msg_key);
                 if (new_messages.len() as i64) >= message_limit {
-                    reached_limit = true;
                     break;
                 }
             }
 
-            let observed_max = if reached_limit {
-                examined_max
-            } else {
-                let max_seq = messages.iter().filter_map(|m| m.get("msg_seqno").and_then(|v| v.as_i64())).fold(0i64, i64::max);
-                last_seqno.max(remote_max).max(payload_max).max(max_seq)
-            };
+            // 游标无分支推进到远端最大值（与 Python 2026-09-15 修复对齐）：
+            // 不再区分 reached_limit，一律推进，避免「最后取出的那一条」卡住后续消费；
+            // max(last_seqno) 保证单调递增，远端 max_seqno 回退时不会重开已消费区间。
+            let max_seq = messages.iter().filter_map(|m| m.get("msg_seqno").and_then(|v| v.as_i64())).fold(0i64, i64::max);
+            let observed_max = last_seqno.max(remote_max).max(payload_max).max(max_seq);
             if let Some(obj) = session_state.as_object_mut() {
                 obj.insert(key, json!(observed_max));
             }
         }
 
-        if processed.len() > 1000 {
-            processed.drain(..processed.len() - 1000);
+        if processed.len() > PROCESSED_KEYS_LIMIT {
+            processed.drain(..processed.len() - PROCESSED_KEYS_LIMIT);
         }
         state["sessions"] = session_state;
         state["processed_keys"] = json!(processed);

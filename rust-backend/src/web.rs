@@ -247,14 +247,57 @@ async fn api_branding(State(ctx): State<Arc<WebCtx>>) -> Response {
 }
 
 // ---------- 配置 ----------
+/// 配置脱敏版（与 Python get_config 对齐）：密钥类顶层键留首尾 + 模型池逐条脱敏。
+fn sanitize_config(cfg: &Config) -> Value {
+    let mut safe = serde_json::Map::new();
+    if let Some(obj) = cfg.raw.as_object() {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                if (k.contains("KEY") || k.contains("TOKEN") || k.contains("SESSDATA") || k.contains("JCT"))
+                    && s.chars().count() > 10
+                {
+                    let head: String = s.chars().take(6).collect();
+                    let tail: String = s.chars().rev().take(4).collect::<String>().chars().rev().collect();
+                    safe.insert(k.clone(), json!(format!("{head}***{tail}")));
+                    continue;
+                }
+            }
+            safe.insert(k.clone(), v.clone());
+        }
+    }
+    // 模型池逐条脱敏（池是列表，顶层字符串键脱敏规则覆盖不到）
+    if let Some(arr) = safe.get("CHAT_MODEL_POOL").cloned() {
+        if let Some(pool_arr) = arr.as_array() {
+            let pooled: Vec<Value> = pool_arr
+                .iter()
+                .filter_map(|item| {
+                    let obj = item.as_object()?;
+                    let key = obj.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                    let mut it = obj.clone();
+                    it.insert("key".to_string(), json!(crate::config::mask_pool_key(key)));
+                    it.insert("has_key".to_string(), json!(!key.is_empty()));
+                    Some(Value::Object(it))
+                })
+                .collect();
+            safe.insert("CHAT_MODEL_POOL".to_string(), json!(pooled));
+        }
+    }
+    Value::Object(safe)
+}
+
 async fn api_config(State(ctx): State<Arc<WebCtx>>) -> Response {
     let cfg = ctx.config.read().unwrap().clone();
-    Json(cfg.raw).into_response()
+    Json(sanitize_config(&cfg)).into_response()
 }
 
 async fn api_config_raw(State(ctx): State<Arc<WebCtx>>) -> Response {
     let cfg = ctx.config.read().unwrap().clone();
-    Json(cfg.raw).into_response()
+    let mut raw = cfg.raw.clone();
+    // 编辑回显接口不脱敏，但池有独立脱敏接口，这里直接摘掉，避免把 key 带出去
+    if let Some(obj) = raw.as_object_mut() {
+        obj.remove("CHAT_MODEL_POOL");
+    }
+    Json(raw).into_response()
 }
 
 async fn api_config_update(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
@@ -435,9 +478,19 @@ async fn api_memory_list(State(ctx): State<Arc<WebCtx>>) -> Response {
 }
 
 async fn api_memory_delete(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
-    let rpid = body.get("rpid").and_then(|v| v.as_str()).unwrap_or("");
+    // 前端 deleteMemory 发的是 id（Flask 契约）；旧版 Rust 面板可能发 rpid，两者都兼容
+    let target_id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| body.get("rpid").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if target_id.is_empty() {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "缺少id"}));
+    }
     let mut memory = ctx.memory.load();
-    memory.retain(|m| m.rpid != rpid);
+    memory.retain(|m| m.rpid != target_id);
     let _ = ctx.memory.save(&memory);
     Json(json!({"ok": true})).into_response()
 }
@@ -1117,6 +1170,313 @@ async fn api_permanent_delete(State(ctx): State<Arc<WebCtx>>, Json(body): Json<V
     Json(json!({"ok": true})).into_response()
 }
 
+// ---------- 永久记忆：一键清空 / 改写 / 整体导入 ----------
+async fn api_permanent_clear(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+    if body.get("confirm").and_then(|c| c.as_bool()) != Some(true) {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "需要确认参数 confirm=true"}));
+    }
+    crate::memory::backup_data_file(&ctx.permanent.file, "clear");
+    let cleared = ctx.permanent.clear();
+    Json(json!({"ok": true, "msg": format!("已清空 {cleared} 条永久记忆"), "cleared": cleared})).into_response()
+}
+
+async fn api_permanent_update(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+    let index = body.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if text.trim().is_empty() {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "内容为空"}));
+    }
+    if !ctx.permanent.update(index as usize, text) {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "索引越界"}));
+    }
+    Json(json!({"ok": true})).into_response()
+}
+
+async fn api_permanent_import(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+    let items = match body.get("items") {
+        Some(Value::Array(a)) => a.clone(),
+        _ => return json_resp(StatusCode::BAD_REQUEST, json!({"error": "items 必须是数组"})),
+    };
+    crate::memory::backup_data_file(&ctx.permanent.file, "import");
+    match ctx.permanent.import(items) {
+        Ok(before) => {
+            let after = ctx.permanent.load().len();
+            Json(json!({"ok": true, "msg": format!("已用 {after} 条替换原有 {before} 条"), "before": before, "after": after})).into_response()
+        }
+        Err(e) => json_resp(StatusCode::BAD_REQUEST, json!({"error": e})),
+    }
+}
+
+// ---------- 对话模型池（多套 API/模型，WebUI 一键切换） ----------
+fn is_masked(k: &str) -> bool {
+    k.contains("***")
+}
+
+async fn api_models_pool_list(State(ctx): State<Arc<WebCtx>>) -> Response {
+    let cfg = ctx.config.read().unwrap().clone();
+    let pool = cfg.chat_pool_masked();
+    let mut active = cfg.get_i64("CHAT_MODEL_ACTIVE");
+    if active >= pool.len() as i64 {
+        active = -1;
+    }
+    Json(json!({"items": pool, "active": active, "limit": crate::config::MODEL_POOL_MAX})).into_response()
+}
+
+async fn api_models_pool_save(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+    let items = match body.get("items") {
+        Some(Value::Array(a)) => a.clone(),
+        _ => return json_resp(StatusCode::BAD_REQUEST, json!({"error": "items 必须是数组"})),
+    };
+    if items.len() > crate::config::MODEL_POOL_MAX {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": format!("最多 {} 条", crate::config::MODEL_POOL_MAX)}));
+    }
+    let cfg = ctx.config.read().unwrap().clone();
+    let old = cfg.chat_pool();
+    let mut cleaned: Vec<Value> = Vec::new();
+    for (i, raw_item) in items.iter().enumerate() {
+        let Some(obj) = raw_item.as_object() else { continue };
+        let g = |k: &str| obj.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut name = g("name").trim().to_string();
+        let url = g("url").trim().to_string();
+        let mut key = g("key").trim().to_string();
+        let model = g("model").trim().to_string();
+        let fallback = g("fallback").trim().to_string();
+        // 前端回填的是掩码，此时沿用旧值，避免把真 key 写成 ***
+        if is_masked(&key) && i < old.len() {
+            key = old[i].key.clone();
+        }
+        if name.is_empty() && model.is_empty() && url.is_empty() && key.is_empty() {
+            continue; // 整条空行直接丢掉，不占池位
+        }
+        if name.is_empty() {
+            name = format!("配置 {}", cleaned.len() + 1);
+        }
+        cleaned.push(json!({"name": name, "url": url, "key": key, "model": model, "fallback": fallback}));
+    }
+    let mut active = body.get("active").and_then(|v| v.as_i64()).unwrap_or_else(|| cfg.get_i64("CHAT_MODEL_ACTIVE"));
+    if active >= cleaned.len() as i64 {
+        active = -1;
+    }
+    let _ = crate::config::update_config(&ctx.config, &json!({"CHAT_MODEL_POOL": cleaned, "CHAT_MODEL_ACTIVE": active}));
+    Json(json!({"ok": true, "count": cleaned.len(), "active": active})).into_response()
+}
+
+async fn api_models_pool_activate(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+    let idx = body.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let cfg = ctx.config.read().unwrap().clone();
+    let pool = cfg.chat_pool();
+    if idx >= pool.len() as i64 {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": format!("下标越界（池中共 {} 条）", pool.len())}));
+    }
+    let _ = crate::config::update_config(&ctx.config, &json!({"CHAT_MODEL_ACTIVE": idx}));
+    if idx < 0 {
+        return Json(json!({"ok": true, "active": -1, "msg": "已停用模型池，回落到单套配置"})).into_response();
+    }
+    let item = &pool[idx as usize];
+    Json(json!({
+        "ok": true, "active": idx, "name": item.name, "model": item.model,
+        "msg": format!("已切换到「{}」{}", item.name, if item.model.is_empty() { String::new() } else { format!("（{}）", item.model) })
+    })).into_response()
+}
+
+async fn api_models_pool_delete(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+    let idx = body.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let cfg = ctx.config.read().unwrap().clone();
+    let mut pool: Vec<Value> = cfg.get("CHAT_MODEL_POOL").as_array().cloned().unwrap_or_default();
+    if idx < 0 || idx >= pool.len() as i64 {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "下标越界"}));
+    }
+    pool.remove(idx as usize);
+    let mut active = cfg.get_i64("CHAT_MODEL_ACTIVE");
+    if active == idx {
+        active = -1; // 删的是激活项，回落到单套配置
+    } else if active > idx {
+        active -= 1;
+    }
+    let _ = crate::config::update_config(&ctx.config, &json!({"CHAT_MODEL_POOL": pool, "CHAT_MODEL_ACTIVE": active}));
+    Json(json!({"ok": true, "active": active})).into_response()
+}
+
+// ---------- 记忆一键清空 / 规模概览 ----------
+/// 记忆类文件清单（与 Python local-chat.py catalog 对齐）。
+fn memory_catalog(base_dir: &str) -> Vec<(&'static str, PathBuf, Value, &'static str)> {
+    vec![
+        ("permanent", crate::util::data_path(base_dir, "permanent_memory.json"), json!([]), "永久记忆（人格规则）"),
+        ("dialog", crate::util::data_path(base_dir, "memory.json"), json!([]), "对话记忆（含压缩摘要）"),
+        ("profile", crate::util::data_path(base_dir, "user_profiles.json"), json!({}), "用户档案（印象/标签/已知信息）"),
+        ("affection", crate::util::data_path(base_dir, "affection.json"), json!({}), "好感度"),
+        ("video", crate::util::data_path(base_dir, "video_memory.json"), json!({}), "视频分析缓存"),
+        ("personality", crate::util::data_path(base_dir, "personality_evolution.json"), json!({}), "性格演化记录"),
+        ("mood", crate::util::data_path(base_dir, "mood.json"), json!({}), "当日心情"),
+    ]
+}
+
+fn value_len(v: &Value) -> i64 {
+    v.as_array().map(|a| a.len() as i64).or_else(|| v.as_object().map(|o| o.len() as i64)).unwrap_or(0)
+}
+
+async fn api_memory_clear_all(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+    if body.get("confirm").and_then(|c| c.as_bool()) != Some(true) {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "需要确认参数 confirm=true"}));
+    }
+    let targets: Option<Vec<String>> = body
+        .get("targets")
+        .and_then(|t| t.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect());
+    let catalog = memory_catalog(&ctx.base_dir);
+    let mut cleared: Vec<Value> = Vec::new();
+    for (name, path, empty, label) in catalog {
+        if let Some(t) = &targets {
+            if !t.iter().any(|x| x == name) {
+                continue;
+            }
+        }
+        let before: Value = load_json(&path, empty.clone());
+        let count = value_len(&before);
+        crate::memory::backup_data_file(&path, &format!("clearall-{name}"));
+        let _ = save_json(&path, &empty);
+        cleared.push(json!({"target": name, "label": label, "removed": count}));
+    }
+    let msg = cleared.iter().map(|c| {
+        format!("{} {} 条", c.get("label").and_then(|l| l.as_str()).unwrap_or(""), c.get("removed").and_then(|r| r.as_i64()).unwrap_or(0))
+    }).collect::<Vec<_>>().join("；");
+    Json(json!({"ok": true, "msg": if msg.is_empty() { "无可清空项".to_string() } else { msg }, "cleared": cleared})).into_response()
+}
+
+async fn api_memory_stats(State(ctx): State<Arc<WebCtx>>) -> Response {
+    let catalog = memory_catalog(&ctx.base_dir);
+    let mut counts = serde_json::Map::new();
+    for (name, path, empty, _) in &catalog {
+        let v: Value = load_json(path, empty.clone());
+        counts.insert(name.to_string(), json!(value_len(&v)));
+    }
+    let total: i64 = counts.values().filter_map(|v| v.as_i64()).sum();
+    Json(json!({"counts": Value::Object(counts), "permanent_limit": crate::memory::PERMANENT_MEMORY_LIMIT, "total": total})).into_response()
+}
+
+// ---------- 临时记忆：明细 / 一键清空 / 定时配置 / 执行状态 ----------
+async fn api_memory_temp_list(State(ctx): State<Arc<WebCtx>>) -> Response {
+    let mut groups = serde_json::Map::new();
+    for (key, path, label) in crate::memory::temp_memory_files(&ctx.base_dir) {
+        let data: Value = load_json(&path, json!([]));
+        if let Some(arr) = data.as_array() {
+            let mut items: Vec<Value> = arr
+                .iter()
+                .filter(|m| m.is_object())
+                .map(|m| {
+                    json!({
+                        "id": m.get("rpid").and_then(|v| v.as_str()).unwrap_or(""),
+                        "user_id": m.get("user_id").and_then(|v| v.as_str()).unwrap_or(""),
+                        "time": m.get("time").and_then(|v| v.as_str()).unwrap_or(""),
+                        "text": m.get("text").and_then(|v| v.as_str()).unwrap_or(""),
+                        "compressed": m.get("thread_id").and_then(|v| v.as_str()) == Some("compressed"),
+                    })
+                })
+                .collect();
+            items.sort_by(|a, b| b.get("time").and_then(|t| t.as_str()).unwrap_or("").cmp(a.get("time").and_then(|t| t.as_str()).unwrap_or("")));
+            groups.insert(key.to_string(), json!({"label": label, "kind": "list", "count": items.len(), "items": items}));
+        } else if let Some(obj) = data.as_object() {
+            let mut entries: Vec<Value> = obj
+                .iter()
+                .filter(|(_, p)| p.is_object())
+                .map(|(uid, prof)| {
+                    json!({
+                        "uid": uid,
+                        "name": prof.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        "impression": prof.get("impression").and_then(|v| v.as_str()).unwrap_or(""),
+                        "tags": prof.get("tags").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+                        "facts": prof.get("user_facts").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+                        "interactions": prof.get("interaction_count").and_then(|v| v.as_i64()).unwrap_or(0),
+                        "updated": prof.get("last_update").and_then(|v| v.as_str()).unwrap_or(prof.get("updated").and_then(|v| v.as_str()).unwrap_or("")),
+                    })
+                })
+                .collect();
+            entries.sort_by(|a, b| b.get("updated").and_then(|t| t.as_str()).unwrap_or("").cmp(a.get("updated").and_then(|t| t.as_str()).unwrap_or("")));
+            groups.insert(key.to_string(), json!({"label": label, "kind": "profile", "count": entries.len(), "items": entries}));
+        }
+    }
+    Json(json!({"groups": Value::Object(groups)})).into_response()
+}
+
+async fn api_memory_temp_clear(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+    if body.get("confirm").and_then(|c| c.as_bool()) != Some(true) {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "需要确认参数 confirm=true"}));
+    }
+    let keep_days = body.get("keep_days").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    let (ok, msg, cleared) = crate::memory::clear_temp_memory(&ctx.base_dir, keep_days, "panelclear");
+    if !ok {
+        return Json(json!({"ok": true, "msg": "暂时没有可清空的临时记忆", "cleared": []})).into_response();
+    }
+    Json(json!({"ok": true, "msg": msg, "cleared": cleared})).into_response()
+}
+
+async fn api_memory_temp_config_get(State(ctx): State<Arc<WebCtx>>) -> Response {
+    let cfg = ctx.config.read().unwrap().clone();
+    let plan = cfg.temp_clear_plan();
+    Json(json!({
+        "enabled": plan.enabled,
+        "hour": plan.hour,
+        "minute": plan.minute,
+        "keep_days": plan.keep_days,
+        "time_str": format!("{:02}:{:02}", plan.hour, plan.minute),
+        "next_run": plan.next_run,
+    })).into_response()
+}
+
+async fn api_memory_temp_config_post(State(ctx): State<Arc<WebCtx>>, Json(data): Json<Value>) -> Response {
+    let mut updates = serde_json::Map::new();
+    if let Some(v) = data.get("enabled") {
+        updates.insert("TEMP_MEMORY_AUTO_CLEAR".into(), json!(v.as_bool().unwrap_or(false)));
+    }
+    if let Some(v) = data.get("hour") {
+        let h = v.as_i64().unwrap_or(-1);
+        if !(0..=23).contains(&h) {
+            return json_resp(StatusCode::BAD_REQUEST, json!({"error": "hour 必须是 0-23 的整数"}));
+        }
+        updates.insert("TEMP_MEMORY_CLEAR_HOUR".into(), json!(h));
+    }
+    if let Some(v) = data.get("minute") {
+        let m = v.as_i64().unwrap_or(-1);
+        if !(0..=59).contains(&m) {
+            return json_resp(StatusCode::BAD_REQUEST, json!({"error": "minute 必须是 0-59 的整数"}));
+        }
+        updates.insert("TEMP_MEMORY_CLEAR_MINUTE".into(), json!(m));
+    }
+    if let Some(v) = data.get("keep_days") {
+        let k = v.as_i64().unwrap_or(-1);
+        if k < 0 {
+            return json_resp(StatusCode::BAD_REQUEST, json!({"error": "keep_days 必须是非负整数"}));
+        }
+        updates.insert("TEMP_MEMORY_KEEP_DAYS".into(), json!(k));
+    }
+    if updates.is_empty() {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "没有可保存的字段"}));
+    }
+    let _ = crate::config::update_config(&ctx.config, &Value::Object(updates));
+    let cfg = ctx.config.read().unwrap().clone();
+    let plan = cfg.temp_clear_plan();
+    let mut msg = if plan.enabled {
+        format!("已保存：每天 {:02}:{:02} 自动清空临时记忆", plan.hour, plan.minute)
+    } else {
+        "已关闭定时清空".to_string()
+    };
+    if plan.enabled && plan.keep_days > 0 {
+        msg += &format!("，保留最近 {} 天", plan.keep_days);
+    }
+    Json(json!({"ok": true, "msg": msg, "plan": {"enabled": plan.enabled, "hour": plan.hour, "minute": plan.minute, "keep_days": plan.keep_days, "time_str": format!("{:02}:{:02}", plan.hour, plan.minute)}})).into_response()
+}
+
+async fn api_memory_temp_status(State(ctx): State<Arc<WebCtx>>) -> Response {
+    let state: Value = load_json(&ctx.path("temp_clear_state.json"), json!({}));
+    let cfg = ctx.config.read().unwrap().clone();
+    let plan = cfg.temp_clear_plan();
+    Json(json!({
+        "last_clear": state.get("last_clear").and_then(|v| v.as_str()).unwrap_or(""),
+        "last_msg": state.get("last_msg").and_then(|v| v.as_str()).unwrap_or(""),
+        "plan": {"enabled": plan.enabled, "hour": plan.hour, "minute": plan.minute, "keep_days": plan.keep_days, "time_str": format!("{:02}:{:02}", plan.hour, plan.minute), "next_run": plan.next_run},
+    })).into_response()
+}
+
 // ---------- 摘要 ----------
 async fn api_summary(State(ctx): State<Arc<WebCtx>>) -> Response {
     let summary: Value = load_json(&ctx.path("summary.json"), json!({}));
@@ -1329,6 +1689,19 @@ pub fn build_router(ctx: Arc<WebCtx>) -> Router {
         .route("/api/permanent/list", get(api_permanent_list))
         .route("/api/permanent/add", post(api_permanent_add))
         .route("/api/permanent/delete", post(api_permanent_delete))
+        .route("/api/permanent/clear", post(api_permanent_clear))
+        .route("/api/permanent/update", post(api_permanent_update))
+        .route("/api/permanent/import", post(api_permanent_import))
+        .route("/api/models/pool/list", get(api_models_pool_list))
+        .route("/api/models/pool/save", post(api_models_pool_save))
+        .route("/api/models/pool/activate", post(api_models_pool_activate))
+        .route("/api/models/pool/delete", post(api_models_pool_delete))
+        .route("/api/memory/clear_all", post(api_memory_clear_all))
+        .route("/api/memory/stats", get(api_memory_stats))
+        .route("/api/memory/temp/list", get(api_memory_temp_list))
+        .route("/api/memory/temp/clear", post(api_memory_temp_clear))
+        .route("/api/memory/temp/config", get(api_memory_temp_config_get).post(api_memory_temp_config_post))
+        .route("/api/memory/temp/status", get(api_memory_temp_status))
         .route("/api/summary", get(api_summary))
         .route("/api/summary/save", post(api_summary_save))
         .route("/api/personas", get(api_personas))

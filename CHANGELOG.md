@@ -59,6 +59,7 @@
 | 2026-09-16 | `fix(bot)` | 动态自定义文案键名错位：面板 `PROMPT_DYNAMIC` 配置不生效 | 故障修复 |
 | 2026-09-16 | `fix(bot)` | 私信 `sender_uid` 为数字时解析为空，存在「对自己消息自我回复」风险 | 故障修复 |
 | 2026-09-16 | `security(panel)` | 面板加固：Cookie 加 SameSite、签名常量时间比较、默认口令启动告警、上传限流、子进程超时 | 安全加固 |
+| 2026-09-16 | `feat(rust-backend)` | 2026-09-15 更新全量移植到 Rust 版：永久记忆分层装填 / 成品条款 / 记忆双页签+定时清空 / 对话模型池 / 记忆一键清空 / 私信复读修复 等 9 项 | 功能移植 |
 
 ### fix(rust-backend) — rust-backend 全量代码审计与修复（8 项）
 
@@ -83,6 +84,33 @@
 - 行为对齐：图片消息构造、动态文案键名、私信 `sender_uid` 解析均与 Python 参考实现逐点核对
 
 **已知边界**（未改动，保持与 Python 一致）：默认口令 `admin()` 为上游设计，已加启动告警，公网部署仍需配置 `CHAT_PASSWORD`。
+
+### feat(rust-backend) — 2026-09-15 更新全量移植（9 项）
+
+将 2026-09-15 的 10 项更新（+1 项同日休眠/TPM）全部移植到 `rust-backend`（Rust 重构版）。此前 Rust 侧版本落后：永久记忆完全没注入提示词、模型池/记忆清空/定时清空等面板 API 缺失、私信去重表与游标存在复读隐患。实现逐项对照 Python 参考（`ai.py` / `config.py` / `local-chat.py`，与生产实机部署目录同源核验一致），编译 / 冒烟 / API 契约均验证通过。
+
+| # | 类型 | 对应 09-15 条目 | Rust 侧缺口 | 修复 |
+|---|------|----------------|-------------|------|
+| 1 | `fix(bot)` | 串台 | 永久记忆完全没有注入提示词（`bot.rs` 只有 personality_evo，无 permanent block）；JSON schema 仍带 `permanent_memory` 字段 | 实现 `build_permanent_block`：tier 0（身份/人格/说话风格）与 tier 1（禁止/安全）无条件全量、tier 2（状态）与 tier 3（表情包）受 `PERMANENT_MEMORY_INJECT` 预算、组内新的先保、输出恢复原始顺序；`_summarize_emoji_pool` 语义对齐（样例 6 条 + 总数 + 硬约束 + `EMOJI_POOL_MARKERS`）；边界段「需要你回应的内容（本节唯一）」+ 三条硬约束挂入 `bot.rs` 提示词 |
+| 2 | `fix(bot)` | 复读/空承诺 | 成品条款缺失 | 提示词补入成品条款：具体请求当场交付成品、不受 15-40 字限制、写诗示范含 `\n` 转义 |
+| 3 | `feat(panel)` | 记忆双页签 + 定时清空 | `TEMP_MEMORY_*` 配置、`clear_temp_memory` 完全缺失 | 新增 `TempClearPlan`（开关/时刻/保留天数/next_run）；`clear_temp_memory`（备份 `.bak-{tag}-{时间戳}`、keep_days 裁剪、无 time 字段保留）；`maybe_clear_temp_memory` 挂主循环休眠判断之前（日期去重、一天一次、返回重绑 memory 防旧条目写回）；面板 4 API：`temp/list`、`temp/clear`、`temp/config`、`temp/status` |
+| 4 | `feat(ui)` | 模型池折叠列表 | 后端 4 API 缺失 | `models/pool/list`（脱敏 key+has_key）、`save`（空行丢弃、掩码回填旧 key、越界回落）、`activate`（未保存改动前端先落盘）、`delete`（激活项删除回落单套配置） |
+| 5 | `feat(panel)` | 对话模型池 | `CHAT_MODEL_POOL` / `CHAT_MODEL_ACTIVE` 缺失，`get_active_chat_model` 缺失 | 实现池解析（默认键+逐条覆盖 `OR_CHAT_*`）、`get_active_chat_model`（每次读盘、越界回落、条目全空回落 None）；`/api/config` 脱敏对齐（顶层 KEY/TOKEN/SESSDATA/JCT 留 6+4、池逐条脱敏）、`/api/config/raw` 摘掉 `CHAT_MODEL_POOL` |
+| 6 | `feat(panel)` | 记忆一键清空 | `permanent/clear`、`permanent/import`、`permanent/update`、`memory/clear_all`、`memory/stats` 缺失 | 全部补齐：clear_all 按 7 类文件 catalog 点单清空+自动备份、stats 返回 counts/limit/total；permanent 三 API 与 Python 契约一致 |
+| 7 | `feat(bot)` | 永久记忆纯人工写入 | schema 字段+自动写入点仍在 | 删除 schema 的 `permanent_memory` 字段与 `bot.rs` 自动写入点，永久记忆只来自面板 |
+| 8 | `fix(bot)` | 永久记忆不起作用 | 上限 20 与注入上限同为 20 | `PERMANENT_MEMORY_LIMIT` 20→40、新增 `PERMANENT_MEMORY_INJECT=40`、写入去重（原有去重保留） |
+| 9 | `fix(bot)` | 私信复读 | 去重表上限 1000（多会话滚动挤出旧 key）；`reached_limit` 分支使游标停在「最后取出的那一条」 | 去重表上限 1000→3000（`PROCESSED_KEYS_LIMIT`）；游标改为无分支推进 `last_seqno.max(remote_max).max(payload_max).max(max_seq)`，`max(last_seqno)` 保证单调递增、远端回退不重开已消费区间 |
+
+**已覆盖项（无需移植，判定为天然安全/已有）**
+
+- `fix(bot)` 语义记忆 KeyError：Rust 侧 `MemoryDoc` 全部 `#[serde(default)]`，`cosine_similarity` 对空向量返回 0，不会抛 KeyError。
+- `feat(bot)` 休眠总开关 + TPM 限流：Rust 侧 `ENABLE_SLEEP`（默认 false）与 `RATE_LIMIT_*_TPM` 已存在，与 09-15 语义一致。
+
+**校验结果**
+
+- `cargo check` / `cargo build`：通过，零 error 零 warning
+- 冒烟测试（`--no-bot --port 5999` + 临时 base dir）：`/api/health` 200、未授权 401、登录后全部新 API 逐一验证——`pool/list`（脱敏 key `sk-a***klmn` + has_key）、`pool/save/activate/delete`、`config` 脱敏（`BILI_JCT` 留 6+4）、`config/raw` 无池、`memory/stats`（7 类 counts + limit 40）、`memory/temp/config`（POST 保存开关/时刻/保留天数）、`temp/status`（含 next_run）、`permanent/add/update/clear`、`memory/delete`（兼容 `id`/`rpid`）、`clear_all`/`temp/clear` 的 `confirm` 校验 400
+- 前端 `chat.html` 无需改动：双页签、模型池折叠、永久记忆编辑/导入/清空 UI 均已具备，与新增后端 API 契约逐点吻合
 
 ### fix(bot) — 评论与私信「串台」：永久记忆膨胀把用户那句话淹掉
 

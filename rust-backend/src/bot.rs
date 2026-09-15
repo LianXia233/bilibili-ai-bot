@@ -6,7 +6,7 @@ use crate::bili_login::BiliQrLoginManager;
 use crate::config::Config;
 use crate::error::Result;
 use crate::llm::{log_cost, needs_search, truncate, LlmClient};
-use crate::memory::{MemoryStore, PermanentMemory};
+use crate::memory::{MemoryDoc, MemoryStore, PermanentMemory};
 use crate::personality::{Personality, PersonaStore};
 use crate::private_msgs::{assess_private_message, is_protected_sender, reply_scope_allows, PrivateMessageClient};
 use crate::util::{load_json, now_str, now_unix, save_json};
@@ -139,6 +139,57 @@ impl Bot {
         let _ = save_json(&self.path("schedule_today.json"), &v);
     }
 
+    /// 按面板配置每天定点清空临时记忆（对齐 Python maybe_clear_temp_memory）。
+    ///
+    /// 挂在休眠判断之前：休眠窗内也要执行清空；日期去重而非时刻相等，
+    /// 一天最多执行一次；进程在目标时刻之后启动会补跑一次。
+    /// 返回清空后重新读盘的内存态；未执行时原样返回。
+    fn maybe_clear_temp_memory(&self, memory: Vec<MemoryDoc>) -> Vec<MemoryDoc> {
+        let cfg = self.config.read().unwrap().clone();
+        let plan = cfg.temp_clear_plan();
+        if !plan.enabled {
+            return memory;
+        }
+        let today = crate::util::today_str();
+        let state: Value = load_json(&self.path("temp_clear_state.json"), json!({}));
+        if state
+            .get("last_clear")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .starts_with(&today)
+        {
+            return memory; // 今天已清过
+        }
+        let now = chrono::Local::now();
+        let target_minutes = plan.hour * 60 + plan.minute;
+        let now_minutes = now.hour() as i64 * 60 + now.minute() as i64;
+        if now_minutes < target_minutes {
+            return memory; // 还没到点
+        }
+        tracing::info!(
+            "到达临时记忆清空时刻（{}:{:02}）{}",
+            plan.hour,
+            plan.minute,
+            if plan.keep_days > 0 { format!("，保留最近 {} 天", plan.keep_days) } else { String::new() }
+        );
+        let (ok, msg, _cleared) = crate::memory::clear_temp_memory(&self.base_dir, plan.keep_days, "autoclear");
+        let _ = save_json(
+            &self.path("temp_clear_state.json"),
+            &json!({
+                "last_clear": crate::util::now_str(),
+                "last_msg": msg,
+                "keep_days": plan.keep_days,
+            }),
+        );
+        if ok {
+            tracing::info!("临时记忆清空完成：{msg}");
+        } else {
+            tracing::info!("临时记忆清空：{msg}");
+        }
+        // 同步进程内存态：只改文件不同步的话，后续 save 会把旧条目连同新条目写回文件
+        self.memory.load()
+    }
+
     pub fn is_active_time(&self) -> bool {
         let cfg = self.config.read().unwrap().clone();
         if !cfg.get_bool("ENABLE_SLEEP") {
@@ -239,6 +290,9 @@ impl Bot {
             // 每日性格演化
             let recent_texts: Vec<String> = memory.iter().rev().take(15).map(|m| m.text.clone()).collect();
             self.personality.maybe_evolve_personality(&recent_texts).await;
+
+            // 临时记忆定时清空（挂在休眠判断之前：休眠窗内也要执行）
+            memory = self.maybe_clear_temp_memory(memory);
 
             if !self.is_active_time() {
                 tracing::info!("当前不在工作时间（休眠中）...");
@@ -381,9 +435,6 @@ impl Bot {
                             None,
                         )
                         .ok();
-                }
-                if !result.permanent_memory.is_empty() {
-                    self.permanent.add(&result.permanent_memory);
                 }
 
                 tracing::info!(
@@ -737,6 +788,14 @@ impl Bot {
             persona_prompt
         };
         let persona_evo = self.personality.get_personality_prompt();
+        // 永久记忆：人工维护的最高优先级规则，分层注入（tier 0/1 全量 + 表情包池摘要），
+        // 与 Python build_permanent_block 对齐；prompt 中永久记忆为纯人工写入，模型不再产出。
+        let permanent_block = crate::memory::build_permanent_block(&cfg, &self.permanent.load());
+        let permanent_block = if permanent_block.is_empty() {
+            String::new()
+        } else {
+            format!("\n{permanent_block}")
+        };
         let bili_note = if !owner_bili.is_empty() {
             format!("\n{}的B站账号名是\"{owner_bili}\"，是同一个人。", cfg.get_str("OWNER_NAME").if_empty_or("主人"))
         } else {
@@ -756,7 +815,7 @@ impl Bot {
         };
 
         let prompt = format!(
-            "{persona_section}\n{persona_evo}\n\n{default_style}{bili_note}\n\n【底线】\n拒绝：表白暧昧、引战、黄赌毒政治。遇到恶意时平静坚定，可暗讽，不恶语。\n{level_prompt}{private_instruction}\n\n【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}\n\n当前时间：{now}{video_section}{memory_section}{search_section}{no_content_section}\n「{username}」的{channel_name}：「{comment_text}」\n\n请以JSON格式回复，不要加任何多余内容：\n{{\"score_delta\": 数字, \"reply\": \"回复内容\", \"impression\": \"一句话描述对该用户的印象\", \"user_facts\": [\"用户提到的个人信息1\", \"用户提到的个人信息2\"], \"permanent_memory\": \"值得永久记住的事(没有则留空)\"}}\n\nuser_facts：如果用户在这条{channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。\n\npermanent_memory：如果这次对话中你发现了值得长期记住的重要信息（如：某个用户的特殊身份、重大事件、你对某件事的感悟、粉丝群体的共同特征等），就写一句精炼的话。日常闲聊不需要记。大部分情况应该留空。\n\nscore_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。\nreply简短自然，一般15-40字，像B站真人回复，不要写得像作文。\nimpression简短描述用户性格/说话风格，如\"友善健谈，喜欢聊游戏\"。"
+            "{persona_section}\n{persona_evo}{permanent_block}\n\n{default_style}{bili_note}\n\n【底线】\n拒绝：表白暧昧、引战、黄赌毒政治。遇到恶意时平静坚定，可暗讽，不恶语。\n{level_prompt}{private_instruction}\n\n【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}\n\n当前时间：{now}{video_section}{memory_section}{search_section}{no_content_section}\n════════ 需要你回应的内容（本节唯一）════════\n{username} 的{channel_name}：\n{comment_text}\n════════════════════════════════════════════\n\n上面这一节是对方这次真正说的话，**回复必须直接针对它**：\n- 不要把这段话复述、改写、翻译或概括后再作答（比如对方说「今天天气怎么样」，不要回「今天天气怎么样呀」，而要真的回答天气或说明自己看不到实时天气）。\n- 不要因为前面有大量规则、设定或素材清单，就把注意力放在那些内容上；它们只是风格约束，本轮要回应的只有上面这一节。\n- 对方提了具体请求（写诗、写文案、解释、推荐、算数等）就当场把成品交出来，不要只回「好的，我来帮你」「我会尽力」这类空承诺 —— 那是没做事。下面「reply 简短自然」的长度要求**不适用于这类成品**，成品该多长就多长，需要分行就分行。写诗就直接把诗句写在 reply 里（例如「好的喵，给你写一首：\\n山高月小，水落石出。\\n清风徐来，水波不兴。」），不要宣布「我要写」，也不要事后再说「你看这样行不行」。\n\n请以JSON格式回复，不要加任何多余内容：\n{{\"score_delta\": 数字, \"reply\": \"回复内容\", \"impression\": \"一句话描述对该用户的印象\", \"user_facts\": [\"用户提到的个人信息1\", \"用户提到的个人信息2\"]}}\n\nuser_facts：如果用户在这条{channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。\n\nscore_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。\nreply简短自然，一般15-40字，像B站真人回复，不要写得像作文。\n（例外：上面「需要你回应的内容」里如果对方点名要一件成品 —— 写诗、写文案、解释一段概念、推荐并列出清单等 —— 则不受这个字数限制，先把成品写出来。）\nimpression简短描述用户性格/说话风格，如\"友善健谈，喜欢聊游戏\"。"
         );
 
         let max_tokens = cfg.max_tokens_of("reply");
@@ -772,7 +831,6 @@ impl Bot {
             score_delta: result.get("score_delta").and_then(|v| v.as_i64()).unwrap_or(1),
             reply: result.get("reply").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             impression: result.get("impression").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            permanent_memory: result.get("permanent_memory").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             user_facts: result.get("user_facts").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default(),
         })
     }
@@ -783,7 +841,6 @@ pub struct ReplyResult {
     pub score_delta: i64,
     pub reply: String,
     pub impression: String,
-    pub permanent_memory: String,
     pub user_facts: Vec<String>,
 }
 

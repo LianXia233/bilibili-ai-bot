@@ -124,6 +124,17 @@ pub fn defaults() -> HashMap<&'static str, Value> {
     set("RATE_LIMIT_SEARCH_TPM", json!(1000000));
     set("RATE_LIMIT_VISION_TPM", json!(0));
     set("RATE_LIMIT_IMAGE_TPM", json!(0));
+    // 永久记忆
+    set("PERMANENT_MEMORY_CHAR_BUDGET", json!(2500));
+    set("PERMANENT_MEMORY_INJECT", json!(40));
+    // 对话模型池（可选覆盖 OR_CHAT_* 四键）
+    set("CHAT_MODEL_POOL", json!([]));
+    set("CHAT_MODEL_ACTIVE", json!(-1));
+    // 临时记忆定时清空
+    set("TEMP_MEMORY_AUTO_CLEAR", json!(false));
+    set("TEMP_MEMORY_CLEAR_HOUR", json!(4));
+    set("TEMP_MEMORY_CLEAR_MINUTE", json!(0));
+    set("TEMP_MEMORY_KEEP_DAYS", json!(0));
     // 面板
     set("CHAT_PASSWORD", json!(""));
     m
@@ -222,6 +233,20 @@ impl Config {
     // ---------- 模型场景解析 ----------
     /// 场景相关 base_url / api_key / model 与候选回退模型。
     pub fn model_of(&self, scene: &str) -> (String, String, Vec<String>) {
+        // chat 场景支持「对话模型池」：激活池条目时整体取代 OR_CHAT_* 四键
+        // （与 Python get_model_config 对齐：池条目留空字段回落全局默认）。
+        if scene == "chat" {
+            if let Some(item) = self.get_active_chat_model() {
+                let base_url = if item.url.is_empty() { self.get_str("OR_BASE_URL") } else { item.url.clone() };
+                let key = if item.key.is_empty() { self.get_str("OR_API_KEY") } else { item.key.clone() };
+                let mut candidates = vec![item.model.clone()];
+                if !item.fallback.is_empty() {
+                    candidates.push(item.fallback.clone());
+                }
+                candidates.retain(|m| !m.is_empty());
+                return (base_url, key, candidates);
+            }
+        }
         let (model_k, url_k, key_k, fb_k) = match scene {
             "chat" => ("OR_CHAT_MODEL", "OR_CHAT_URL", "OR_CHAT_KEY", "OR_CHAT_MODEL_FALLBACK"),
             "vision" => ("OR_VISION_MODEL", "OR_VISION_URL", "OR_VISION_KEY", "OR_VISION_MODEL_FALLBACK"),
@@ -276,6 +301,128 @@ impl Config {
             _ => "RATE_LIMIT_CHAT_TPM",
         };
         self.get_i64(key)
+    }
+
+    // ---------- 对话模型池 ----------
+    /// 读取对话模型池（原始结构，含 key，仅供后端使用）。
+    pub fn chat_pool(&self) -> Vec<PoolItem> {
+        let mut out = Vec::new();
+        if let Some(arr) = self.get("CHAT_MODEL_POOL").as_array() {
+            for item in arr {
+                if let Some(obj) = item.as_object() {
+                    let g = |k: &str| obj.get(k).unwrap_or(&Value::Null);
+                    out.push(PoolItem {
+                        name: v_str(g("name"), ""),
+                        url: v_str(g("url"), ""),
+                        key: v_str(g("key"), ""),
+                        model: v_str(g("model"), ""),
+                        fallback: v_str(g("fallback"), ""),
+                    });
+                }
+            }
+        }
+        out.truncate(MODEL_POOL_MAX);
+        out
+    }
+
+    /// 取当前激活的池条目；未激活、下标越界或条目全空时返回 None（与 Python 对齐）。
+    pub fn get_active_chat_model(&self) -> Option<PoolItem> {
+        let idx = self.get_i64("CHAT_MODEL_ACTIVE");
+        if idx < 0 {
+            return None;
+        }
+        let pool = self.chat_pool();
+        let item = pool.get(idx as usize)?.clone();
+        if item.model.is_empty() && item.url.is_empty() && item.key.is_empty() {
+            return None;
+        }
+        Some(item)
+    }
+
+    /// 池的脱敏版（喂给前端）：key 只留首尾各 4 位。
+    pub fn chat_pool_masked(&self) -> Vec<Value> {
+        self.chat_pool()
+            .iter()
+            .map(|item| {
+                let has_key = !item.key.is_empty();
+                let masked = mask_pool_key(&item.key);
+                json!({
+                    "name": item.name,
+                    "url": item.url,
+                    "key": masked,
+                    "model": item.model,
+                    "fallback": item.fallback,
+                    "has_key": has_key,
+                })
+            })
+            .collect()
+    }
+
+    /// 读取临时记忆定时清空计划（总开关 / 时刻 / 保留天数 / 下次执行）。
+    pub fn temp_clear_plan(&self) -> TempClearPlan {
+        let hour = self.get_i64("TEMP_MEMORY_CLEAR_HOUR").clamp(0, 23);
+        let minute = self.get_i64("TEMP_MEMORY_CLEAR_MINUTE").clamp(0, 59);
+        let enabled = self.get_bool("TEMP_MEMORY_AUTO_CLEAR");
+        // 下次执行：今天该时刻若已过，顺延到明天（与 Python get_temp_clear_plan 对齐）
+        let now = chrono::Local::now();
+        let today_at = now
+            .date_naive()
+            .and_hms_opt(hour as u32, minute as u32, 0)
+            .unwrap_or_else(|| now.date_naive().and_hms_opt(0, 0, 0).unwrap());
+        let nxt = if today_at > now.naive_local() {
+            today_at
+        } else {
+            today_at + chrono::Duration::days(1)
+        };
+        TempClearPlan {
+            enabled,
+            hour,
+            minute,
+            keep_days: self.get_i64("TEMP_MEMORY_KEEP_DAYS").max(0),
+            next_run: if enabled {
+                nxt.format("%Y-%m-%d %H:%M").to_string()
+            } else {
+                String::new()
+            },
+        }
+    }
+}
+
+/// 模型池单条配置。
+#[derive(Debug, Clone)]
+pub struct PoolItem {
+    pub name: String,
+    pub url: String,
+    pub key: String,
+    pub model: String,
+    pub fallback: String,
+}
+
+/// 临时记忆定时清空计划。
+#[derive(Debug, Clone)]
+pub struct TempClearPlan {
+    pub enabled: bool,
+    pub hour: i64,
+    pub minute: i64,
+    pub keep_days: i64,
+    pub next_run: String,
+}
+
+/// 对话模型池最大条数（与 Python MODEL_POOL_MAX 对齐）。
+pub const MODEL_POOL_MAX: usize = 20;
+
+/// 密钥脱敏：长度 >10 时留首尾各 4 位；否则整体掩码。字符安全切片。
+pub fn mask_pool_key(k: &str) -> String {
+    if k.is_empty() {
+        return String::new();
+    }
+    let len = k.chars().count();
+    if len > 10 {
+        let head: String = k.chars().take(4).collect();
+        let tail: String = k.chars().rev().take(4).collect::<String>().chars().rev().collect();
+        format!("{head}***{tail}")
+    } else {
+        "***".to_string()
     }
 }
 
