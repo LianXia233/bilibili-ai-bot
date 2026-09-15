@@ -271,7 +271,17 @@ async fn fav_video(bot: &Bot, aid: i64) -> bool {
     let cfg = bot.config.read().unwrap().clone();
     let url = "https://api.bilibili.com/x/v3/fav/folder/created/list-all";
     let params = [("up_mid", cfg.get_str("DEDE_USER_ID")), ("type", "2".to_string())];
-    let resp = match bot.bili.http.get(url).query(&params).send().await {
+    let resp = match bot
+        .bili
+        .http
+        .get(url)
+        .query(&params)
+        .header("User-Agent", crate::bili_api::UA)
+        .header("Referer", "https://www.bilibili.com/")
+        .header("Cookie", bot.bili.cookie_header())
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(_) => return false,
     };
@@ -304,6 +314,9 @@ async fn post_form(bot: &Bot, url: &str, extra: &[(&str, String)]) -> bool {
     headers.insert("User-Agent", reqwest::header::HeaderValue::from_static(crate::bili_api::UA));
     headers.insert("Referer", reqwest::header::HeaderValue::from_static("https://www.bilibili.com/"));
     headers.insert("Content-Type", reqwest::header::HeaderValue::from_static("application/x-www-form-urlencoded"));
+    if let Ok(c) = reqwest::header::HeaderValue::from_str(&bot.bili.cookie_header()) {
+        headers.insert("Cookie", c);
+    }
     let resp = match bot.bili.http.post(url).headers(headers).form(&form).send().await {
         Ok(r) => r,
         Err(_) => return false,
@@ -321,6 +334,9 @@ async fn send_comment(bot: &Bot, oid: i64, comment: &str) -> bool {
     headers.insert("User-Agent", reqwest::header::HeaderValue::from_static(crate::bili_api::UA));
     headers.insert("Referer", reqwest::header::HeaderValue::from_static("https://www.bilibili.com/"));
     headers.insert("Content-Type", reqwest::header::HeaderValue::from_static("application/x-www-form-urlencoded"));
+    if let Ok(c) = reqwest::header::HeaderValue::from_str(&bot.bili.cookie_header()) {
+        headers.insert("Cookie", c);
+    }
     let form = [
         ("oid", oid.to_string()),
         ("type", "1".into()),

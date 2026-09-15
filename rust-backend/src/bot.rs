@@ -158,7 +158,7 @@ impl Bot {
     pub async fn run(&self) {
         tracing::info!("Bot 已启动，正在监听评论...");
         let (valid, info) = self.bili.check_cookie().await;
-        tracing::info!("B站Cookie: {info}");
+        tracing::info!("Cookie状态: {info}");
         if !valid {
             tracing::warn!("Cookie 已失效，请通过前端设置面板手动更新 Cookie");
         }
@@ -276,8 +276,7 @@ impl Bot {
                 let level = self.personality.get_level(current_score, Some(&mid_str));
                 let src = if reply.via == "at" { "被@" } else { "回复" };
                 tracing::info!(
-                    "[{}] rpid={rpid} {}（{} | {current_score}分）：{}",
-                    src,
+                    "[{src}] rpid={rpid} {}（{} | {current_score}分）：{}",
                     reply.username,
                     Personality::level_name(level),
                     reply.content
@@ -425,7 +424,8 @@ impl Bot {
                 }
 
                 let cfg_now = self.config.read().unwrap().clone();
-                let auto_block = cfg_now.get_bool("PRIVATE_MESSAGE_AUTO_BLOCK");
+                // 与 Python 对齐：好感度/连续负反馈拉黑由 AUTO_BLOCK_ON_AFFECTION 控制（默认 false，仅手动）
+                let auto_block = cfg_now.get_bool("AUTO_BLOCK_ON_AFFECTION");
                 let is_owner = mid_str == cfg_now.get_str("OWNER_MID");
                 if let Some(reason) = block_reason {
                     if auto_block && !is_owner {
@@ -524,13 +524,32 @@ impl Bot {
             if decision.should_block {
                 let protected = is_protected_sender(&mid, &cfg);
                 if !protected {
-                    tracing::warn!("私信危险内容 from {username}({mid})：{}", decision.reason);
-                    self.memory.log_security_event("private_message_quarantined", &mid, &username, &content, &format!("判定：{}", decision.reason));
+                    // 与 Python 对齐：隔离逻辑不变；PRIVATE_MESSAGE_AUTO_BLOCK 控制是否真正调用 B站拉黑
+                    let mut blocked = false;
+                    if cfg.get_bool("PRIVATE_MESSAGE_AUTO_BLOCK") {
+                        if let Ok(mid_i64) = mid.parse::<i64>() {
+                            self.bili.block_user(mid_i64).await;
+                            blocked = true;
+                        }
+                    }
+                    let action = if blocked { "已拉黑" } else { "已隔离，未完成拉黑" };
+                    tracing::warn!("私信安全拦截 {username}（{mid}）：{}；{action}", decision.reason);
+                    self.memory.log_security_event(
+                        if blocked { "private_message_auto_block" } else { "private_message_quarantined" },
+                        &mid,
+                        &username,
+                        &content,
+                        &format!("私信命中安全规则：{}；{action}", decision.reason),
+                    );
                     let mut block_log: Value = load_json(&self.path("block_log.json"), json!({}));
                     block_log[&mid] = json!({
                         "username": username,
                         "reason": decision.reason,
                         "last_comment": content,
+                        "last_message": content,
+                        "source": "private_message",
+                        "score": affection.get(&mid).and_then(|v| v.as_i64()).unwrap_or(0),
+                        "api_blocked": blocked,
                         "time": now_str(),
                     });
                     save_json(&self.path("block_log.json"), &block_log).ok();
@@ -711,7 +730,7 @@ impl Bot {
         let bot_name = cfg.get_str("BOT_NAME");
         let owner_bili = cfg.get_str("OWNER_BILI_NAME");
         let persona_store = PersonaStore::new(&self.base_dir);
-        let persona_prompt = persona_store.active_system_prompt();
+        let persona_prompt = persona_store.active_system_prompt(&cfg.get_str("ACTIVE_PERSONA"));
         let persona_section = if persona_prompt.is_empty() {
             format!("你是{bot_name}，一个有独立人格的存在。你有自己的想法和态度，会真实地表达感受，不敷衍不套话。说话自然，像真人在聊天。")
         } else {
