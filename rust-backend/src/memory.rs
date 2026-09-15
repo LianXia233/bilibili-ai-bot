@@ -113,8 +113,16 @@ impl MemoryStore {
     ) -> Result<()> {
         let cfg = self.config.read().unwrap().clone();
         let bot_name = cfg.get_str("BOT_NAME");
-        let text = format!("[{now}] 用户{user_id}({username})说：{content} | {bot_name}回复：{reply_text}", now = now_str());
-        let embedding = self.get_embedding(&text).await;
+        // 记忆里只保存 Bot 回复的前 N 字（长成品/长文不污染记忆），由 MEMORY_REPLY_CHARS 控制。
+        let reply_keep: usize = {
+            let n = cfg.get_i64("MEMORY_REPLY_CHARS");
+            if n > 0 { n as usize } else { 300 }
+        };
+        let reply_saved: String = reply_text.chars().take(reply_keep).collect();
+        let text = format!("[{now}] 用户{user_id}({username})说：{content} | {bot_name}回复：{reply_saved}", now = now_str());
+        // embedding 以「用户侧内容」为主体，避免 Bot 自己回复的风格主导语义检索，造成召回偏差。
+        let embed_text = format!("用户{user_id}({username})说：{content}");
+        let embedding = self.get_embedding(&embed_text).await;
         memory.push(MemoryDoc {
             rpid: rpid.to_string(),
             thread_id: thread_id.to_string(),
@@ -126,10 +134,49 @@ impl MemoryStore {
         self.save(memory)
     }
 
-    pub fn get_thread_memories(&self, memory: &[MemoryDoc], thread_id: &str) -> Vec<String> {
-        let mut docs: Vec<&MemoryDoc> = memory.iter().filter(|m| m.thread_id == thread_id).collect();
-        docs.sort_by_key(|m| m.time.clone());
-        docs.iter().map(|m| m.text.clone()).collect()
+    /// 线程记忆：embedding 可用时按「与当前话题的相关度」取相关度最高的 tail 条
+    /// （跨话题时不再把无关历史全量注入）；完全没有相关记忆时退回时间最近 tail 条，
+    /// 避免冷场。
+    pub async fn get_thread_memories(
+        &self,
+        memory: &[MemoryDoc],
+        thread_id: &str,
+        query_text: &str,
+        tail: usize,
+    ) -> Vec<String> {
+        let docs: Vec<&MemoryDoc> = memory.iter().filter(|m| m.thread_id == thread_id).collect();
+        if docs.is_empty() {
+            return Vec::new();
+        }
+        let tail = tail.max(1);
+        let query_emb = self.get_embedding(query_text).await;
+        if query_emb.is_empty() {
+            // embedding 不可用：按时间取最近 tail 条
+            let mut sorted = docs.clone();
+            sorted.sort_by_key(|m| m.time.clone());
+            return sorted.iter().rev().take(tail).rev().map(|m| m.text.clone()).collect();
+        }
+        let mut scored: Vec<(f32, &MemoryDoc)> = docs
+            .iter()
+            .map(|m| {
+                let s = if m.embedding.is_empty() {
+                    0.0
+                } else {
+                    cosine_similarity(&query_emb, &m.embedding)
+                };
+                (s, *m)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // 最高相关度都不足 0.2（线程里确实没有相关历史）→ 退回最近 tail 条，避免完全冷场
+        if scored.first().map(|(s, _)| *s).unwrap_or(0.0) <= 0.2 {
+            let mut sorted = docs.clone();
+            sorted.sort_by_key(|m| m.time.clone());
+            return sorted.iter().rev().take(tail).rev().map(|m| m.text.clone()).collect();
+        }
+        let mut picked: Vec<&MemoryDoc> = scored.into_iter().take(tail).map(|(_, m)| m).collect();
+        picked.sort_by_key(|m| m.time.clone());
+        picked.iter().map(|m| m.text.clone()).collect()
     }
 
     pub async fn get_user_semantic_memories(&self, memory: &[MemoryDoc], user_id: &str, query_text: &str) -> Vec<String> {
@@ -141,6 +188,15 @@ impl MemoryStore {
         if query_emb.is_empty() {
             return Vec::new();
         }
+        let cfg = self.config.read().unwrap().clone();
+        let top: usize = {
+            let n = cfg.get_i64("MEMORY_SEMANTIC_TOP");
+            if n > 0 { n as usize } else { 3 }
+        };
+        let mut min_sim: f32 = cfg.get_f64("MEMORY_SEMANTIC_MIN_SIM") as f32;
+        if min_sim <= 0.0 {
+            min_sim = 0.5;
+        }
         let mut scored: Vec<(f32, &MemoryDoc)> = user_mems
             .iter()
             .map(|m| (cosine_similarity(&query_emb, &m.embedding), *m))
@@ -148,9 +204,10 @@ impl MemoryStore {
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored
             .into_iter()
-            .take(3)
-            .filter(|(s, _)| *s > 0.45)
-            .map(|(_, m)| m.text.clone())
+            .take(top)
+            .filter(|(s, _)| *s > min_sim)
+            // 带相关度标注，模型可据此判断哪些记忆更可靠
+            .map(|(s, m)| format!("{}（相关度 {:.2}）", m.text, s))
             .collect()
     }
 
@@ -161,21 +218,31 @@ impl MemoryStore {
         docs.iter().rev().take(limit).map(|m| m.text.clone()).collect()
     }
 
-    /// 构建记忆上下文：线程记忆 + 用户语义记忆 + 用户档案。
+    /// 构建记忆上下文：相关线程记忆 + 用户语义记忆 + 用户档案。
     pub async fn build_memory_context(&self, memory: &[MemoryDoc], thread_id: &str, user_id: &str, query_text: &str) -> String {
+        let cfg = self.config.read().unwrap().clone();
+        let tail: usize = {
+            let n = cfg.get_i64("MEMORY_THREAD_TAIL");
+            if n > 0 { n as usize } else { 4 }
+        };
+        let chars_cap: usize = {
+            let n = cfg.get_i64("MEMORY_THREAD_CHARS");
+            if n > 0 { n as usize } else { 800 }
+        };
         let mut parts: Vec<String> = Vec::new();
-        let thread = self.get_thread_memories(memory, thread_id);
+        let thread = self.get_thread_memories(memory, thread_id, query_text, tail).await;
         if !thread.is_empty() {
-            let tail: Vec<&String> = thread.iter().rev().take(6).collect();
-            let mut joined = tail.iter().rev().map(|s| s.to_string()).collect::<Vec<_>>().join("\n");
-            if joined.chars().count() > 1000 {
-                joined = joined.chars().take(1000).collect::<String>();
-            }
-            parts.push(format!("【最近对话】\n{joined}"));
+            let joined = thread.join("\n");
+            let joined: String = if joined.chars().count() > chars_cap {
+                joined.chars().take(chars_cap).collect()
+            } else {
+                joined
+            };
+            parts.push(format!("【最近相关对话（仅与当前话题直接相关时参考，否则忽略）】\n{joined}"));
         }
         let semantic = self.get_user_semantic_memories(memory, user_id, query_text).await;
         if !semantic.is_empty() {
-            parts.push(format!("【相关记忆】\n{}", semantic.join("\n")));
+            parts.push(format!("【历史相关记忆（其中的「bot 回复」是当时的历史发言，禁止照搬复述，仅作背景了解）】\n{}", semantic.join("\n")));
         }
         let profile = self.get_user_profile_context(user_id);
         if !profile.is_empty() {

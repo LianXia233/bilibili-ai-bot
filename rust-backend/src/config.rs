@@ -127,6 +127,15 @@ pub fn defaults() -> HashMap<&'static str, Value> {
     // 永久记忆
     set("PERMANENT_MEMORY_CHAR_BUDGET", json!(2500));
     set("PERMANENT_MEMORY_INJECT", json!(40));
+    // 临时记忆装填质量（防止无关历史注入导致乱回复）
+    set("MEMORY_THREAD_TAIL", json!(4));       // 线程最近 N 条（embedding 可用时按与当前话题相关度取）
+    set("MEMORY_THREAD_CHARS", json!(800));    // 线程记忆注入最大字符数
+    set("MEMORY_SEMANTIC_TOP", json!(3));      // 语义检索最多注入条数
+    set("MEMORY_SEMANTIC_MIN_SIM", json!(0.5)); // 语义记忆最低相关度（低于视为无关，不注入）
+    // 回复防重复（同一用户连续类似话题时避免重复内容；0 关闭）
+    set("REPLY_DEDUP_SIM", json!(0.85));       // 与最近回复的字符相似度阈值，超过则重新生成
+    set("REPLY_DEDUP_LOOKBACK", json!(3));     // 对比最近 N 条自己发过的回复
+    set("MEMORY_REPLY_CHARS", json!(300));     // 记忆里保存 Bot 回复的最大字符数（长成品截断，防污染）
     // 对话模型池（可选覆盖 OR_CHAT_* 四键）
     set("CHAT_MODEL_POOL", json!([]));
     set("CHAT_MODEL_ACTIVE", json!(-1));

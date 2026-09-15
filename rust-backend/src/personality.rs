@@ -196,8 +196,9 @@ impl Personality {
         let mut parts: Vec<String> = Vec::new();
         let traits = evo.get("evolved_traits").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         if !traits.is_empty() {
-            parts.push("【最近的成长变化】".into());
-            for t in traits.iter().rev().take(3) {
+            // 只注入最近 1 条：成长是增量吸收的，旧特质已被新特质覆盖，全量注入会让说话风格漂移。
+            parts.push("【长期形成的稳定特点（这是长期趋势，不要在单条回复中刻意改变语气，也不要每句话都体现）】".into());
+            if let Some(t) = traits.last() {
                 if let Some(c) = t.get("change").and_then(|v| v.as_str()) {
                     parts.push(format!("- {c}"));
                 }

@@ -187,3 +187,55 @@ pub fn b64_encode(data: &[u8]) -> String {
 pub fn b64_decode(data: &str) -> std::result::Result<Vec<u8>, AppError> {
     Ok(B64.decode(data)?)
 }
+
+/// 归一化文本：只保留中英文与数字字符（去空白、标点、emoji），用于回复相似度比较。
+pub fn normalize_chars(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(c))
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect()
+}
+
+/// 字符集合 Jaccard 相似度（0.0~1.0）：两份归一化文本的字符交集 / 并集。
+pub fn char_jaccard(a: &str, b: &str) -> f64 {
+    use std::collections::HashSet;
+    let sa: HashSet<char> = a.chars().collect();
+    let sb: HashSet<char> = b.chars().collect();
+    if sa.is_empty() && sb.is_empty() {
+        return 1.0;
+    }
+    let inter = sa.intersection(&sb).count();
+    let union = sa.union(&sb).count();
+    if union == 0 {
+        1.0
+    } else {
+        inter as f64 / union as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_keeps_cn_en_digits_only() {
+        assert_eq!(normalize_chars("你好呀！Hello 123? 😊"), "你好呀hello123");
+        assert_eq!(normalize_chars("   "), "");
+        assert_eq!(normalize_chars(""), "");
+    }
+
+    #[test]
+    fn char_jaccard_same_and_disjoint() {
+        assert!((char_jaccard("你好世界", "你好世界") - 1.0).abs() < 1e-9);
+        assert!(char_jaccard("abcdef", "ghijkl") < 0.2);
+        // 近义改写：相似但不完全相同（约 0.67，低于去重阈值 0.85，不应误杀）
+        assert!(char_jaccard("这装扮很好看呀", "这装扮看起来很好看") > 0.6);
+        assert!(char_jaccard("这装扮很好看呀", "这装扮看起来很好看") < 0.9);
+        // 一字不差 + 语气词：归一化后完全重复（真实调用链先 normalize 再 jaccard），应命中高阈值
+        let na = normalize_chars("这装扮很好看呀");
+        let nb = normalize_chars("这装扮很好看呀！");
+        assert!((char_jaccard(&na, &nb) - 1.0).abs() < 1e-9);
+        // 完全不同话题
+        assert!(char_jaccard("今天天气怎么样", "推荐几首好听的歌") < 0.2);
+    }
+}

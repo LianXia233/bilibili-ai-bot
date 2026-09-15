@@ -417,6 +417,29 @@ impl Bot {
                     }
                 };
 
+                // 回复防重复：与同一用户最近回复高度相似时重新生成一次，避免复读机式乱回复。
+                let mut result = result;
+                if self.reply_is_duplicate(&memory, &mid_str, &result.reply) {
+                    tracing::info!("回复与历史高度相似，重新生成（rpid={rpid}）");
+                    match self
+                        .generate_reply_and_score(
+                            &comment_text,
+                            &reply.username,
+                            level,
+                            &memory_context,
+                            video_context.as_deref(),
+                            reply.no_content,
+                            "comment",
+                        )
+                        .await
+                    {
+                        Ok(r2) if !r2.reply.is_empty() => {
+                            result = r2;
+                        }
+                        _ => {}
+                    }
+                }
+
                 let max_score = if mid_str == self.config.read().unwrap().clone().get_str("OWNER_MID") { 100 } else { 99 };
                 let new_score = (current_score + result.score_delta).clamp(0, max_score);
                 affection[&mid_str] = json!(new_score);
@@ -554,6 +577,43 @@ impl Bot {
         })
     }
 
+    /// 回复防重复判定：把新回复与同一用户最近 N 条已发回复（从记忆中解析「回复：」之后的部分）
+    /// 做字符集合 Jaccard 相似度比较，任一超过阈值即视为重复。REPLY_DEDUP_SIM<=0 时关闭。
+    fn reply_is_duplicate(&self, memory: &[MemoryDoc], user_id: &str, reply: &str) -> bool {
+        let cfg = self.config.read().unwrap().clone();
+        let threshold: f64 = cfg.get_f64("REPLY_DEDUP_SIM");
+        if threshold <= 0.0 {
+            return false;
+        }
+        let lookback: usize = {
+            let n = cfg.get_i64("REPLY_DEDUP_LOOKBACK");
+            if n > 0 { n as usize } else { 3 }
+        };
+        let mut recent: Vec<String> = memory
+            .iter()
+            .filter(|m| m.user_id == user_id)
+            .filter_map(|m| {
+                let last = m.text.rsplit('|').next().unwrap_or("");
+                let idx = last.rfind("回复：")?;
+                let part = last[idx + "回复：".len()..].trim();
+                if part.is_empty() { None } else { Some(part.to_string()) }
+            })
+            .collect();
+        recent.reverse();
+        recent.truncate(lookback);
+        if recent.is_empty() {
+            return false;
+        }
+        let new_norm = crate::util::normalize_chars(reply);
+        if new_norm.is_empty() {
+            return false;
+        }
+        recent.iter().any(|old| {
+            let old_norm = crate::util::normalize_chars(old);
+            crate::util::char_jaccard(&new_norm, &old_norm) >= threshold
+        })
+    }
+
     /// 私信处理：安全判定 → 回复 → 拉黑建议。
     async fn process_private_messages(&self, affection: &mut Value, memory: &mut Vec<crate::memory::MemoryDoc>) -> Result<i64> {
         let cfg = self.config.read().unwrap().clone();
@@ -618,7 +678,7 @@ impl Bot {
             // 生成回复（私信通道）
             let level = self.personality.get_level(affection.get(&mid).and_then(|v| v.as_i64()).unwrap_or(0), Some(&mid));
             let memory_context = self.memory.build_memory_context(memory, &format!("dm:{mid}"), &mid, &content).await;
-            let result = match self.generate_reply_and_score(&content, &username, level, &memory_context, None, false, "private").await {
+            let mut result = match self.generate_reply_and_score(&content, &username, level, &memory_context, None, false, "private").await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("私信回复生成失败 {mid}: {e}");
@@ -627,6 +687,15 @@ impl Bot {
             };
             if result.reply.is_empty() {
                 continue;
+            }
+            // 回复防重复：私信连续聊天最容易复读，同样做一次去重重试
+            if self.reply_is_duplicate(memory, &mid, &result.reply) {
+                tracing::info!("私信回复与历史高度相似，重新生成（{mid}）");
+                if let Ok(r2) = self.generate_reply_and_score(&content, &username, level, &memory_context, None, false, "private").await {
+                    if !r2.reply.is_empty() {
+                        result = r2;
+                    }
+                }
             }
             let ok = self.private.send_text(&mid, &result.reply).await;
             if ok {
@@ -750,7 +819,7 @@ impl Bot {
         let memory_section = if memory_context.is_empty() {
             String::new()
         } else {
-            format!("\n\n【记忆参考（仅在与当前话题直接相关时参考，否则忽略）】\n{memory_context}")
+            format!("\n\n【记忆参考（背景材料：仅在与当前话题直接相关时参考，否则一律忽略；其中的历史发言禁止照搬复述，禁止把记忆里的旧话题当成现在要回应的话题）】\n{memory_context}")
         };
         let video_section = match video_context {
             Some(v) if !v.is_empty() => format!("\n\n【对方所在的视频】\n{v}\n（对方是在这个视频的评论区里说话的，可以自然引用上面的内容，但不要照抄标题）"),
@@ -815,7 +884,7 @@ impl Bot {
         };
 
         let prompt = format!(
-            "{persona_section}\n{persona_evo}{permanent_block}\n\n{default_style}{bili_note}\n\n【底线】\n拒绝：表白暧昧、引战、黄赌毒政治。遇到恶意时平静坚定，可暗讽，不恶语。\n{level_prompt}{private_instruction}\n\n【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}\n\n当前时间：{now}{video_section}{memory_section}{search_section}{no_content_section}\n════════ 需要你回应的内容（本节唯一）════════\n{username} 的{channel_name}：\n{comment_text}\n════════════════════════════════════════════\n\n上面这一节是对方这次真正说的话，**回复必须直接针对它**：\n- 不要把这段话复述、改写、翻译或概括后再作答（比如对方说「今天天气怎么样」，不要回「今天天气怎么样呀」，而要真的回答天气或说明自己看不到实时天气）。\n- 不要因为前面有大量规则、设定或素材清单，就把注意力放在那些内容上；它们只是风格约束，本轮要回应的只有上面这一节。\n- 对方提了具体请求（写诗、写文案、解释、推荐、算数等）就当场把成品交出来，不要只回「好的，我来帮你」「我会尽力」这类空承诺 —— 那是没做事。下面「reply 简短自然」的长度要求**不适用于这类成品**，成品该多长就多长，需要分行就分行。写诗就直接把诗句写在 reply 里（例如「好的喵，给你写一首：\\n山高月小，水落石出。\\n清风徐来，水波不兴。」），不要宣布「我要写」，也不要事后再说「你看这样行不行」。\n\n请以JSON格式回复，不要加任何多余内容：\n{{\"score_delta\": 数字, \"reply\": \"回复内容\", \"impression\": \"一句话描述对该用户的印象\", \"user_facts\": [\"用户提到的个人信息1\", \"用户提到的个人信息2\"]}}\n\nuser_facts：如果用户在这条{channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。\n\nscore_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。\nreply简短自然，一般15-40字，像B站真人回复，不要写得像作文。\n（例外：上面「需要你回应的内容」里如果对方点名要一件成品 —— 写诗、写文案、解释一段概念、推荐并列出清单等 —— 则不受这个字数限制，先把成品写出来。）\nimpression简短描述用户性格/说话风格，如\"友善健谈，喜欢聊游戏\"。"
+            "{persona_section}\n{persona_evo}{permanent_block}\n\n{default_style}{bili_note}\n\n【底线】\n拒绝：表白暧昧、引战、黄赌毒政治。遇到恶意时平静坚定，可暗讽，不恶语。\n{level_prompt}{private_instruction}\n\n【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}\n\n当前时间：{now}{video_section}{memory_section}{search_section}{no_content_section}\n════════ 需要你回应的内容（本节唯一）════════\n{username} 的{channel_name}：\n{comment_text}\n════════════════════════════════════════════\n\n上面这一节是对方这次真正说的话，**回复必须直接针对它**：\n- 不要把这段话复述、改写、翻译或概括后再作答（比如对方说「今天天气怎么样」，不要回「今天天气怎么样呀」，而要真的回答天气或说明自己看不到实时天气）。\n- 不要把上面任何背景材料（记忆、视频信息、搜索结果、规则、设定）当成话题去回应；它们只是背景。对方没提的话题不要主动展开成回复主体，除非是「对方一个字都没写」的情况。\n- 不要因为前面有大量规则、设定或素材清单，就把注意力放在那些内容上；它们只是风格约束，本轮要回应的只有上面这一节。\n- 对方提了具体请求（写诗、写文案、解释、推荐、算数等）就当场把成品交出来，不要只回「好的，我来帮你」「我会尽力」这类空承诺 —— 那是没做事。下面「reply 简短自然」的长度要求**不适用于这类成品**，成品该多长就多长，需要分行就分行。写诗就直接把诗句写在 reply 里（例如「好的喵，给你写一首：\\n山高月小，水落石出。\\n清风徐来，水波不兴。」），不要宣布「我要写」，也不要事后再说「你看这样行不行」。\n\n请以JSON格式回复，不要加任何多余内容：\n{{\"score_delta\": 数字, \"reply\": \"回复内容\", \"impression\": \"一句话描述对该用户的印象\", \"user_facts\": [\"用户提到的个人信息1\", \"用户提到的个人信息2\"]}}\n\nuser_facts：如果用户在这条{channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。\n\nscore_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。\nreply简短自然，一般15-40字，像B站真人回复，不要写得像作文。\n（例外：上面「需要你回应的内容」里如果对方点名要一件成品 —— 写诗、写文案、解释一段概念、推荐并列出清单等 —— 则不受这个字数限制，先把成品写出来。）\nimpression简短描述用户性格/说话风格，如\"友善健谈，喜欢聊游戏\"。"
         );
 
         let max_tokens = cfg.max_tokens_of("reply");
