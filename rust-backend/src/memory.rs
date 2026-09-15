@@ -364,28 +364,53 @@ pub fn parse_json_lenient(text: &str) -> Option<Value> {
 }
 
 /// 永久记忆（data/permanent_memory.json）。
+/// 与 Python 兼容：条目为 {text, time} 对象数组，上限 20 条。
 pub struct PermanentMemory {
     pub file: PathBuf,
 }
+
+pub const PERMANENT_MEMORY_LIMIT: usize = 20;
 
 impl PermanentMemory {
     pub fn new(base_dir: &str) -> Self {
         PermanentMemory { file: crate::util::data_path(base_dir, "permanent_memory.json") }
     }
-    pub fn load(&self) -> Vec<String> {
-        load_json(&self.file, Vec::new())
+    /// 读取对象数组；兼容旧版纯字符串数组（读取时自动迁移为对象）。
+    pub fn load(&self) -> Vec<Value> {
+        let raw: Value = load_json(&self.file, json!([]));
+        let mut out: Vec<Value> = Vec::new();
+        if let Some(arr) = raw.as_array() {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    out.push(json!({"text": s, "time": ""}));
+                } else {
+                    out.push(item.clone());
+                }
+            }
+        }
+        out
     }
     pub fn add(&self, text: &str) {
-        let mut list = self.load();
-        if text.is_empty() || list.contains(&text.to_string()) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
             return;
         }
-        list.push(text.to_string());
+        let mut list = self.load();
+        if list.iter().any(|v| v.get("text").and_then(|t| t.as_str()) == Some(text.as_str())) {
+            return;
+        }
+        if list.len() >= PERMANENT_MEMORY_LIMIT {
+            return;
+        }
+        list.push(json!({"text": text, "time": crate::util::now_str()}));
         let _ = save_json(&self.file, &list);
     }
-    pub fn remove(&self, text: &str) {
-        let list: Vec<String> = self.load().into_iter().filter(|t| t != text).collect();
-        let _ = save_json(&self.file, &list);
+    pub fn remove_by_index(&self, index: usize) {
+        let mut list = self.load();
+        if index < list.len() {
+            list.remove(index);
+            let _ = save_json(&self.file, &list);
+        }
     }
 }
 

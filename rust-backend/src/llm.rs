@@ -4,7 +4,7 @@
 use crate::bili_api::TpmWindow;
 use crate::config::Config;
 use crate::error::{AppError, Result};
-use crate::util::{now_unix, save_json, v_i64};
+use crate::util::{save_json, v_i64};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -213,7 +213,8 @@ impl LlmClient {
     }
 }
 
-/// 成本记账（data/cost_log.json），结构与 Python log_cost 对齐。
+/// 成本记账（data/cost_log.json），结构与 Python log_cost 对齐：
+/// day-keyed 对象 {日期: {total, calls, input_tokens, output_tokens, details, models}}。
 pub fn log_cost(
     config: &Arc<RwLock<Config>>,
     source: &str,
@@ -244,27 +245,63 @@ pub fn log_cost(
     let cost = input_tokens as f64 / 1_000_000.0 * input_price + output_tokens as f64 / 1_000_000.0 * output_price;
 
     let path = cost_log_path;
-    let mut log: Value = crate::util::load_json(path, json!([]));
-    if !log.is_array() {
-        log = json!([]);
+    let mut log: Value = crate::util::load_json(path, json!({}));
+    if !log.is_object() {
+        log = json!({});
     }
-    let mut entry = json!({
-        "source": source,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "model": model,
-        "time": crate::util::now_str(),
-        "ts": now_unix(),
-    });
-    if cost > 0.0 {
-        entry["cost"] = json!((cost * 10000.0).round() / 10000.0);
-        entry["input_price"] = json!(input_price);
-        entry["output_price"] = json!(output_price);
+    let today = crate::util::today_str();
+    if !log.get(&today).map(|v| v.is_object()).unwrap_or(false) {
+        log[&today] = json!({"total": 0.0, "calls": 0, "input_tokens": 0, "output_tokens": 0, "details": [], "models": {}});
     }
-    if let Some(arr) = log.as_array_mut() {
-        arr.push(entry);
-        if arr.len() > 5000 {
-            arr.drain(..arr.len() - 5000);
+    let day = log.as_object_mut().unwrap().get_mut(&today).unwrap();
+    let day_obj = day.as_object_mut().unwrap();
+    for k in ["total", "calls", "input_tokens", "output_tokens"] {
+        if !day_obj.contains_key(k) {
+            day_obj.insert(k.to_string(), json!(0));
+        }
+    }
+    if !day_obj.contains_key("details") {
+        day_obj.insert("details".to_string(), json!([]));
+    }
+    if !day_obj.contains_key("models") {
+        day_obj.insert("models".to_string(), json!({}));
+    }
+    let prev_total = day_obj.get("total").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    day_obj.insert("total".to_string(), json!(((prev_total + cost) * 1e6).round() / 1e6));
+    day_obj.insert("calls".to_string(), json!(day_obj.get("calls").and_then(|v| v.as_i64()).unwrap_or(0) + 1));
+    day_obj.insert("input_tokens".to_string(), json!(day_obj.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0) + input_tokens));
+    day_obj.insert("output_tokens".to_string(), json!(day_obj.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0) + output_tokens));
+    let time_hm: String = crate::util::now_str().chars().skip(11).take(5).collect();
+    if let Some(details) = day_obj.get_mut("details").and_then(|d| d.as_array_mut()) {
+        details.push(json!({
+            "time": time_hm,
+            "source": source,
+            "in": input_tokens,
+            "out": output_tokens,
+            "cost": (cost * 1e6).round() / 1e6,
+        }));
+    }
+    let model_key = if model.contains('/') { model.to_string() } else { source.to_string() };
+    if let Some(models) = day_obj.get_mut("models").and_then(|ms| ms.as_object_mut()) {
+        let entry = models
+            .entry(model_key)
+            .or_insert_with(|| json!({"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost": 0.0}));
+        if let Some(eo) = entry.as_object_mut() {
+            eo.insert("calls".to_string(), json!(eo.get("calls").and_then(|v| v.as_i64()).unwrap_or(0) + 1));
+            eo.insert("input_tokens".to_string(), json!(eo.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0) + input_tokens));
+            eo.insert("output_tokens".to_string(), json!(eo.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0) + output_tokens));
+            let prev_mcost = eo.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            eo.insert("cost".to_string(), json!(((prev_mcost + cost) * 1e6).round() / 1e6));
+        }
+    }
+    // 保留最近 30 天
+    if let Some(obj) = log.as_object_mut() {
+        let mut keys: Vec<String> = obj.keys().cloned().collect();
+        keys.sort();
+        if keys.len() > 30 {
+            for k in keys.iter().take(keys.len() - 30) {
+                obj.remove(k);
+            }
         }
     }
     let _ = save_json(path, &log);

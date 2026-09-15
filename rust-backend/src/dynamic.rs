@@ -165,6 +165,7 @@ async fn upload_image_to_bilibili(bot: &Bot, image: &PathBuf) -> Option<Value> {
         .post("https://api.bilibili.com/x/dynamic/feed/draw/upload_bfs")
         .header("User-Agent", crate::bili_api::UA)
         .header("Referer", "https://www.bilibili.com/")
+        .header("Cookie", bot.bili.cookie_header())
         .multipart(form)
         .send()
         .await
@@ -185,6 +186,7 @@ async fn post_dynamic_text(bot: &Bot, text: &str) -> bool {
         .post("https://api.bilibili.com/x/dynamic/feed/create/dyn")
         .header("User-Agent", crate::bili_api::UA)
         .header("Referer", "https://www.bilibili.com/")
+        .header("Cookie", bot.bili.cookie_header())
         .form(&[("dynamic_id", ""), ("type", "4"), ("rid", "0"), ("content", text), ("csrf", csrf.as_str())])
         .send()
         .await;
@@ -212,7 +214,6 @@ async fn post_dynamic_with_image(bot: &Bot, text: &str, img_info: &Value) -> boo
     let cfg = bot.config.read().unwrap().clone();
     let csrf = cfg.get_str("BILI_JCT");
     let img_url = img_info["data"]["image_url"].as_str().unwrap_or("");
-    let _img_url2 = img_info["data"]["image_url"].as_str().unwrap_or("");
     if img_url.is_empty() {
         return post_dynamic_text(bot, text).await;
     }
@@ -223,6 +224,7 @@ async fn post_dynamic_with_image(bot: &Bot, text: &str, img_info: &Value) -> boo
         .post("https://api.bilibili.com/x/dynamic/feed/create/dyn")
         .header("User-Agent", crate::bili_api::UA)
         .header("Referer", "https://www.bilibili.com/")
+        .header("Cookie", bot.bili.cookie_header())
         .form(&[
             ("dynamic_id", ""),
             ("type", "0"),
