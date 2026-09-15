@@ -108,6 +108,10 @@ MOOD_FILE = "data/mood.json"
 VIDEO_MEMORY_FILE = "data/video_memory.json"
 USER_PROFILE_FILE = "data/user_profiles.json"
 PERSONALITY_FILE = "data/personality_evolution.json"
+# 临时记忆「今天清过没有」的日期标记。放在独立小文件里而不是塞进 config.json：
+# config.json 会被面板整体回写，混入运行态标记容易被覆盖丢失，
+# 一旦丢失就会在目标时刻所在的那一分钟内被反复触发。
+TEMP_CLEAR_STATE_FILE = "data/temp_clear_state.json"
 
 # 关键词过滤
 BLOCK_KEYWORDS = ["傻逼", "草泥马", "滚", "死", "废物", "智障", "脑残"]
@@ -1118,6 +1122,69 @@ def _parse_evolve_json(raw_text, old_habits, old_opinions):
         "reflection": reflection or "今天的反思没能整理好..."
     }
 
+def maybe_clear_temp_memory(memory):
+    """按面板配置，每天定点清空「临时记忆」（对话记忆 + 用户档案）。
+
+    返回清空后的 memory（若未执行则原样返回）。
+
+    为什么要做成日期去重而不是「每小时判断是否等于目标时刻」：
+    主循环是长驻进程、每分钟跑一轮。若判据写成 `now.hour == HOUR`，那么在那一小时
+    内每一轮都会命中 —— 一小时内清 60 次，等于把随后写入的新记忆也一起抹掉。
+    改用「今天清过没有」的日期标记（写在 memory_clear_state.json），
+    一天最多执行一次，且进程重启后依然不会重复执行。
+
+    与 maybe_evolve_personality 的关系：那个要求 now.hour == EVOLVE_HOUR（同样有
+    一小时窗内重复触发的问题，但它有 last_evolve 日期标记兜底，所以安全）。
+    这里直接采用日期标记，不做小时相等判断 —— 只要「今天该清的还没清」且
+    「当前时间已过设定时刻」就执行，进程若在目标时刻之后才启动，也能补上一次。
+    """
+    from config import get_raw_config, get_temp_clear_plan, clear_temp_memory
+    plan = get_temp_clear_plan()
+    if not plan["enabled"]:
+        return memory
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    state = load_json(TEMP_CLEAR_STATE_FILE, {})
+    if state.get("last_clear", "")[:10] == today:
+        return memory  # 今天已清过
+
+    now = datetime.now()
+    target_minutes = plan["hour"] * 60 + plan["minute"]
+    now_minutes = now.hour * 60 + now.minute
+    if now_minutes < target_minutes:
+        return memory  # 还没到点
+
+    keep_days = plan["keep_days"]
+    print(f"🧹 到达临时记忆清空时刻（{plan['time_str']}），开始清理..."
+          + (f"，保留最近 {keep_days} 天" if keep_days else "（全清）"))
+    try:
+        ok, msg, cleared = clear_temp_memory(keep_days=keep_days, backup=True, tag="autoclear")
+    except Exception as e:
+        print(f"⚠️ 临时记忆清空失败：{e}")
+        return memory
+
+    if not ok:
+        print("🧹 无可清空项")
+    else:
+        for c in cleared:
+            if c["target"] == "profile":
+                # 用户档案是 dict，按用户 UID 为键；清掉后 Bot 对你的印象归零。
+                # 打印出来是为了事后能从日志区分「Bot 忘了」与「Bot 没记」。
+                print(f"🧹 {c['label']}：清除 {c['removed']} 条")
+            else:
+                print(f"🧹 {c['label']}：清除 {c['removed']} 条"
+                      + (f"，保留 {c['kept']} 条" if c.get("kept") else ""))
+
+    save_json(TEMP_CLEAR_STATE_FILE, {
+        "last_clear": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "last_msg": msg,
+        "keep_days": keep_days,
+    })
+    # 进程内存里那份 memory 也必须同步清掉。若只改文件，
+    # 后续 save_memory_record 会把内存里的旧条目连同新条目一起写回文件，
+    # 表现为「刚清完几分钟，记忆又全回来了」—— 这是最容易漏的一步。
+    return load_memory()
+
 def maybe_evolve_personality(memory):
     """每天一次，让Bot反思近期经历并演化性格"""
     from config import ENABLE_PERSONALITY_EVOLUTION, EVOLVE_HOUR
@@ -1929,6 +1996,14 @@ def run():
 
             # 每日性格演化（独立于休眠判断）
             maybe_evolve_personality(memory)
+
+            # 每日临时记忆清空（同样独立于休眠）：挂在演化之后、休眠判断之前。
+            # 若放到下面 continue 之后，开启休眠时整个休眠窗内的清空都不会执行，
+            # 而用户恰恰最可能把清空时间设在深夜 —— 那就永远不会触发。
+            # 必须用返回值重新绑定 memory：清空后进程内存里那份也要同步，
+            # 否则后续写新记忆时会把旧条目一并写回文件。
+            memory = maybe_clear_temp_memory(memory)
+
             if not is_active_time():
                 print(f"😴 当前不在工作时间（2:00-8:00休眠中）...")
                 time.sleep(60)

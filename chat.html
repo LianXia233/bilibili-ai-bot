@@ -918,6 +918,15 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
   box-shadow: 0 4px 12px rgba(8, 124, 186, 0.22);
 }
 
+/* 记忆管理面板的双页签选中态。用 border-bottom 高亮而不是换背景色：
+   两个页签并排时背景色差异在浅色主题下几乎看不出来，底部横线更明确。 */
+.summary-btn.mem-tab.active {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: rgba(8, 124, 186, 0.10);
+  box-shadow: inset 0 -2px 0 var(--primary);
+}
+
 .settings-btn.primary:hover {
   background: linear-gradient(135deg, var(--primary-strong), var(--primary));
   color: #fff;
@@ -1826,11 +1835,72 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
     <p>查看和管理Bot的记忆</p>
   </div>
   <div class="panel-content">
-    <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;">
-      <button class="summary-btn" style="margin:0" onclick="switchPanel('permanent')">💎 永久记忆</button>
+    <!-- 双页签：临时 / 长期。分界与会话里约定的一致：
+         临时=对话记忆+用户档案（会自然堆积、清掉只是忘掉聊过什么）；
+         长期=永久记忆/好感度/性格演化等（清掉等于回滚人格，不参与定时清理）。 -->
+    <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center;">
+      <button class="summary-btn mem-tab active" id="memTabTemp" style="margin:0" onclick="switchMemTab('temp')">⏳ 临时记忆</button>
+      <button class="summary-btn mem-tab" id="memTabLong" style="margin:0" onclick="switchMemTab('long')">💎 长期记忆</button>
+      <button class="summary-btn" style="margin:0;margin-left:auto;" onclick="loadMemTab()">↻ 刷新</button>
     </div>
-    <div id="memoryList"></div>
-    <div id="memoryPager" style="margin-top:16px;text-align:center;"></div>
+
+    <!-- 临时记忆页 -->
+    <div id="memPaneTemp">
+      <div style="padding:12px;border-radius:8px;background:rgba(255,180,120,.07);border:1px solid rgba(255,180,120,.2);margin-bottom:14px;">
+        <div style="font-size:13px;font-weight:600;color:var(--text-main);margin-bottom:6px;">临时记忆 · Bot 记得聊过什么</div>
+        <span class="avatar-upload-hint">包含「对话记忆」（每条对话、评论线摘要与记忆压缩总结）与「用户档案」（对每个人的印象、标签、已知信息）。这部分会随时间不断堆积，清掉只是让它忘掉聊过什么，不影响人格与好感度。</span>
+        <div id="tempMemStats" style="font-size:12px;color:var(--text-dim);line-height:1.9;margin:10px 0;"></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="settings-btn small" style="background:#8b2f2f;" onclick="clearTempMemory()">🗑 一键清空临时记忆</button>
+          <button class="settings-btn small" onclick="switchPanel('permanent')">前往永久记忆 →</button>
+        </div>
+        <div id="tempClearResult" class="model-test-result"></div>
+      </div>
+
+      <!-- 定时清空配置 -->
+      <div style="padding:12px;border-radius:8px;background:rgba(120,170,255,.06);border:1px solid rgba(120,170,255,.18);margin-bottom:14px;">
+        <div style="font-size:13px;font-weight:600;color:var(--text-main);margin-bottom:6px;">⏰ 定时自动清空</div>
+        <span class="avatar-upload-hint">按设定的时刻每天自动清空一次临时记忆，永久记忆与好感度不受影响。清空前会自动备份。</span>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:10px;">
+          <div class="settings-field" style="margin:0;">
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+              <input type="checkbox" id="tempAutoClear" style="width:auto;">
+              <span>启用定时清空</span>
+            </label>
+          </div>
+          <div class="settings-field" style="margin:0;">
+            <label>每天几点</label>
+            <input type="time" id="tempClearTime" style="width:130px;">
+          </div>
+          <div class="settings-field" style="margin:0;">
+            <label>保留最近（天）</label>
+            <input type="number" id="tempKeepDays" min="0" max="365" value="0" style="width:110px;" placeholder="0=全清">
+          </div>
+          <button class="settings-btn primary" style="height:38px;white-space:nowrap;" onclick="saveTempClearConfig()">保存</button>
+        </div>
+        <span class="avatar-upload-hint" style="display:block;margin-top:6px;">「保留最近」填 0 = 每次全清；填 7 = 只丢弃 7 天前的记录，保留近期记忆。</span>
+        <div id="tempClearStatus" style="font-size:12px;color:var(--text-dim);line-height:1.9;margin-top:8px;"></div>
+        <div id="tempConfigResult" class="model-test-result"></div>
+      </div>
+
+      <div id="tempMemList"></div>
+      <div id="tempMemPager" style="margin-top:16px;text-align:center;"></div>
+    </div>
+
+    <!-- 长期记忆页 -->
+    <div id="memPaneLong" style="display:none;">
+      <div style="padding:12px;border-radius:8px;background:rgba(120,220,160,.06);border:1px solid rgba(120,220,160,.18);margin-bottom:14px;">
+        <div style="font-size:13px;font-weight:600;color:var(--text-main);margin-bottom:6px;">长期记忆 · Bot 的自我与关系</div>
+        <span class="avatar-upload-hint">永久记忆（人格规则）、好感度、性格演化、视频缓存、当日心情。这些不参与定时清理；清空会让 Bot 的性格或对主人的关系定位发生变化，请谨慎操作。</span>
+        <div id="longMemStats" style="font-size:12px;color:var(--text-dim);line-height:1.9;margin:10px 0;"></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="settings-btn small" onclick="switchPanel('permanent')">💎 管理永久记忆</button>
+          <button class="settings-btn small" onclick="clearMemories('personality')">清空性格演化</button>
+          <button class="settings-btn small" onclick="clearMemories('video')">清空视频缓存</button>
+        </div>
+      </div>
+      <div id="longMemList"></div>
+    </div>
   </div>
 </div>
 
@@ -2653,6 +2723,12 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
             <button class="settings-btn small" style="background:#8b2f2f;" onclick="clearMemories('profile')">清空用户档案</button>
             <button class="settings-btn small" style="background:#8b2f2f;" onclick="clearMemories('affection')">清空好感度</button>
           </div>
+          <div style="margin-top:10px;padding:10px 12px;border-radius:8px;background:rgba(255,180,120,.07);border:1px solid rgba(255,180,120,.2);">
+            <div style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:8px;">
+              临时记忆 = 对话记忆 + 用户档案，可一键清空，也可在「记忆管理」里配置每天定点自动清空。
+            </div>
+            <button class="settings-btn small" style="background:#8b2f2f;" onclick="clearTempMemory()">🗑 一键清空临时记忆</button>
+          </div>
           <div style="margin-top:10px;">
             <button class="settings-btn" style="background:#6b1f1f;width:100%;" onclick="clearMemories('all')">⚠ 一键清空全部记忆</button>
             <span class="avatar-upload-hint">包含：永久记忆、对话记忆（含摘要）、用户档案、好感度、视频分析缓存、性格演化、当日心情。</span>
@@ -3103,7 +3179,7 @@ function switchPanel(name) {
   if (event && event.currentTarget) event.currentTarget.classList.add('active');
   if (name === 'users') loadUsers();
   if (name === 'blocks') loadBlocks();
-  if (name === 'memory') loadMemory(1);
+  if (name === 'memory') loadMemTab();
   if (name === 'security') { loadBlockSuggestions(); loadSecurity(1); }
   if (name === 'permanent') loadPermanent();
   if (name === 'cost') loadCost();
@@ -3448,33 +3524,203 @@ async function loadBlocks() {
 
 // ===== 记忆管理 =====
 let memPage = 1;
+let memTab = 'temp';
+
+// 切换页签：临时 / 长期。两个页签各自惰性加载，避免进面板就打四个接口。
+function switchMemTab(tab) {
+  memTab = tab;
+  const isTemp = tab === 'temp';
+  document.getElementById('memPaneTemp').style.display = isTemp ? '' : 'none';
+  document.getElementById('memPaneLong').style.display = isTemp ? 'none' : '';
+  document.getElementById('memTabTemp').classList.toggle('active', isTemp);
+  document.getElementById('memTabLong').classList.toggle('active', !isTemp);
+  loadMemTab();
+}
+
+function loadMemTab() {
+  if (memTab === 'temp') { loadTempMemory(); loadTempClearConfig(); }
+  else loadLongMemory();
+}
+
+// ---- 临时记忆 ----
+async function loadTempMemory() {
+  const list = document.getElementById('tempMemList');
+  try {
+    const resp = await apiFetch('/api/memory/temp/list');
+    const data = await resp.json();
+    const groups = data.groups || {};
+    const dialog = groups.dialog || {count: 0, items: []};
+    const profile = groups.profile || {count: 0, items: []};
+
+    const st = document.getElementById('tempMemStats');
+    if (st) {
+      st.innerHTML = `对话记忆 <span style="color:var(--ice-blue)">${dialog.count}</span> 条`
+        + ` · 用户档案 <span style="color:var(--ice-blue)">${profile.count}</span> 个`;
+    }
+    if (!list) return;
+    if (!dialog.count && !profile.count) {
+      list.innerHTML = '<p style="color:var(--text-dim);font-size:13px;">暂无临时记忆</p>';
+      return;
+    }
+
+    let html = '';
+    if (profile.count) {
+      html += '<div style="font-size:13px;font-weight:600;color:var(--text-main);margin:14px 0 8px;">👤 用户档案</div>';
+      html += profile.items.map(p => {
+        const tags = (p.tags || []).map(t =>
+          `<span style="display:inline-block;padding:1px 7px;margin:2px 4px 2px 0;background:rgba(126,200,227,.12);border-radius:10px;font-size:11px;color:var(--ice-blue);">${escapeHtml(t)}</span>`).join('');
+        const facts = (p.facts || []).map(f =>
+          `<div style="font-size:12px;color:var(--text-dim);line-height:1.6;">· ${escapeHtml(f)}</div>`).join('');
+        return `
+        <div class="user-card" style="flex-direction:column;align-items:stretch;gap:6px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span style="font-size:13px;color:var(--ice-blue);font-weight:600;">${escapeHtml(p.name || ('UID ' + p.uid))}</span>
+            <span style="font-size:12px;color:var(--text-dim);">UID:${escapeHtml(p.uid)} · 互动 ${p.interactions} 次${p.updated ? ' · ' + escapeHtml(String(p.updated)) : ''}</span>
+          </div>
+          ${p.impression ? `<div style="font-size:13px;line-height:1.6;color:var(--text-main);">${escapeHtml(p.impression)}</div>` : ''}
+          ${tags ? `<div>${tags}</div>` : ''}
+          ${facts}
+        </div>`;
+      }).join('');
+    }
+    if (dialog.count) {
+      const perPage = 20;
+      const pages = Math.max(1, Math.ceil(dialog.items.length / perPage));
+      if (memPage > pages) memPage = pages;
+      const slice = dialog.items.slice((memPage - 1) * perPage, memPage * perPage);
+      html += '<div style="font-size:13px;font-weight:600;color:var(--text-main);margin:18px 0 8px;">💬 对话记忆</div>';
+      html += slice.map(m => `
+        <div class="user-card" style="flex-direction:column;align-items:stretch;gap:8px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span style="font-size:12px;color:var(--text-dim)">[${escapeHtml(m.time)}] UID:${escapeHtml(m.user_id)}${m.compressed ? ' · 压缩摘要' : ''}</span>
+            <span style="color:#e74c3c;cursor:pointer;font-size:12px;" onclick="deleteMemory('${escapeAttr(m.id)}')">删除</span>
+          </div>
+          <div style="font-size:13px;line-height:1.6;color:var(--text-main);">${escapeHtml(m.text)}</div>
+        </div>`).join('');
+      const pager = document.getElementById('tempMemPager');
+      if (pager) {
+        let btns = '';
+        if (memPage > 1) btns += `<button class="summary-btn" style="margin:0 4px" onclick="loadTempMemoryPage(${memPage-1})">上一页</button>`;
+        btns += `<span style="color:var(--text-dim);font-size:13px;margin:0 8px">${memPage}/${pages} (对话记忆共${dialog.count}条)</span>`;
+        if (memPage < pages) btns += `<button class="summary-btn" style="margin:0 4px" onclick="loadTempMemoryPage(${memPage+1})">下一页</button>`;
+        pager.innerHTML = btns;
+      }
+    } else {
+      const pager = document.getElementById('tempMemPager');
+      if (pager) pager.innerHTML = '';
+    }
+    list.innerHTML = html;
+  } catch(e) {
+    if (list) list.innerHTML = '<p style="color:var(--text-dim)">加载失败</p>';
+  }
+}
+function loadTempMemoryPage(p) { memPage = p; loadTempMemory(); }
+
+async function clearTempMemory() {
+  if (!confirm('确定清空「临时记忆」？\n\n会清掉：对话记忆（含压缩摘要）、用户档案。\n不会动：永久记忆、好感度、性格演化、视频缓存、当日心情。\n\n清空前每个文件都会自动备份。')) return;
+  const el = document.getElementById('tempClearResult');
+  try {
+    const resp = await apiFetch('/api/memory/temp/clear', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({confirm: true})
+    });
+    const data = await resp.json();
+    if (data.error) { if (el) { el.className='model-test-result fail'; el.textContent='✗ '+data.error; } toast(data.error, 'error'); return; }
+    if (el) { el.className='model-test-result ok'; el.textContent = '✓ ' + (data.msg || '已清空'); }
+    toast(data.msg || '已清空', 'success');
+    memPage = 1;
+    loadTempMemory();
+    loadMemStats();
+  } catch(e) {
+    if (el) { el.className='model-test-result fail'; el.textContent='✗ 清空失败'; }
+    toast('清空失败', 'error');
+  }
+}
+
+async function loadTempClearConfig() {
+  try {
+    const resp = await apiFetch('/api/memory/temp/status');
+    const data = await resp.json();
+    const plan = data.plan || {};
+    const cb = document.getElementById('tempAutoClear');
+    const tm = document.getElementById('tempClearTime');
+    const kd = document.getElementById('tempKeepDays');
+    if (cb) cb.checked = !!plan.enabled;
+    if (tm) tm.value = plan.time_str || '04:00';
+    if (kd) kd.value = (typeof plan.keep_days === 'number') ? plan.keep_days : 0;
+    const st = document.getElementById('tempClearStatus');
+    if (st) {
+      let html = plan.enabled
+        ? `状态：<span style="color:#4fd18b;">已启用</span> · 每天 ${plan.time_str} 自动清空`
+          + (plan.keep_days ? `（保留最近 ${plan.keep_days} 天）` : '（全清）')
+          + (plan.next_run ? ` · 下次 ${plan.next_run}` : '')
+        : '状态：<span style="color:var(--text-dim);">未启用</span>，临时记忆只会在你手动点击时清空';
+      if (data.last_clear) {
+        html += `<br>上次执行：${escapeHtml(data.last_clear)}` + (data.last_msg ? ` · ${escapeHtml(data.last_msg)}` : '');
+      }
+      st.innerHTML = html;
+    }
+  } catch(e) {}
+}
+
+async function saveTempClearConfig() {
+  const el = document.getElementById('tempConfigResult');
+  const enabled = document.getElementById('tempAutoClear').checked;
+  const timeVal = document.getElementById('tempClearTime').value || '04:00';
+  const parts = timeVal.split(':');
+  const body = {
+    enabled: enabled,
+    hour: parseInt(parts[0], 10) || 0,
+    minute: parseInt(parts[1], 10) || 0,
+    keep_days: parseInt(document.getElementById('tempKeepDays').value, 10) || 0
+  };
+  try {
+    const resp = await apiFetch('/api/memory/temp/config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    if (data.error) { if (el) { el.className='model-test-result fail'; el.textContent='✗ '+data.error; } toast(data.error, 'error'); return; }
+    if (el) { el.className='model-test-result ok'; el.textContent = '✓ ' + (data.msg || '已保存'); }
+    toast(data.msg || '已保存', 'success');
+    loadTempClearConfig();
+  } catch(e) {
+    if (el) { el.className='model-test-result fail'; el.textContent='✗ 保存失败'; }
+    toast('保存失败', 'error');
+  }
+}
+
+// ---- 长期记忆（只读概览 + 跳转分项清空）----
+const LONG_LABELS = {permanent: '永久记忆', affection: '好感度', video: '视频缓存', personality: '性格演化', mood: '当日心情'};
+async function loadLongMemory() {
+  const st = document.getElementById('longMemStats');
+  const list = document.getElementById('longMemList');
+  try {
+    const resp = await apiFetch('/api/memory/stats');
+    const data = await resp.json();
+    const counts = data.counts || {};
+    if (st) {
+      st.innerHTML = ['permanent', 'affection', 'video', 'personality', 'mood']
+        .map(k => `${LONG_LABELS[k]} <span style="color:var(--ice-blue)">${counts[k] || 0}</span>`)
+        .join(' · ')
+        + `<br>永久记忆上限 ${data.permanent_limit || 40} 条`;
+    }
+  } catch(e) {
+    if (st) st.textContent = '统计读取失败';
+  }
+  if (list) list.innerHTML = '';
+}
+
 async function loadMemory(page) {
   memPage = page || 1;
-  try {
-    const resp = await fetch('/api/memory/list?page=' + memPage);
-    const data = await resp.json();
-    const list = document.getElementById('memoryList');
-    if (!data.memories.length) { list.innerHTML = '<p style="color:var(--text-dim)">暂无记忆</p>'; return; }
-    list.innerHTML = data.memories.map(m => `
-      <div class="user-card" style="flex-direction:column;align-items:stretch;gap:8px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-          <span style="font-size:12px;color:var(--text-dim)">[${m.time}] UID:${m.user_id}</span>
-          <span style="color:#e74c3c;cursor:pointer;font-size:12px;" onclick="deleteMemory('${m.id}')">删除</span>
-        </div>
-        <div style="font-size:13px;line-height:1.6;color:var(--text-main);">${escapeHtml(m.text)}</div>
-      </div>`).join('');
-    const pager = document.getElementById('memoryPager');
-    let btns = '';
-    if (memPage > 1) btns += `<button class="summary-btn" style="margin:0 4px" onclick="loadMemory(${memPage-1})">上一页</button>`;
-    btns += `<span style="color:var(--text-dim);font-size:13px;margin:0 8px">${memPage}/${data.pages} (共${data.total}条)</span>`;
-    if (memPage < data.pages) btns += `<button class="summary-btn" style="margin:0 4px" onclick="loadMemory(${memPage+1})">下一页</button>`;
-    pager.innerHTML = btns;
-  } catch(e) { document.getElementById('memoryList').innerHTML = '<p style="color:var(--text-dim)">加载失败</p>'; }
+  return loadTempMemory();
 }
 
 async function deleteMemory(id) {
   if (!confirm('确定删除这条记忆？')) return;
-  try { await fetch('/api/memory/delete', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: id}) }); loadMemory(memPage); } catch(e) { toast('删除失败', 'error'); }
+  try {
+    await apiFetch('/api/memory/delete', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: id}) });
+    loadTempMemory();
+  } catch(e) { toast('删除失败', 'error'); }
 }
 
 // ===== 拉黑建议（自动拉黑已关闭，改为人工确认）=====
@@ -3684,6 +3930,9 @@ async function clearMemories(target) {
     toast(data.msg || '已清空', 'success');
     loadMemStats();
     if (isAll || target === 'permanent') loadPermanent();
+    // 记忆管理面板若已渲染，同步刷新它的两个页签 —— 否则用户从设置页清完
+    // 再切回「记忆管理」，看到的还是清空前的列表，会以为没生效。
+    if (document.getElementById('memPaneTemp')) loadMemTab();
   } catch(e) { toast('清空失败', 'error'); }
 }
 
@@ -4869,49 +5118,106 @@ async function testModel(type) {
 // ===== 对话模型池：多套 API/模型，一键切换 =====
 // 语义是「可选覆盖」：启用池中某条后，该条整体取代单套配置；
 // 未启用（active = -1）时行为与改造前一致。
+//
+// UI 形态：折叠式紧凑列表。
+// 改造前是「永远铺开 5 个空表单」—— 每个空位 4 个输入框，一进设置页就被 20 个
+// 空输入框糊满，真正已配置的条目反而找不到。现在默认只渲染一行摘要
+// （名称 + 模型 ID + 状态），点「编辑」才展开四个字段；空位折叠成一行占位。
+// 展开状态记在 expandedPool 里（内存态，不落盘），重渲染后保持。
 let modelPool = [];
 let modelPoolActive = -1;
+let expandedPool = {};
+
+function poolField(label, value, ph, idx, field, isPwd) {
+  return `<label style="display:block;font-size:11px;color:var(--text-dim);margin-bottom:3px;">${label}</label>
+    <input type="${isPwd ? 'password' : 'text'}" value="${escapeAttr(value)}" placeholder="${escapeAttr(ph)}"
+           oninput="modelPool[${idx}].${field}=this.value"
+           style="width:100%;font-size:13px;${isPwd ? 'margin-bottom:0;' : ''}">`;
+}
+
+function poolRow(it, i) {
+  const on = i === modelPoolActive;
+  const empty = !it.name && !it.model && !it.url && !it.key && !it.fallback;
+  const open = !!expandedPool[i];
+
+  // 空槽位：折叠成一行，避免视觉噪音
+  if (empty && !open) {
+    return `
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;margin-bottom:5px;
+                border:1px dashed rgba(255,255,255,.14);border-radius:7px;">
+      <span style="flex:1;font-size:12px;color:var(--text-dim);">未配置的空位 ${i + 1}</span>
+      <button class="settings-btn small" onclick="expandPoolSlot(${i})">配置</button>
+    </div>`;
+  }
+
+  const statusChip = on
+    ? `<span style="font-size:11px;padding:1px 7px;border-radius:9px;background:rgba(120,220,160,.16);color:#4fd18b;">使用中</span>`
+    : '';
+
+  return `
+  <div style="border:1px solid ${on ? 'rgba(120,220,160,.5)' : 'rgba(255,255,255,.12)'};
+              border-radius:8px;margin-bottom:6px;
+              background:${on ? 'rgba(120,220,160,.06)' : 'transparent'};">
+    ${open ? `
+      <div style="display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.08);">
+        <input type="text" value="${escapeAttr(it.name)}" placeholder="配置名（如 主号-OpenRouter）"
+               oninput="modelPool[${i}].name=this.value" style="flex:1;font-size:13px;">
+        ${statusChip}
+        <button class="settings-btn small" onclick="collapsePoolSlot(${i})">收起</button>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px;">
+        <div>${poolField('模型 ID（必填）', it.model, 'anthropic/claude-sonnet-4-5', i, 'model', false)}</div>
+        <div>${poolField('回退模型（选填）', it.fallback, 'google/gemini-3-flash-preview', i, 'fallback', false)}</div>
+        <div>${poolField('Base URL（留空=用全局）', it.url, 'https://...', i, 'url', false)}</div>
+        <div>${poolField(it.has_key ? 'API Key（留空=保持原 Key）' : 'API Key（留空=用全局）', it.key, 'sk-...', i, 'key', true)}</div>
+      </div>
+      <div style="display:flex;gap:8px;padding:0 10px 10px;flex-wrap:wrap;">
+        <button class="settings-btn small" style="${on ? 'background:#2f7d4f;color:#fff;' : ''}"
+                onclick="activatePool(${i})">${on ? '✓ 使用中' : '启用这条'}</button>
+        <button class="settings-btn small" style="background:#8b2f2f;" onclick="removePoolSlot(${i})">删除</button>
+      </div>
+    ` : `
+      <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;flex-wrap:wrap;">
+        <span style="font-size:13px;color:var(--text-main);font-weight:600;">${escapeHtml(it.name || '未命名配置')}</span>
+        ${statusChip}
+        <span style="font-size:12px;color:var(--text-dim);flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+          ${escapeHtml(it.model || '未填模型 ID')}${it.fallback ? ' · 回退 ' + escapeHtml(it.fallback) : ''}${it.has_key ? ' · 已设 Key' : ''}
+        </span>
+        <button class="settings-btn small" style="${on ? 'background:#2f7d4f;color:#fff;' : ''}"
+                onclick="activatePool(${i})">${on ? '✓ 使用中' : '启用'}</button>
+        <button class="settings-btn small" onclick="expandPoolSlot(${i})">编辑</button>
+        <button class="settings-btn small" onclick="removePoolSlot(${i})">删除</button>
+      </div>
+    `}
+  </div>`;
+}
 
 async function loadModelPool() {
   const box = document.getElementById('modelPoolList');
   const st = document.getElementById('modelPoolStatus');
   if (!box) return;
-  if (!modelPool.length) { modelPool = [blankSlot(), blankSlot(), blankSlot(), blankSlot(), blankSlot()]; }
-  box.innerHTML = modelPool.map((it, i) => {
-    const on = i === modelPoolActive;
-    return `
-    <div style="border:1px solid ${on ? 'rgba(120,220,160,.55)' : 'rgba(255,255,255,.12)'};
-                border-radius:8px;padding:10px;margin-bottom:8px;
-                background:${on ? 'rgba(120,220,160,.08)' : 'transparent'};">
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
-        <input type="text" value="${escapeAttr(it.name)}" placeholder="配置名（如 主号-OpenRouter）"
-               oninput="modelPool[${i}].name=this.value"
-               style="flex:1;font-size:13px;">
-        <button class="settings-btn small" style="${on ? 'background:#2f7d4f;' : ''}"
-                onclick="activatePool(${i})">${on ? '✓ 使用中' : '启用'}</button>
-        <button class="settings-btn small" onclick="removePoolSlot(${i})">删除</button>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
-        <input type="text" value="${escapeAttr(it.model)}" placeholder="模型 ID（必填）"
-               oninput="modelPool[${i}].model=this.value" style="font-size:13px;">
-        <input type="text" value="${escapeAttr(it.fallback)}" placeholder="回退模型（选填）"
-               oninput="modelPool[${i}].fallback=this.value" style="font-size:13px;">
-        <input type="text" value="${escapeAttr(it.url)}" placeholder="Base URL（留空=用全局）"
-               oninput="modelPool[${i}].url=this.value" style="font-size:13px;">
-        <input type="password" value="${escapeAttr(it.key)}" placeholder="${it.has_key ? '留空=保持原 Key' : 'API Key（留空=用全局）'}"
-               oninput="modelPool[${i}].key=this.value" style="font-size:13px;">
-      </div>
-    </div>`;
-  }).join('');
+  // 补足空位：只在真的没有空位时才补，否则每渲染一次就多一个空槽。
+  // 保留「至少 5 个位置」的产品要求，但空位现在是折叠的，不再占地方。
+  const configured = modelPool.filter(it => it.name || it.model || it.url || it.key || it.fallback).length;
+  let blanks = modelPool.filter(it => !it.name && !it.model && !it.url && !it.key && !it.fallback).length;
+  while (modelPool.length < 5 || blanks < 1) { modelPool.push(blankSlot()); blanks++; }
+
+  box.innerHTML = modelPool.map((it, i) => poolRow(it, i)).join('');
+
   if (st) {
     if (modelPoolActive >= 0 && modelPool[modelPoolActive]) {
-      st.innerHTML = `<span style="color:#4fd18b;">✓ 当前生效：${escapeHtml(modelPool[modelPoolActive].name || '未命名')}`
-        + `${modelPool[modelPoolActive].model ? '（' + escapeHtml(modelPool[modelPoolActive].model) + '）' : ''}</span>`;
+      const a = modelPool[modelPoolActive];
+      st.innerHTML = `<span style="color:#4fd18b;">✓ 当前生效：${escapeHtml(a.name || '未命名')}`
+        + `${a.model ? '（' + escapeHtml(a.model) + '）' : ''}</span>`;
     } else {
       st.innerHTML = '<span style="color:var(--text-dim);">当前未启用池，使用下方单套配置</span>';
     }
+    st.innerHTML += ` <span style="color:var(--text-dim);">· 已配置 ${configured} 条</span>`;
   }
 }
+
+function expandPoolSlot(i) { expandedPool[i] = true; loadModelPool(); }
+function collapsePoolSlot(i) { expandedPool[i] = false; loadModelPool(); }
 
 function blankSlot() { return {name: '', url: '', key: '', model: '', fallback: '', has_key: false}; }
 
@@ -4926,16 +5232,23 @@ async function fetchModelPool() {
     // 少于 5 个时补足空位 —— 用户要求「至少能填 5 个」
     while (modelPool.length < 5) modelPool.push(blankSlot());
   } catch(e) { toast('模型池读取失败', 'error'); }
+  expandedPool = {};
   loadModelPool();
 }
 
-function addPoolSlot() { modelPool.push(blankSlot()); loadModelPool(); }
+function addPoolSlot() {
+  const idx = modelPool.length;
+  modelPool.push(blankSlot());
+  expandedPool[idx] = true;  // 新增即展开，省得用户还要再点一次「配置」
+  loadModelPool();
+}
 
 function removePoolSlot(i) {
   if (!confirm(`删除「${modelPool[i].name || '配置 ' + (i+1)}」？`)) return;
   modelPool.splice(i, 1);
   if (modelPoolActive === i) modelPoolActive = -1;
   else if (modelPoolActive > i) modelPoolActive -= 1;
+  expandedPool = {};  // 下标整体前移，旧的展开态会串位，直接清掉重来
   loadModelPool();
 }
 
@@ -4957,7 +5270,18 @@ async function saveModelPool() {
 // 一键切换：只需改激活下标，Bot 侧每次读盘即刻生效，无需重启
 async function activatePool(i) {
   const el = document.getElementById('pool-result');
+  // 未保存的改动先落盘，否则「启用」后刷新页面改动就丢了 —— 这是最容易踩的坑：
+  // 用户在展开的卡片里填好模型 ID，直接点「启用」，改的内容还没写进 config.json。
+  const dirty = modelPool.some(it => it.name || it.model || it.url || it.key || it.fallback);
   try {
+    if (dirty) {
+      const saveResp = await apiFetch('/api/models/pool/save', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({items: modelPool, active: modelPoolActive})
+      });
+      const saveData = await saveResp.json();
+      if (saveData.error) { if (el) { el.className='model-test-result fail'; el.textContent='✗ '+saveData.error; } toast(saveData.error,'error'); return; }
+    }
     const resp = await apiFetch('/api/models/pool/activate', {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({index: i})
     });
@@ -4966,7 +5290,7 @@ async function activatePool(i) {
     modelPoolActive = data.active;
     if (el) { el.className='model-test-result ok'; el.textContent = '✓ ' + (data.msg || '已切换'); }
     toast(data.msg || '已切换', 'success');
-    loadModelPool();
+    await fetchModelPool();
   } catch(e) { toast('切换失败', 'error'); }
 }
 

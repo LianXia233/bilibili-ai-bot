@@ -1829,6 +1829,126 @@ def memory_stats():
                     "permanent_limit": PERMANENT_MEMORY_LIMIT,
                     "total": sum(counts.values())})
 
+# ========== 临时记忆（对话记忆 + 用户档案）==========
+# 分界依据用户定义：临时 = 会随时间自然堆积、清掉只是「忘掉聊过什么」；
+# 长期 = 永久记忆/好感度/性格演化等，清掉会改变 Bot 的自我认知或关系定位。
+# 文件清单不在这里写死，统一从 config.TEMP_MEMORY_FILES 取 ——
+# 面板与 Bot 侧共用一份，避免「面板清了两份、Bot 清了三份」的口径漂移。
+@app.route("/api/memory/temp/list", methods=["GET"])
+def temp_memory_list():
+    """列出临时记忆的明细，供面板「临时记忆」页签查看。"""
+    from config import TEMP_MEMORY_FILES
+    out = {}
+    for name, path, empty, label in TEMP_MEMORY_FILES:
+        data = load_json(path, empty)
+        if isinstance(data, list):
+            items = []
+            for m in data:
+                if not isinstance(m, dict):
+                    continue
+                items.append({
+                    "id": m.get("rpid", ""),
+                    "user_id": m.get("user_id", ""),
+                    "time": m.get("time", ""),
+                    "text": m.get("text", ""),
+                    "compressed": str(m.get("thread_id", "")) == "compressed",
+                })
+            items.sort(key=lambda x: x.get("time", ""), reverse=True)
+            out[name] = {"label": label, "kind": "list", "count": len(items), "items": items}
+        else:
+            # 用户档案是 {uid: {...}}，转成列表并按最后更新排序
+            entries = []
+            for uid, prof in (data or {}).items():
+                if not isinstance(prof, dict):
+                    continue
+                entries.append({
+                    "uid": str(uid),
+                    "name": prof.get("name", ""),
+                    "impression": prof.get("impression", ""),
+                    "tags": prof.get("tags", []) or [],
+                    "facts": prof.get("user_facts", []) or [],
+                    "interactions": prof.get("interaction_count", 0),
+                    "updated": prof.get("last_update", "") or prof.get("updated", ""),
+                })
+            entries.sort(key=lambda x: str(x.get("updated", "")), reverse=True)
+            out[name] = {"label": label, "kind": "profile", "count": len(entries), "items": entries}
+    return jsonify({"groups": out})
+
+@app.route("/api/memory/temp/clear", methods=["POST"])
+def temp_memory_clear():
+    """一键清空临时记忆（对话记忆 + 用户档案）。
+
+    与 /api/memory/clear_all 的区别：那个是「按文件点单」的通用入口，
+    这个是语义化的「清临时」，且**永久记忆、好感度、性格演化永不受影响**。
+    面板上给一个显眼的按钮，用户不必记住哪几项算临时。
+    """
+    from config import clear_temp_memory
+    data = request.json or {}
+    if not data.get("confirm"):
+        return jsonify({"error": "需要确认参数 confirm=true"}), 400
+    try:
+        keep_days = int(data.get("keep_days", 0) or 0)
+    except (TypeError, ValueError):
+        keep_days = 0
+    ok, msg, cleared = clear_temp_memory(keep_days=keep_days, backup=True, tag="panelclear")
+    if not ok:
+        return jsonify({"ok": True, "msg": "暂时没有可清空的临时记忆", "cleared": []})
+    return jsonify({"ok": True, "msg": msg, "cleared": cleared})
+
+@app.route("/api/memory/temp/config", methods=["GET", "POST"])
+def temp_memory_config():
+    """读写「临时记忆定时清空」配置。
+
+    GET 返回当前配置与下次执行时间；POST 保存开关/时刻/保留天数。
+    """
+    from config import get_temp_clear_plan, update_config
+    if request.method == "GET":
+        return jsonify(get_temp_clear_plan())
+
+    data = request.json or {}
+    updates = {}
+    if "enabled" in data:
+        updates["TEMP_MEMORY_AUTO_CLEAR"] = bool(data.get("enabled"))
+    if "hour" in data:
+        try:
+            updates["TEMP_MEMORY_CLEAR_HOUR"] = min(23, max(0, int(data.get("hour"))))
+        except (TypeError, ValueError):
+            return jsonify({"error": "hour 必须是 0-23 的整数"}), 400
+    if "minute" in data:
+        try:
+            updates["TEMP_MEMORY_CLEAR_MINUTE"] = min(59, max(0, int(data.get("minute"))))
+        except (TypeError, ValueError):
+            return jsonify({"error": "minute 必须是 0-59 的整数"}), 400
+    if "keep_days" in data:
+        try:
+            updates["TEMP_MEMORY_KEEP_DAYS"] = max(0, int(data.get("keep_days")))
+        except (TypeError, ValueError):
+            return jsonify({"error": "keep_days 必须是非负整数"}), 400
+    if not updates:
+        return jsonify({"error": "没有可保存的字段"}), 400
+    update_config(updates)
+    plan = get_temp_clear_plan()
+    msg = (f"已保存：每天 {plan['time_str']} 自动清空临时记忆"
+           if plan["enabled"] else "已关闭定时清空")
+    if plan["enabled"] and plan["keep_days"]:
+        msg += f"，保留最近 {plan['keep_days']} 天"
+    return jsonify({"ok": True, "msg": msg, "plan": plan})
+
+@app.route("/api/memory/temp/status", methods=["GET"])
+def temp_memory_status():
+    """定时清空的执行状态：上次何时清的、清了多少。
+
+    只读 ai.py 写的状态文件。面板进程无法得知 Bot 进程内存态，
+    这个文件是两侧唯一的交接点，也是用户排查「到底清了没有」的唯一依据。
+    """
+    state = load_json("data/temp_clear_state.json", {})
+    from config import get_temp_clear_plan
+    return jsonify({
+        "last_clear": state.get("last_clear", ""),
+        "last_msg": state.get("last_msg", ""),
+        "plan": get_temp_clear_plan(),
+    })
+
 @app.route("/api/personas/reset", methods=["POST"])
 def api_reset_persona():
     """重置为默认人设，清空所有自定义数据"""

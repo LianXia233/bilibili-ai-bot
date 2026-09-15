@@ -192,6 +192,20 @@ _DEFAULTS = {
     "RATE_LIMIT_SEARCH_TPM": 1000000,
     "RATE_LIMIT_VISION_TPM": 0,
     "RATE_LIMIT_IMAGE_TPM": 0,
+
+    # ===== 临时记忆的每日定时清空 =====
+    # 「临时记忆」= 对话记忆（memory.json，含压缩摘要）+ 用户档案（user_profiles.json），
+    # 也就是「Bot 记得跟我聊过什么、对我有什么印象」这一类会随时间不断堆积的内容。
+    # 永久记忆（人格规则）、好感度、性格演化不在此列 —— 那些是长期资产，清掉等于回滚人格。
+    #
+    # 为什么要有定时清空：对话记忆与用户档案是持续增长的，长期不清理会带来两个问题：
+    # 一是语义检索时旧记忆与新记忆混在一起，模型容易拿半年前的印象回答今天的话；
+    # 二是 memory.json 越滚越大，每轮读盘 + embedding 比对的成本随之上升。
+    # 交给面板配一个每天的低峰时间自动清，比人工记得来点更可靠。
+    "TEMP_MEMORY_AUTO_CLEAR": False,   # 总开关，默认关闭（与 ENABLE_SLEEP 同理，不擅自改变现状）
+    "TEMP_MEMORY_CLEAR_HOUR": 4,       # 每天几点清（0-23）
+    "TEMP_MEMORY_CLEAR_MINUTE": 0,     # 几分清（0-59）
+    "TEMP_MEMORY_KEEP_DAYS": 0,        # 保留最近 N 天的记录，0 = 全清（不清空更早的语义）
 }
 
 # ========== 加载/保存 ==========
@@ -843,3 +857,156 @@ def refresh_bili_cookie():
 
     except Exception as e:
         return False, f"刷新出错: {e}"
+
+# ========== 临时记忆：分类与清空（面板与 Bot 共用的单一实现） ==========
+# 为什么收敛到这里：面板（local-chat.py）要提供「一键清空临时记忆」按钮，
+# Bot（ai.py）要按计划每日清空，二者清的东西必须完全一致。
+# 各写一套文件清单是最典型的漂移源 —— 面板清了两份、Bot 清了三份，
+# 用户看到「清空了但 Bot 还记得」却查不出原因。
+#
+# 临时 vs 长期的分界（用户定义）：
+#   临时 = 对话记忆（memory.json）+ 用户档案（user_profiles.json）
+#          —— 随时间自然堆积、清掉只是「忘掉聊过什么」，不影响人格
+#   长期 = 永久记忆（人工规则）、好感度、性格演化、视频缓存、当日心情
+#          —— 清掉会改变 Bot 的自我认知或主人的关系定位，不在自动清理范围
+TEMP_MEMORY_FILES = (
+    ("dialog",  "data/memory.json",         [], "对话记忆"),
+    ("profile", "data/user_profiles.json",  {}, "用户档案"),
+)
+
+# 长期记忆的清单（供面板展示与「全部清空」使用，定时任务永不触碰）
+LONG_MEMORY_FILES = (
+    ("permanent",   "data/permanent_memory.json",       [], "永久记忆"),
+    ("affection",   "data/affection.json",             {}, "好感度"),
+    ("video",       "data/video_memory.json",          {}, "视频分析缓存"),
+    ("personality", "data/personality_evolution.json",  {}, "性格演化"),
+    ("mood",        "data/mood.json",                   {}, "当日心情"),
+)
+
+def _load_json_safe(path, empty):
+    """读取 JSON，缺失或损坏时返回初值。"""
+    import json as _json
+    if not os.path.exists(path):
+        return empty
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except Exception:
+        return empty
+
+def _save_json_safe(path, value):
+    """原子写 JSON：先写 .tmp 再替换，避免清空到一半进程被杀导致文件半截。"""
+    import json as _json
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(value, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def _prune_old_records(records, keep_days):
+    """按保留天数裁剪记录列表（只对含 time 字段的列表生效）。
+
+    keep_days <= 0 表示全清 —— 这是默认值，语义上等于「临时记忆就该每天归零」。
+    设为正数时保留最近 N 天：需要「Bot 有短期记忆但别无限堆积」的场景。
+    时间解析失败的单条记录按「保留」处理：宁可多留一条，也不因格式异常误删。
+    """
+    if not isinstance(records, list):
+        return records
+    if not keep_days or keep_days <= 0:
+        return []
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = _dt.now() - _td(days=int(keep_days))
+    kept = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        ts = str(r.get("time", "") or "").strip()
+        if not ts:
+            kept.append(r)
+            continue
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                parsed = _dt.strptime(ts[:len(fmt) + 2].strip(), fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None or parsed >= cutoff:
+            kept.append(r)
+    return kept
+
+def clear_temp_memory(keep_days=0, backup=True, tag="tempclear"):
+    """清空临时记忆。返回 (是否成功, 摘要文本, 明细列表)。
+
+    backup=True 时每个文件先落一份带时间戳的 .bak 再清 —— 定时任务同样要备份：
+    「反正有备份」是用户在误清后唯一的回退手段，不能因为是自动执行就省掉。
+    """
+    from datetime import datetime as _dt
+    cleared = []
+    for name, path, empty, label in TEMP_MEMORY_FILES:
+        before = _load_json_safe(path, empty)
+        count = len(before) if isinstance(before, (list, dict)) else 0
+        if backup and count:
+            try:
+                stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
+                if os.path.exists(path):
+                    with open(path, "rb") as src:
+                        data = src.read()
+                    with open(f"{path}.{tag}-{stamp}.bak", "wb") as dst:
+                        dst.write(data)
+            except Exception as e:
+                print(f"⚠️ 临时记忆备份失败（{label}）：{e}")
+        if isinstance(before, list):
+            after = _prune_old_records(before, keep_days)
+            if after == before:
+                kept = 0
+            else:
+                kept = len(after)
+        else:
+            after = {} if not keep_days else before
+            kept = len(after) if isinstance(after, dict) else 0
+        _save_json_safe(path, after)
+        cleared.append({"target": name, "label": label, "removed": count, "kept": kept})
+    if not cleared:
+        return False, "无可清空项", []
+    msg = "；".join(
+        f"{c['label']} 清除 {c['removed']} 条" + (f"（保留 {c['kept']} 条）" if c.get("kept") else "")
+        for c in cleared
+    )
+    return True, msg, cleared
+
+def get_temp_clear_plan():
+    """读取定时清空配置，返回给面板用的结构（含下次执行时间）。"""
+    cfg = get_raw_config()
+    try:
+        hour = int(cfg.get("TEMP_MEMORY_CLEAR_HOUR", 4))
+    except (TypeError, ValueError):
+        hour = 4
+    try:
+        minute = int(cfg.get("TEMP_MEMORY_CLEAR_MINUTE", 0))
+    except (TypeError, ValueError):
+        minute = 0
+    hour = min(23, max(0, hour))
+    minute = min(59, max(0, minute))
+    try:
+        keep_days = int(cfg.get("TEMP_MEMORY_KEEP_DAYS", 0))
+    except (TypeError, ValueError):
+        keep_days = 0
+    keep_days = max(0, keep_days)
+    enabled = bool(cfg.get("TEMP_MEMORY_AUTO_CLEAR", False))
+
+    # 下次执行时间：今天该时刻若已过，顺延到明天。
+    from datetime import datetime as _dt, timedelta as _td
+    now = _dt.now()
+    today_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    nxt = today_at if today_at > now else today_at + _td(days=1)
+    return {
+        "enabled": enabled,
+        "hour": hour,
+        "minute": minute,
+        "keep_days": keep_days,
+        "next_run": nxt.strftime("%Y-%m-%d %H:%M") if enabled else "",
+        "time_str": f"{hour:02d}:{minute:02d}",
+    }
