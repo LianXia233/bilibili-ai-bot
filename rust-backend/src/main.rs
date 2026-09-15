@@ -74,7 +74,7 @@ fn main() {
         }
     };
     let config = Arc::new(RwLock::new(cfg));
-    tracing::info!("📂 数据目录: {base_dir}");
+    tracing::info!("数据目录: {base_dir}");
 
     // 客户端
     let bili = Arc::new(bili_api::BiliClient::new(config.clone()));
@@ -98,7 +98,7 @@ fn main() {
         if run_web {
             let seal = web::load_seal_key(&base_dir);
             if seal.is_some() {
-                tracing::info!("🔐 RSA 口令密封密钥已就绪（data/.seal_key.pem）");
+                tracing::info!("RSA 口令密封密钥已就绪（data/.seal_key.pem）");
             }
             let secret = web::load_secret_key(&base_dir);
             let ctx = Arc::new(web::WebCtx {
