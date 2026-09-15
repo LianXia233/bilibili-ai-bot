@@ -65,7 +65,8 @@ pub async fn run_once(bot: &Arc<Bot>) -> Result<()> {
 async fn generate_dynamic_content(bot: &Bot) -> Option<String> {
     let cfg = bot.config.read().unwrap().clone();
     let bot_name = cfg.get_str("BOT_NAME");
-    let custom = cfg.get_str("PROMPT_DYNAMIC_CONTENT");
+    // 与 Python dynamic.py / WebUI 面板键名对齐（PROMPT_DYNAMIC），面板上配置的自定义文案才能真正生效
+    let custom = cfg.get_str("PROMPT_DYNAMIC");
     let prompt = if custom.is_empty() {
         format!(
             "你是{bot_name}，一个有独立人格的B站UP主。请写一条今天想发的动态（40-120字），自然口语化，有个人想法，不要营销腔。直接输出内容。"

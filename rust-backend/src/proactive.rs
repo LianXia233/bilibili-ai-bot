@@ -194,11 +194,16 @@ async fn download_video(bot: &Bot, bvid: &str) -> Option<PathBuf> {
     std::fs::create_dir_all(out.parent()?).ok()?;
     let out_str = out.to_str()?.to_string();
     let url = format!("https://www.bilibili.com/video/{bvid}");
-    let status = Command::new("yt-dlp")
-        .args(["-f", "mp4", "--cookies", cookies.to_str()?, "-o", &out_str, "-q", &url])
-        .status()
-        .await
-        .ok()?;
+    // 5 分钟超时 + kill_on_drop，防止 yt-dlp 卡死泄漏子进程
+    let mut cmd = Command::new("yt-dlp");
+    cmd.kill_on_drop(true);
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        cmd.args(["-f", "mp4", "--cookies", cookies.to_str()?, "-o", &out_str, "-q", &url]).status(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if status.success() && out.exists() {
         Some(out)
     } else {
@@ -213,11 +218,16 @@ async fn extract_frames(_bot: &Bot, video: &PathBuf) -> Option<Vec<PathBuf>> {
     let counts = [3usize, 8, 14];
     for &sec in &counts {
         let frame = dir.join(format!("f{sec}.jpg"));
-        let status = Command::new("ffmpeg")
-            .args(["-y", "-ss", &sec.to_string(), "-i", video.to_str()?, "-frames:v", "1", "-q:v", "2", frame.to_str()?])
-            .status()
-            .await
-            .ok()?;
+        // 60 秒超时 + kill_on_drop，防止 ffmpeg 卡死泄漏子进程
+        let mut cmd = Command::new("ffmpeg");
+        cmd.kill_on_drop(true);
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            cmd.args(["-y", "-ss", &sec.to_string(), "-i", video.to_str()?, "-frames:v", "1", "-q:v", "2", frame.to_str()?]).status(),
+        )
+        .await
+        .ok()?
+        .ok()?;
         if status.success() && frame.exists() {
             frames.push(frame);
         }

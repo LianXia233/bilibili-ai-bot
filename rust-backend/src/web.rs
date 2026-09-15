@@ -74,7 +74,8 @@ fn verify_session(ctx: &WebCtx, cookie: Option<&str>) -> bool {
     let Some(cookie) = cookie else { return false };
     let Some((b64, sig)) = cookie.rsplit_once('.') else { return false };
     let expect = hmac_sha256_hex(ctx.secret_key.as_bytes(), b64.as_bytes());
-    if sig != expect {
+    // 常量时间比较，避免通过时序差异探测签名
+    if !constant_time_eq(sig, &expect) {
         return false;
     }
     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
@@ -102,6 +103,18 @@ fn cookie_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
                 .find_map(|kv| kv.trim().strip_prefix(&format!("{COOKIE_NAME}=")))
                 .map(|s| s.to_string())
         })
+}
+
+/// 常量时间字符串比较（防止签名校验的时序侧信道）。
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn auth_middleware(
@@ -149,7 +162,7 @@ async fn api_login(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> R
         let cookie = session_cookie(&ctx, true);
         let mut resp = Json(json!({"ok": true, "channel": channel})).into_response();
         if let Ok(v) = HeaderValue::from_str(&format!(
-            "{COOKIE_NAME}={cookie}; Path=/; HttpOnly; Max-Age={}",
+            "{COOKIE_NAME}={cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
             30 * 24 * 3600
         )) {
             resp.headers_mut().insert(header::SET_COOKIE, v);
@@ -342,20 +355,31 @@ async fn api_chat(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Re
     } else {
         json!({"role": "user", "content": user_msg, "image": image_filename})
     };
-    // 图片以 base64 内联（本地图已存 data/images）
+    // 组装 LLM 消息：图片 + 文本合并为单条 content 数组（与 Python _generate_reply 对齐）；
+    // 图片缺失/不可读时降级为纯文本，绝不丢掉用户文字消息。
+    let mut content: Vec<Value> = Vec::new();
     if !image_filename.is_empty() {
         let img_path = ctx.path("images").join(&image_filename);
-        if let Ok(bytes) = std::fs::read(&img_path) {
-            let mime = "image/jpeg";
-            llm_messages.push(json!({
-                "role": "user",
-                "content": [{"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{}", crate::util::b64_encode(&bytes))}}]
-            }));
-            user_entry["content"] = json!(user_msg);
+        match std::fs::read(&img_path) {
+            Ok(bytes) => {
+                let mime = image_mime(&image_filename);
+                content.push(json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:{mime};base64,{}", crate::util::b64_encode(&bytes))}
+                }));
+            }
+            Err(_) => {
+                tracing::warn!("图片不存在或不可读，降级为纯文本消息: {image_filename}");
+            }
         }
-    } else {
-        llm_messages.push(user_entry.clone());
     }
+    if !user_msg.is_empty() {
+        content.push(json!({"type": "text", "text": user_msg}));
+    }
+    if content.is_empty() {
+        content.push(json!({"type": "text", "text": "（发送了一张图片）"}));
+    }
+    llm_messages.push(json!({"role": "user", "content": Value::Array(content)}));
 
     let max_tokens = cfg.max_tokens_of("chat");
     match ctx.llm.complete("chat", json!(llm_messages), max_tokens).await {
@@ -1006,10 +1030,13 @@ async fn generate_chat_reply(ctx: &WebCtx, user_msg: &str, image_filename: &str,
     if !image_filename.is_empty() {
         let img_path = ctx.path("images").join(image_filename);
         if let Ok(bytes) = std::fs::read(&img_path) {
+            let mime = image_mime(image_filename);
             llm_messages.push(json!({
                 "role": "user",
-                "content": [{"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{}", crate::util::b64_encode(&bytes))}}]
+                "content": [{"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{}", crate::util::b64_encode(&bytes))}}]
             }));
+        } else {
+            tracing::warn!("图片不存在或不可读，降级为纯文本消息: {image_filename}");
         }
     }
     llm_messages.push(json!({"role": "user", "content": user_msg}));
@@ -1031,6 +1058,10 @@ async fn api_cost_add(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -
     }
     let today = crate::util::today_str();
     let mut logs: Value = load_json(&ctx.path("cost_log.json"), json!({}));
+    // 账本文件损坏为非对象时兜底为 {}，避免 as_object_mut().unwrap() 触发 500
+    if !logs.is_object() {
+        logs = json!({});
+    }
     let entry = logs
         .as_object_mut()
         .map(|obj| obj.entry(today).or_insert(json!({"total": 0.0, "calls": 0, "input_tokens": 0, "output_tokens": 0})))
@@ -1144,9 +1175,18 @@ async fn api_personas_switch(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Va
 
 // ---------- 图片上传 ----------
 async fn api_upload_image(State(ctx): State<Arc<WebCtx>>, mut multipart: Multipart) -> Response {
+    const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
     let img_dir = ctx.path("images");
     std::fs::create_dir_all(&img_dir).ok();
-    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!("multipart 解析失败: {e}");
+                break;
+            }
+        };
         let name = field.file_name().unwrap_or("upload.jpg").to_string();
         let ext = name.rsplit('.').next().unwrap_or("jpg").to_lowercase();
         if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
@@ -1156,7 +1196,14 @@ async fn api_upload_image(State(ctx): State<Arc<WebCtx>>, mut multipart: Multipa
             Ok(d) => d,
             Err(_) => continue,
         };
-        let fname = format!("{}.{}", crate::util::now_unix(), ext);
+        if data.is_empty() {
+            continue;
+        }
+        if data.len() > MAX_UPLOAD_BYTES {
+            return json_resp(StatusCode::PAYLOAD_TOO_LARGE, json!({"error": "图片超过 10MB 上限"}));
+        }
+        // 时间戳 + 随机后缀，避免同一秒内两次上传互相覆盖
+        let fname = format!("{}_{}.{}", crate::util::now_unix(), crate::util::gen_token().chars().take(6).collect::<String>(), ext);
         let target = img_dir.join(&fname);
         if std::fs::write(&target, &data).is_ok() {
             return Json(json!({"ok": true, "filename": fname, "url": format!("/data/images/{fname}")})).into_response();
@@ -1189,6 +1236,16 @@ async fn serve_image(State(ctx): State<Arc<WebCtx>>, AxumPath(name): AxumPath<St
 
 async fn api_health() -> Response {
     Json(json!({"ok": true, "name": "bilibili-ai-bot-rs", "time": now_str()})).into_response()
+}
+
+/// 按扩展名推断图片 MIME（与 Python get_image_media_type 对齐）。
+fn image_mime(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    }
 }
 
 fn serve_file(ctx: &WebCtx, rel: &str) -> Response {
@@ -1323,6 +1380,9 @@ pub fn load_secret_key(base_dir: &str) -> String {
 
 /// 启动 Web 服务（0.0.0.0:port）。
 pub async fn serve(ctx: Arc<WebCtx>, port: u16) {
+    if ctx.auth_password() == DEFAULT_AUTH_PASSWORD {
+        tracing::warn!("面板正在使用默认口令，请尽快通过环境变量 CHAT_PASSWORD 或配置项 CHAT_PASSWORD 修改（默认口令不可用于公网部署）");
+    }
     let app = build_router(ctx);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = match tokio::net::TcpListener::bind(addr).await {

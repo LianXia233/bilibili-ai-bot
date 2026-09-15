@@ -22,6 +22,10 @@ __pycache__/
 venv/
 env/
 
+# ===== Rust =====
+rust-backend/target/
+target/
+
 # ===== 备份与临时产物 =====
 *.bak
 *.bak.*

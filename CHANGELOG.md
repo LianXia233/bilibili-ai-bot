@@ -54,6 +54,35 @@
 | 2026-09-14 | `feat(ui)` | WebUI 改用 PaperGrid / schale 设计语言 | 界面 |
 | 2026-09-14 | `chore` | 行尾规范与忽略规则 | 工程 |
 | 2026-09-14 | `docs` | 修复记录与部署注意事项 | 文档 |
+| 2026-09-16 | `fix(rust-backend)` | 修复 `cargo check` 无法通过：`check_cookie` 括号语法错误（整仓不可编译） | 故障修复 |
+| 2026-09-16 | `fix(panel)` | 面板带图聊天丢消息：图片+文字时文字不进模型，图片缺失时整条用户消息丢失 | 故障修复 |
+| 2026-09-16 | `fix(bot)` | 动态自定义文案键名错位：面板 `PROMPT_DYNAMIC` 配置不生效 | 故障修复 |
+| 2026-09-16 | `fix(bot)` | 私信 `sender_uid` 为数字时解析为空，存在「对自己消息自我回复」风险 | 故障修复 |
+| 2026-09-16 | `security(panel)` | 面板加固：Cookie 加 SameSite、签名常量时间比较、默认口令启动告警、上传限流、子进程超时 | 安全加固 |
+
+### fix(rust-backend) — rust-backend 全量代码审计与修复（8 项）
+
+对 `rust-backend`（Rust 重构版）做全量审查 + 修复。审查以「能否编译、能否按 Python 参考语义运行」为基线，全部修复已通过 `cargo check` / `cargo build` / 启动冒烟测试。
+
+| # | 级别 | 位置 | 问题 | 修复 |
+|---|------|------|------|------|
+| 1 | P0 | `src/bili_api.rs:198` | `check_cookie()` 报错分支多一个右括号，**整个 crate 无法编译**（`cargo check` 直接失败） | 重写为 `format!("Cookie 已失效（{msg}）")` |
+| 2 | P1 | `src/web.rs api_chat` | 带图聊天：图片+文字时**文字不进模型**；图片文件缺失时**整条用户消息丢失**（LLM 只收到 system 消息） | 图片+文字合并为单条 `content` 数组（对齐 Python `_generate_reply`）；图片不可读降级纯文本并告警；`generate_chat_reply` 同步对齐；MIME 按扩展名推断 |
+| 3 | P1 | `src/dynamic.rs` | 动态自定义文案读 `PROMPT_DYNAMIC_CONTENT`，面板/默认表/ Python 均为 `PROMPT_DYNAMIC`，**面板配置永远不生效** | 键名对齐 `PROMPT_DYNAMIC` |
+| 4 | P1 | `src/private_msgs.rs poll()` | `sender_uid` 用 `as_str()` 读取，B 站返回数字时解析为空串，`sender_uid == self_uid` 判空失败 → **可能对「自己发给自己」的消息自我回复** | 字符串/数字双态解析（对齐 Python `str(...)`） |
+| 5 | P2 | `src/web.rs api_cost_add` | `cost_log.json` 损坏为非对象时 `as_object_mut().unwrap()` **panic 500** | 非对象兜底为 `{}` |
+| 6 | P2 | `src/web.rs` 会话 | 会话 Cookie 无 `SameSite`；HMAC 签名用普通 `!=` 比较（时序侧信道） | 加 `SameSite=Lax`；改常量时间比较 `constant_time_eq` |
+| 7 | P2 | `src/web.rs` 上传/口令 | 上传无大小上限、同秒同名覆盖；默认口令 `admin()` 无启动提示 | 10MB 上限 + 时间戳+随机后缀唯一名；启动时检测默认口令并 `tracing::warn` |
+| 8 | P3 | `src/proactive.rs` | `yt-dlp` / `ffmpeg` 子进程无超时，卡死会永久占用任务 | 300s/60s 超时 + `kill_on_drop(true)` |
+
+**校验结果**
+
+- `cargo check` / `cargo build`：通过（修复前直接编译失败）
+- `cargo clippy`：无新增错误，仅存量风格提示
+- 冒烟测试：`--no-bot --port` 启动后 `/api/health` 200、未授权 `/api/config` 401、`/api/handshake` 正常返回 RSA 公钥（密封密钥生成正常）
+- 行为对齐：图片消息构造、动态文案键名、私信 `sender_uid` 解析均与 Python 参考实现逐点核对
+
+**已知边界**（未改动，保持与 Python 一致）：默认口令 `admin()` 为上游设计，已加启动告警，公网部署仍需配置 `CHAT_PASSWORD`。
 
 ### fix(bot) — 评论与私信「串台」：永久记忆膨胀把用户那句话淹掉
 
