@@ -23,6 +23,12 @@ SESSIONS_URL = "https://api.vc.bilibili.com/session_svr/v1/session_svr/get_sessi
 MESSAGES_URL = "https://api.vc.bilibili.com/svr_sync/v1/svr_sync/fetch_session_msgs"
 SEND_URL = "https://api.vc.bilibili.com/web_im/v1/web_im/send_msg"
 
+# 已处理 msg_key 的保留条数。这只是辅助去重表，真正防重靠 sessions 里的
+# seqno 游标（单调递增、按会话独立、不会被多会话冲刷）。
+# 实测账号有 101 个私信会话，每轮都会追加各会话的新 key，队列太短就会把
+# 旧 key 迅速挤出窗口 —— 那是历史上私信复读的直接原因，因此这里留足余量。
+PROCESSED_KEYS_LIMIT = 3000
+
 _URL_RE = re.compile(
     r"""(?ix)
     (?:
@@ -332,6 +338,12 @@ class PrivateMessageClient:
                 "processed_keys": [],
             }
         session_state = state.setdefault("sessions", {})
+        # 已处理队列被当成「无界去重表」用，但它是定长列表（见下方 processed[-1000:]）。
+        # 多会话账号会把它冲垮：每一轮都会把**所有**会话的新消息 key 追加进来，
+        # 几十个会话滚动几轮就把旧 key 挤出窗口，于是同一条老消息的 key 不再命中，
+        # 被重新判为「新消息」再次回复 —— 这就是私信复读的根因。
+        # 真正防重的主判据是 sessions 里的 seqno 游标（单调递增、按会话独立），
+        # processed_keys 只作辅助，因此这里按会话预算裁剪，而不是全量堆积。
         processed = [str(item) for item in state.get("processed_keys", [])]
         processed_set = set(processed)
 
@@ -386,7 +398,6 @@ class PrivateMessageClient:
 
             messages = list(payload.get("messages") or [])
             payload_max = int(payload.get("max_seqno") or remote_max or last_seqno)
-            examined_max = last_seqno
             reached_limit = False
             for message in reversed(messages):
                 msg_key = str(
@@ -400,8 +411,6 @@ class PrivateMessageClient:
                 timestamp = int(message.get("timestamp") or now)
                 if timestamp > 10_000_000_000:
                     timestamp //= 1000
-                if msg_seqno:
-                    examined_max = max(examined_max, msg_seqno)
                 if (
                     not msg_key
                     or msg_key in processed_set
@@ -441,17 +450,20 @@ class PrivateMessageClient:
                     reached_limit = True
                     break
 
-            if reached_limit:
-                # 只推进到本轮最后实际取出的消息，剩余消息留给下一轮。
-                observed_max = examined_max
-            else:
-                observed_max = max(
-                    [last_seqno, remote_max, payload_max]
-                    + [int(item.get("msg_seqno") or 0) for item in messages]
-                )
-            session_state[key] = observed_max
+            # 本轮到量上限提前退出（reached_limit）时，游标同样要推进到远端最大值，
+            # 不能只推进到「最后取出的那一条」——原因见下方注释。因此这里不分支。
+            observed_max = max(
+                [last_seqno, remote_max, payload_max]
+                + [int(item.get("msg_seqno") or 0) for item in messages]
+            )
+            # 游标只允许单调递增，避免远端 max_seqno 回退时把已消费区间重新打开
+            session_state[key] = max(int(session_state.get(key) or 0), observed_max)
 
-        state["processed_keys"] = processed[-1000:]
+        # 定长去重表：保留最近 N 条（按插入顺序去重），防止被 100+ 个会话的
+        # 新消息把早期 key 迅速挤出窗口。历史上这里是裸的 processed[-1000:]，
+        # 每轮把队列里所有会话的 key 全量追加，滚动几轮就把旧 key 挤没了。
+        dedup = list(dict.fromkeys(processed))[-PROCESSED_KEYS_LIMIT:]
+        state["processed_keys"] = dedup
         self._save_state(state)
         return new_messages
 

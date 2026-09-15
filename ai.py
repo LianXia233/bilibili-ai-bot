@@ -97,6 +97,12 @@ AFFECTION_FILE = "data/affection.json"
 MEMORY_FILE = "data/memory.json"
 SECURITY_LOG_FILE = "data/security_log.json"
 PERMANENT_MEMORY_FILE = "data/permanent_memory.json"
+# 永久记忆条数上限。它不是「最多能记几件事」，而是「最多能装几条规则」——
+# 永久记忆承载的是人格/行为规则，条数太少会被细则挤爆，太多则每次都要
+# 全量注入提示词、挤占正文预算。40 条对应约 2~3k token，实测可接受。
+PERMANENT_MEMORY_LIMIT = 40
+# 每次注入上下文时取用的条数上限（按时间倒序取最近 N 条）
+PERMANENT_MEMORY_INJECT = 40
 COST_LOG_FILE = "data/cost_log.json"
 MOOD_FILE = "data/mood.json"
 VIDEO_MEMORY_FILE = "data/video_memory.json"
@@ -963,8 +969,21 @@ def get_user_semantic_memories(memory, user_id, query_text):
     ]
     if not user_memories:
         return []
+    # 只有「带 embedding 的条目」才参与语义检索。
+    # 原实现直接取 m["embedding"]，一旦 memory.json 里存在没有该字段的条目
+    # （embedding 写盘失败、旧数据迁移、手工编辑过文件等）就抛 KeyError，
+    # 而 build_memory_context 位于回复主链路上 —— 一条脏数据足以让
+    # 「构造上下文」整段失败，表现出来是所有回复都挂掉。
+    # 缺字段的条目直接跳过：它们无法参与相似度计算，跳过只是少一条参考，
+    # 好过整个流程异常。
+    with_emb = [m for m in user_memories if m.get("embedding")]
+    if not with_emb:
+        return []
     query_embedding = get_embedding(query_text)
-    scored = [(cosine_similarity(query_embedding, m["embedding"]), m["text"]) for m in user_memories]
+    if not query_embedding:
+        # embedding 服务不可用（如密钥失效）时不做检索，而不是拿 None 去算相似度
+        return []
+    scored = [(cosine_similarity(query_embedding, m["embedding"]), m["text"]) for m in with_emb]
     scored.sort(reverse=True)
     # 相似度低于0.6的不检索，避免无关记忆污染当前对话
     return [text for sim, text in scored[:MAX_SEMANTIC_RESULTS] if sim > 0.6]
@@ -992,12 +1011,21 @@ def build_memory_context(memory, thread_id, user_id, query_text):
     就等于给了模型一个「可以不看」的理由，回复会退化成「有什么事」这类空话。
     """
     parts = []
-    # 永久记忆
+    # 永久记忆：人工维护的人格 / 行为规则，是**最高优先级的约束**，必须全量注入。
+    #
+    # 此前这里写的是 perm[-20:]，与写入侧的 20 条上限相同 —— 一旦写满，
+    # 「取最近 20 条」就等于「永远只看到最早那批被反复挤兑的条目」，
+    # 新加的规则（如「禁止复读」）反而进不了上下文，表现出来就是
+    # 「永久记忆改了但不起作用」。改为全量注入 + 明确的优先级措辞。
     perm = load_json(PERMANENT_MEMORY_FILE, [])
     if perm:
-        parts.append("【Bot的自我认知】\n" + "\n".join(
-            [f"[{p.get('time', '未知')}] {p['text']}" for p in perm[-20:]]
-        ))
+        items = perm[-PERMANENT_MEMORY_INJECT:]
+        parts.append(
+            "【最高优先级规则（人工设定，必须遵守）】\n"
+            "以下是引航者喵亲手写下的规则，优先级高于本提示词中的其他风格描述；"
+            "若与【说话风格】【今日状态】等段落冲突，一律以本段为准。\n"
+            + "\n".join(f"- {p.get('text', '')}" for p in items if p.get("text"))
+        )
     # 用户档案
     user_profile_ctx = get_user_profile_context(user_id)
     if user_profile_ctx:
@@ -1543,11 +1571,9 @@ def generate_reply_and_score(comment_text, username, level, memory_context,
 「{username}」的{_channel_name}：「{comment_text}」
 
 请以JSON格式回复，不要加任何多余内容：
-{{"score_delta": 数字, "reply": "回复内容", "impression": "一句话描述对该用户的印象", "user_facts": ["用户提到的个人信息1", "用户提到的个人信息2"], "permanent_memory": "值得永久记住的事(没有则留空)"}}
+{{"score_delta": 数字, "reply": "回复内容", "impression": "一句话描述对该用户的印象", "user_facts": ["用户提到的个人信息1", "用户提到的个人信息2"]}}
 
 user_facts：如果用户在这条{_channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。
-
-permanent_memory：如果这次对话中你发现了值得长期记住的重要信息（如：某个用户的特殊身份、重大事件、你对某件事的感悟、粉丝群体的共同特征等），就写一句精炼的话。日常闲聊不需要记。大部分情况应该留空。
 
 score_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。
 reply简短自然，一般15-40字，像B站真人回复，不要写得像作文。
@@ -1628,19 +1654,36 @@ def block_user(mid, config=None):
         return False
 
 
-def _save_permanent_memory(text):
+def _save_permanent_memory(text, source="auto"):
+    """永久记忆写入。
+
+    永久记忆是「人格规则」层，只允许人工在 WebUI 里写入 —— 模型自动产出会让
+    规则与闲聊混在一起：实测 20 条上限里塞进了大量「编号是0831」「每句话都要
+    随机带上表情包」这类内容，且同一段规则重复 3 次，真正的人格规则被挤掉。
+    因此这里默认拒绝自动写入，只有 source="manual" 才落盘。
+    """
     if not text:
-        return
+        return False
+    if source != "manual":
+        print(f"💎 永久记忆仅支持人工写入（来自面板），已忽略模型产出：{str(text)[:40]}")
+        return False
     permanent = load_json(PERMANENT_MEMORY_FILE, [])
-    if len(permanent) >= 20:
-        print(f"💎 永久记忆已满，跳过：{text}")
-        return
+    text = str(text).strip()
+    # 去重：同一条内容只保留一份，避免规则被反复追加（历史上重复 3 次）
+    if any(str(item.get("text", "")).strip() == text for item in permanent):
+        print(f"💎 永久记忆已存在，跳过：{text[:40]}")
+        return False
+    if len(permanent) >= PERMANENT_MEMORY_LIMIT:
+        print(f"💎 永久记忆已满（{PERMANENT_MEMORY_LIMIT} 条），请先在面板删除旧的：{text[:40]}")
+        return False
     permanent.append({
         "text": text,
         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "source": "manual",
     })
     save_json(PERMANENT_MEMORY_FILE, permanent)
-    print(f"💎 新增永久记忆：{text}")
+    print(f"💎 新增永久记忆（人工）：{text[:60]}")
+    return True
 
 
 def _record_private_block(message, reason, score, blocked):
@@ -1778,7 +1821,7 @@ def process_private_messages(client, affection, memory):
                 impression=impression or None,
                 new_facts=user_facts or None,
             )
-        _save_permanent_memory(perm_mem)
+        # 永久记忆不再由模型自动写入（见 _save_permanent_memory 说明）。
 
         if client.send_text(config, mid, ai_reply, message["session_type"]):
             print(f"💬 私信回复 {username}：{ai_reply}")
@@ -1995,7 +2038,8 @@ def run():
                         if user_facts:
                             print(f"📝 记录用户信息：{'；'.join(user_facts)}")
 
-                    _save_permanent_memory(perm_mem)
+                    # 永久记忆不再由模型自动写入（见 _save_permanent_memory 说明），
+                    # 只保留面板人工维护入口。
 
                     delta_str = f"+{score_delta}" if score_delta >= 0 else str(score_delta)
                     print(f"💛 好感度：{current_score} → {new_score}（{delta_str}）| {LEVEL_NAMES[get_level(new_score, mid)]}")

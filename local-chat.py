@@ -3,6 +3,7 @@ import math
 import os
 import io
 import base64
+import shutil
 import uuid
 import traceback
 from datetime import datetime, timedelta
@@ -357,6 +358,23 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+def _backup_data_file(path, tag):
+    """破坏性写盘前留一份带时间戳的备份。
+
+    清空 / 整体替换记忆这类操作一旦点错就无法回收，备份成本极低，
+    因此所有不可逆的数据写操作都必须先调用它。
+    """
+    try:
+        if not os.path.exists(path):
+            return None
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = f"{path}.bak-{tag}-{stamp}"
+        shutil.copy2(path, dest)
+        return dest
+    except Exception as exc:      # 备份失败不应阻断主流程，但必须留痕
+        print(f"⚠️ 备份 {path} 失败：{exc}")
+        return None
 
 def log_cost(source, input_tokens, output_tokens, model=""):
     """记录API调用费用，价格从config读取。
@@ -1225,30 +1243,220 @@ def block_suggestion_dismiss():
     return jsonify({"ok": True, "total": len(build_block_suggestions())})
 
 
+PERMANENT_MEMORY_FILE = "data/permanent_memory.json"
+# 与 ai.py 的 PERMANENT_MEMORY_LIMIT 保持一致：永久记忆承载人格/行为规则，
+# 20 条会把细则挤爆（实测写满后新规则进不去，看起来"改了不生效"）。
+PERMANENT_MEMORY_LIMIT = 40
+
+
 @app.route("/api/permanent/list", methods=["GET"])
 def permanent_list():
-    return jsonify({"items": load_json("data/permanent_memory.json", [])})
+    return jsonify({"items": load_json(PERMANENT_MEMORY_FILE, []),
+                    "limit": PERMANENT_MEMORY_LIMIT})
 
 @app.route("/api/permanent/add", methods=["POST"])
 def permanent_add():
-    data = request.json
-    text = data.get("text", "").strip()
-    if not text: return jsonify({"error": "内容为空"}), 400
-    perm = load_json("data/permanent_memory.json", [])
-    if len(perm) >= 20: return jsonify({"error": "永久记忆已满20条，请先删除旧的"}), 400
-    perm.append({"text": text, "time": datetime.now().strftime("%Y-%m-%d %H:%M")})
-    save_json("data/permanent_memory.json", perm)
+    data = request.json or {}
+    text = str(data.get("text", "") or "").strip()
+    if not text:
+        return jsonify({"error": "内容为空"}), 400
+    perm = load_json(PERMANENT_MEMORY_FILE, [])
+    # 去重：同一条规则反复追加会让真正的新规则没位置（历史上重复过 3 次）
+    if any(str(item.get("text", "")).strip() == text for item in perm):
+        return jsonify({"error": "这条永久记忆已存在"}), 400
+    if len(perm) >= PERMANENT_MEMORY_LIMIT:
+        return jsonify({
+            "error": f"永久记忆已满 {PERMANENT_MEMORY_LIMIT} 条，请先删除旧的或整合重复内容"
+        }), 400
+    perm.append({"text": text, "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                 "source": "manual"})
+    save_json(PERMANENT_MEMORY_FILE, perm)
     return jsonify({"ok": True})
 
 @app.route("/api/permanent/delete", methods=["POST"])
 def permanent_delete():
-    data = request.json
+    data = request.json or {}
     idx = data.get("index", -1)
-    perm = load_json("data/permanent_memory.json", [])
+    perm = load_json(PERMANENT_MEMORY_FILE, [])
     if 0 <= idx < len(perm):
         perm.pop(idx)
-        save_json("data/permanent_memory.json", perm)
+        save_json(PERMANENT_MEMORY_FILE, perm)
     return jsonify({"ok": True})
+
+@app.route("/api/permanent/clear", methods=["POST"])
+def permanent_clear():
+    """一键清空永久记忆（只清永久记忆，不动人格/好感度/对话记忆）。"""
+    data = request.json or {}
+    if not data.get("confirm"):
+        return jsonify({"error": "需要确认参数 confirm=true"}), 400
+    before = load_json(PERMANENT_MEMORY_FILE, [])
+    _backup_data_file(PERMANENT_MEMORY_FILE, "clear")
+    save_json(PERMANENT_MEMORY_FILE, [])
+    return jsonify({"ok": True, "msg": f"已清空 {len(before)} 条永久记忆",
+                    "cleared": len(before)})
+
+@app.route("/api/permanent/update", methods=["POST"])
+def permanent_update():
+    """按索引改写某条永久记忆（整合长规则时不必先删再加）。"""
+    data = request.json or {}
+    idx = data.get("index", -1)
+    text = str(data.get("text", "") or "").strip()
+    if not text:
+        return jsonify({"error": "内容为空"}), 400
+    perm = load_json(PERMANENT_MEMORY_FILE, [])
+    if not (0 <= idx < len(perm)):
+        return jsonify({"error": "索引越界"}), 400
+    perm[idx]["text"] = text
+    perm[idx]["time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    perm[idx]["source"] = "manual"
+    save_json(PERMANENT_MEMORY_FILE, perm)
+    return jsonify({"ok": True})
+
+@app.route("/api/permanent/import", methods=["POST"])
+def permanent_import():
+    """整体替换永久记忆（传 items 数组），用于把零散规则整合成一份结构化规则。"""
+    data = request.json or {}
+    items = data.get("items")
+    if not isinstance(items, list):
+        return jsonify({"error": "items 必须是数组"}), 400
+    cleaned = []
+    seen = set()
+    for raw in items:
+        if isinstance(raw, dict):
+            text = str(raw.get("text", "") or "").strip()
+        else:
+            text = str(raw or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append({"text": text,
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "source": "manual"})
+    if len(cleaned) > PERMANENT_MEMORY_LIMIT:
+        return jsonify({"error": f"整理后仍有 {len(cleaned)} 条，超过上限 "
+                                 f"{PERMANENT_MEMORY_LIMIT}"}), 400
+    before = load_json(PERMANENT_MEMORY_FILE, [])
+    _backup_data_file(PERMANENT_MEMORY_FILE, "import")
+    save_json(PERMANENT_MEMORY_FILE, cleaned)
+    return jsonify({"ok": True, "msg": f"已用 {len(cleaned)} 条替换原有 {len(before)} 条",
+                    "before": len(before), "after": len(cleaned)})
+
+# ========== 对话模型池（多套 API/模型配置，一键切换） ==========
+# 池的语义是「可选覆盖」：启用池中某条后，该条整体取代 OR_CHAT_* 四个键；
+# 未启用（CHAT_MODEL_ACTIVE = -1）时，行为与改造前完全一致，旧配置不作废。
+# key 一律不下发明文：读取接口只回脱敏值，写入时若收到脱敏值（含 ***）
+# 则视为「保持原 key 不变」，避免前端回填时把真 key 覆盖成掩码。
+MODEL_POOL_MAX = 20
+
+def _mask_key(k):
+    k = str(k or "")
+    if not k:
+        return ""
+    return (k[:4] + "***" + k[-4:]) if len(k) > 10 else "***"
+
+def _is_masked(k):
+    return "***" in str(k or "")
+
+@app.route("/api/models/pool/list", methods=["GET"])
+def models_pool_list():
+    """列出模型池（key 脱敏）+ 当前激活下标。"""
+    from config import get_chat_pool_masked
+    raw = get_raw_config()
+    try:
+        active = int(raw.get("CHAT_MODEL_ACTIVE", -1))
+    except (TypeError, ValueError):
+        active = -1
+    pool = get_chat_pool_masked()
+    if active >= len(pool):
+        active = -1
+    return jsonify({"items": pool, "active": active, "limit": MODEL_POOL_MAX})
+
+@app.route("/api/models/pool/save", methods=["POST"])
+def models_pool_save():
+    """整体保存模型池（传 items 数组）。收到的脱敏 key 保留原值。"""
+    data = request.json or {}
+    items = data.get("items")
+    if not isinstance(items, list):
+        return jsonify({"error": "items 必须是数组"}), 400
+    if len(items) > MODEL_POOL_MAX:
+        return jsonify({"error": f"最多 {MODEL_POOL_MAX} 条"}), 400
+
+    old = get_raw_config().get("CHAT_MODEL_POOL", [])
+    old = old if isinstance(old, list) else []
+
+    cleaned = []
+    for i, raw_item in enumerate(items):
+        if not isinstance(raw_item, dict):
+            continue
+        name = str(raw_item.get("name", "") or "").strip()
+        url = str(raw_item.get("url", "") or "").strip()
+        key = str(raw_item.get("key", "") or "").strip()
+        model = str(raw_item.get("model", "") or "").strip()
+        fallback = str(raw_item.get("fallback", "") or "").strip()
+        # 前端回填的是掩码，此时沿用旧值，避免把真 key 写成 ***
+        if _is_masked(key) and i < len(old) and isinstance(old[i], dict):
+            key = str(old[i].get("key", "") or "")
+        if not (name or model or url or key):
+            continue  # 整条空行直接丢掉，不占池位
+        cleaned.append({"name": name or f"配置 {len(cleaned) + 1}",
+                        "url": url, "key": key, "model": model, "fallback": fallback})
+
+    try:
+        active = int(data.get("active", get_raw_config().get("CHAT_MODEL_ACTIVE", -1)))
+    except (TypeError, ValueError):
+        active = -1
+    if active >= len(cleaned):
+        active = -1
+
+    update_config({"CHAT_MODEL_POOL": cleaned, "CHAT_MODEL_ACTIVE": active})
+    return jsonify({"ok": True, "count": len(cleaned), "active": active})
+
+@app.route("/api/models/pool/activate", methods=["POST"])
+def models_pool_activate():
+    """一键切换：把 CHAT_MODEL_ACTIVE 设为指定下标（-1 = 不用池）。"""
+    data = request.json or {}
+    try:
+        idx = int(data.get("index", -1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "index 必须是整数"}), 400
+    pool = get_raw_config().get("CHAT_MODEL_POOL", [])
+    pool = pool if isinstance(pool, list) else []
+    if idx >= len(pool):
+        return jsonify({"error": f"下标越界（池中共 {len(pool)} 条）"}), 400
+    update_config({"CHAT_MODEL_ACTIVE": idx})
+    if idx < 0:
+        return jsonify({"ok": True, "active": -1, "msg": "已停用模型池，回落到单套配置"})
+    name = str(pool[idx].get("name", "") or f"配置 {idx + 1}")
+    model = str(pool[idx].get("model", "") or "")
+    return jsonify({"ok": True, "active": idx, "name": name, "model": model,
+                    "msg": f"已切换到「{name}」{('（' + model + '）') if model else ''}"})
+
+@app.route("/api/models/pool/delete", methods=["POST"])
+def models_pool_delete():
+    """删除池中一条。若删的是激活项，激活状态回落为「不用池」。"""
+    data = request.json or {}
+    try:
+        idx = int(data.get("index", -1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "index 必须是整数"}), 400
+    raw = get_raw_config()
+    pool = list(raw.get("CHAT_MODEL_POOL", []) or [])
+    if not (0 <= idx < len(pool)):
+        return jsonify({"error": "下标越界"}), 400
+    try:
+        active = int(raw.get("CHAT_MODEL_ACTIVE", -1))
+    except (TypeError, ValueError):
+        active = -1
+    pool.pop(idx)
+    # 删掉的是激活项 -> 停用；删的是激活项之前的 -> 下标整体前移，激活项语义不变
+    if active == idx:
+        active = -1
+    elif active > idx:
+        active -= 1
+    if active >= len(pool):
+        active = -1
+    update_config({"CHAT_MODEL_POOL": pool, "CHAT_MODEL_ACTIVE": active})
+    return jsonify({"ok": True, "count": len(pool), "active": active})
 
 @app.route("/api/cost/stats", methods=["GET"])
 def cost_stats():
@@ -1337,9 +1545,17 @@ def api_get_config():
 
 @app.route("/api/config/raw", methods=["GET"])
 def api_get_config_raw():
-    """获取原始配置（不脱敏，用于编辑回显）"""
+    """获取原始配置（不脱敏，用于编辑回显）
+
+    这里的「不脱敏」是为了让单套模型的输入框能回显完整 key。
+    但模型池是列表，前端有独立的脱敏接口（/api/models/pool/list）负责读写，
+    因此这里必须把池整体摘掉 —— 否则池里每一条的 key 都会明文出现在响应里，
+    且顺着浏览器缓存/日志扩散。池不经过本接口，摘掉不影响任何功能。
+    """
     from config import get_raw_config
-    return jsonify({"config": get_raw_config()})
+    cfg = dict(get_raw_config())
+    cfg.pop("CHAT_MODEL_POOL", None)
+    return jsonify({"config": cfg})
 
 @app.route("/api/config/update", methods=["POST"])
 def api_update_config():
@@ -1534,6 +1750,84 @@ def api_delete_persona():
     if get_raw_config().get("ACTIVE_PERSONA") == name:
         update_config({"ACTIVE_PERSONA": "default"})
     return jsonify({"ok": True})
+
+@app.route("/api/memory/clear_all", methods=["POST"])
+def memory_clear_all():
+    """一键清空「记忆」类数据。
+
+    只清记忆与互动痕迹，**不动**：人格配置、模型/API 配置、B站 Cookie、功能开关。
+    此前面板里没有任何独立入口，唯一会清永久记忆的是 /api/personas/reset，
+    但它同时会重置人格与性格演化 —— 想清记忆就必须连人格一起丢，所以只能放弃。
+
+    body: {"confirm": true, "targets": ["permanent","dialog","profile","affection",
+                                        "video","personality","mood"]}
+    不传 targets 时默认清全部；每个被清的文件都会先自动备份。
+    """
+    data = request.json or {}
+    if not data.get("confirm"):
+        return jsonify({"error": "需要确认参数 confirm=true"}), 400
+
+    # 目标 -> (文件路径, 清空后的初值, 说明)
+    catalog = {
+        "permanent":   (PERMANENT_MEMORY_FILE, [],  "永久记忆（人格规则）"),
+        "dialog":      (MEMORY_FILE,           [],  "对话记忆（含压缩摘要）"),
+        "profile":     ("data/user_profiles.json", {}, "用户档案（印象/标签/已知信息）"),
+        "affection":   (AFFECTION_FILE,        {},  "好感度"),
+        "video":       ("data/video_memory.json", {}, "视频分析缓存"),
+        "personality": ("data/personality_evolution.json", {}, "性格演化记录"),
+        "mood":        (MOOD_FILE,             {},  "当日心情"),
+    }
+    targets = data.get("targets")
+    if targets is None:
+        targets = list(catalog.keys())
+    if not isinstance(targets, list):
+        return jsonify({"error": "targets 必须是数组"}), 400
+
+    cleared = []
+    for name in targets:
+        if name not in catalog:
+            continue
+        path, empty_value, label = catalog[name]
+        before = load_json(path, empty_value)
+        count = len(before) if isinstance(before, (list, dict)) else 0
+        _backup_data_file(path, f"clearall-{name}")
+        save_json(path, empty_value)
+        cleared.append({"target": name, "label": label, "removed": count})
+
+    # 好感度被清空后，主人位会被下一轮重新补回 100（ai.py 启动时兜底），这里不用管
+    return jsonify({
+        "ok": True,
+        "msg": "；".join(f"{c['label']} {c['removed']} 条" for c in cleared) or "无可清空项",
+        "cleared": cleared,
+    })
+
+@app.route("/api/memory/stats", methods=["GET"])
+def memory_stats():
+    """记忆类数据的规模概览，供面板显示「清空前会丢多少」。
+
+    返回结构必须与前端 clearMemories/loadMemStats 读的字段一致（`counts` 子对象）。
+    此前这里是扁平键（permanent/dialog/...），前端读 data.counts 拿到 undefined，
+    面板上「记忆清空」那一栏永远是空的 —— 接口通了但内容不显示，属于静默失配。
+    """
+    def size_of(path, empty):
+        data = load_json(path, empty)
+        if isinstance(data, (list, dict)):
+            return len(data)
+        return 0
+
+    # 键名与 clear_all 的 catalog / 前端 MEM_LABELS 保持一一对应
+    counts = {
+        "permanent":   size_of(PERMANENT_MEMORY_FILE, []),
+        "dialog":      size_of(MEMORY_FILE, []),
+        "profile":     size_of("data/user_profiles.json", {}),
+        "affection":   size_of(AFFECTION_FILE, {}),
+        "video":       size_of("data/video_memory.json", {}),
+        "personality": size_of("data/personality_evolution.json", {}),
+        "mood":        size_of(MOOD_FILE, {}),
+    }
+    return jsonify({"counts": counts,
+                    "permanent_limit": PERMANENT_MEMORY_LIMIT,
+                    "total": sum(counts.values())})
 
 @app.route("/api/personas/reset", methods=["POST"])
 def api_reset_persona():

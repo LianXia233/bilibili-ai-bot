@@ -42,6 +42,8 @@
   "OR_BASE_URL": "你的API Base URL",
   "OR_CHAT_MODEL": "对话模型ID",
   "OR_CHAT_MODEL_FALLBACK": "备用对话模型ID（可留空）",
+  "CHAT_MODEL_POOL": [],
+  "CHAT_MODEL_ACTIVE": -1,
   "OR_VISION_MODEL": "视觉模型ID",
   "OR_SEARCH_MODEL": "搜索模型ID（需支持联网）",
   "OR_IMAGE_MODEL": "图片生成模型ID",

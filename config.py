@@ -31,6 +31,15 @@ _DEFAULTS = {
     "OR_CHAT_URL": "",       # 留空=用全局 OR_BASE_URL
     "OR_CHAT_KEY": "",       # 留空=用全局 OR_API_KEY
 
+    # ===== 对话模型池（多套 API/模型配置，面板一键切换）=====
+    # 为什么要有池：对话是最常换模型的场景（不同网关的额度、限速、价格差别很大），
+    # 只留一套配置时，换个模型就要手改 4 个输入框、改错了还不好回退。
+    # 池里每条是 {"name","url","key","model","fallback"}；
+    # CHAT_MODEL_ACTIVE 是激活项的 index，-1 表示不使用池（回落上面的单套配置）。
+    # 这样旧配置继续可用，池只是可选的一层覆盖。
+    "CHAT_MODEL_POOL": [],
+    "CHAT_MODEL_ACTIVE": -1,
+
     # 视觉模型
     "OR_VISION_MODEL": "",
     "OR_VISION_MODEL_FALLBACK": "",
@@ -380,6 +389,23 @@ def get_config():
             safe[k] = v[:6] + "***" + v[-4:]
         else:
             safe[k] = v
+    # 模型池是列表，上面只按「顶层字符串键名」脱敏，管道进不来 ——
+    # 池里的 api key 会被原样下发到前端（面板任何登录用户都能在响应里读到明文 key）。
+    # 这里对池单独做一次逐条脱敏。
+    if isinstance(safe.get("CHAT_MODEL_POOL"), list):
+        pooled = []
+        for item in safe["CHAT_MODEL_POOL"]:
+            if not isinstance(item, dict):
+                continue
+            it = dict(item)
+            key = str(it.get("key", "") or "")
+            if len(key) > 10:
+                it["key"] = key[:4] + "***" + key[-4:]
+            elif key:
+                it["key"] = "***"
+            it["has_key"] = bool(key)
+            pooled.append(it)
+        safe["CHAT_MODEL_POOL"] = pooled
     return safe
 
 def get_raw_config():
@@ -504,12 +530,73 @@ def get_rate_limit(scene):
         v = fallback
     return max(0, v)
 
+# ========== 对话模型池 ==========
+# 池的存在意义：对话模型换得最勤（网关额度/限速/价格差异大），单套配置换个模型
+# 要手改 4 个输入框，改错了不好回退。池把每套配置存成一条，切换只改一个下标。
+# 语义是「可选覆盖」：CHAT_MODEL_ACTIVE = -1 表示不用池，走 OR_CHAT_* 单套配置。
+MODEL_POOL_MAX = 20
+
+def get_chat_pool():
+    """读取对话模型池（原始结构，含 key，仅供后端使用）。"""
+    pool = get_raw_config().get("CHAT_MODEL_POOL", [])
+    if not isinstance(pool, list):
+        return []
+    out = []
+    for item in pool:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "name": str(item.get("name", "") or "").strip(),
+            "url": str(item.get("url", "") or "").strip(),
+            "key": str(item.get("key", "") or "").strip(),
+            "model": str(item.get("model", "") or "").strip(),
+            "fallback": str(item.get("fallback", "") or "").strip(),
+        })
+    return out[:MODEL_POOL_MAX]
+
+def get_chat_pool_masked():
+    """池的脱敏版（喂给前端）：key 只留首尾各 4 位。"""
+    out = []
+    for item in get_chat_pool():
+        k = item["key"]
+        masked = (k[:4] + "***" + k[-4:]) if len(k) > 10 else ("***" if k else "")
+        out.append(dict(item, key=masked, has_key=bool(k)))
+    return out
+
+def get_active_chat_model():
+    """取当前激活的池条目；未激活或下标越界时返回 None。
+
+    每次读盘而非缓存：面板点「启用」后 Bot 进程无需重启即生效，
+    与 get_max_tokens / get_rate_limit 的证据口径一致。
+    """
+    cfg = get_raw_config()
+    try:
+        idx = int(cfg.get("CHAT_MODEL_ACTIVE", -1))
+    except (TypeError, ValueError):
+        idx = -1
+    if idx < 0:
+        return None
+    pool = get_chat_pool()
+    if idx >= len(pool):
+        # 池被改小（删条目）后下标会越界，此时视为未激活，避免读到错误配置
+        return None
+    item = pool[idx]
+    if not (item["model"] or item["url"] or item["key"]):
+        return None
+    return item
+
 # ========== 获取各模型的 API 配置 ==========
 def get_model_config(model_type):
     """
     获取指定模型类型的 (base_url, api_key, model_id, fallback_model)
     model_type: "chat" / "vision" / "search" / "image"
     每个模型可以有独立的 URL 和 Key，留空则用全局的
+
+    chat 类额外支持「模型池」：若面板启用了池中某条，该条整体覆盖
+    OR_CHAT_URL / OR_CHAT_KEY / OR_CHAT_MODEL / OR_CHAT_MODEL_FALLBACK。
+    覆盖语义是「整条取代」而不是逐字段合并 —— 池条目里留空的字段
+    表示「用全局默认」，若与单套配置逐字段混合，会出现「切换了模型但
+    Key 还是上一套的」这种极难排查的状态。
     """
     cfg = _load_config()
     prefix = f"OR_{model_type.upper()}"
@@ -517,6 +604,15 @@ def get_model_config(model_type):
     api_key = cfg.get(f"{prefix}_KEY", "") or cfg.get("OR_API_KEY", "")
     model_id = cfg.get(f"{prefix}_MODEL", "")
     fallback = cfg.get(f"{prefix}_MODEL_FALLBACK", "")
+
+    if model_type == "chat":
+        active = get_active_chat_model()
+        if active:
+            base_url = active["url"] or cfg.get("OR_BASE_URL", "")
+            api_key = active["key"] or cfg.get("OR_API_KEY", "")
+            model_id = active["model"]
+            fallback = active["fallback"]
+
     return base_url, api_key, model_id, fallback
 
 # ========== B站 Cookie 有效性检查 ==========
