@@ -1,10 +1,10 @@
 //! 人格系统：好感度等级、里程碑、每日心情、节日彩蛋（含农历）、性格演化、personas。
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::llm::LlmClient;
 use crate::memory::parse_json_lenient;
-use crate::util::{load_json, now_str, save_json};
+use crate::util::{load_json, now_str, now_unix, save_json};
 use chrono::Datelike;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -381,6 +381,19 @@ fn leap_month_days(_year: i32, info: u32) -> i32 {
 }
 
 // ============ personas ============
+/// 默认人格（与 Python local-chat.py DEFAULT_PERSONA 对齐）。
+pub fn default_persona() -> Value {
+    json!({
+        "name": "default",
+        "display_name": "默认人格",
+        "system_prompt": "你是一个友善的 AI 聊天助手。你有自己的性格和态度，说话自然随意，像朋友一样聊天。",
+        "style_prompt": "【说话风格】\n- 轻松自然，像朋友聊天\n- 有自己的态度和想法，不无脑附和\n- 可以适当调侃和开玩笑\n- 回复简洁，1-3句话为主",
+        "owner_prompt": "【对用户的态度】\n- 友善、真诚、自然\n- 不过度客气，也不过度热情\n- 像一个值得信赖的朋友",
+    })
+}
+
+/// personas 存储：文件为 persona 对象**列表**（与 Python / chat.html 契约一致），
+/// 当前激活项由配置 ACTIVE_PERSONA 决定。兼容旧 Rust 版对象格式（自动迁移落盘）。
 pub struct PersonaStore {
     pub file: PathBuf,
 }
@@ -389,63 +402,113 @@ impl PersonaStore {
     pub fn new(base_dir: &str) -> Self {
         PersonaStore { file: crate::util::data_path(base_dir, "personas.json") }
     }
-    pub fn load(&self) -> Value {
-        load_json(&self.file, json!({}))
-    }
-    pub fn list(&self) -> Value {
-        let v = self.load();
-        let active = v.get("active").cloned().unwrap_or(json!("default"));
-        let personas = v.get("personas").cloned().unwrap_or(json!({}));
-        json!({"active": active, "personas": personas})
-    }
-    pub fn create(&self, name: &str, system_prompt: &str) -> Result<()> {
-        let mut v = self.load();
-        let mut personas = v.get("personas").cloned().unwrap_or_else(|| json!({}));
-        if personas.get(name).is_none() {
-            personas[name] = json!({"system_prompt": system_prompt, "created": now_str()});
+    /// 读取 personas 列表；兼容旧版 {"active","personas":{name:{...}}} 对象格式并迁移落盘。
+    pub fn load(&self) -> Vec<Value> {
+        let raw: Value = load_json(&self.file, json!([]));
+        let mut out: Vec<Value> = Vec::new();
+        if let Some(arr) = raw.as_array() {
+            for item in arr {
+                if let Some(obj) = item.as_object() {
+                    out.push(Value::Object(obj.clone()));
+                }
+            }
+        } else if let Some(obj) = raw.as_object() {
+            if let Some(personas) = obj.get("personas").and_then(|p| p.as_object()) {
+                for (name, p) in personas {
+                    let mut entry = p.clone();
+                    if let Some(eo) = entry.as_object_mut() {
+                        eo.entry("name").or_insert_with(|| json!(name));
+                        eo.entry("display_name").or_insert_with(|| json!(name));
+                        eo.entry("style_prompt").or_insert_with(|| json!(""));
+                        eo.entry("owner_prompt").or_insert_with(|| json!(""));
+                    }
+                    out.push(entry);
+                }
+                let _ = save_json(&self.file, &out);
+            }
         }
-        v["personas"] = personas;
-        save_json(&self.file, &v)
-    }
-    pub fn update(&self, name: &str, system_prompt: &str) -> Result<()> {
-        let mut v = self.load();
-        let mut personas = v.get("personas").cloned().unwrap_or_else(|| json!({}));
-        personas[name] = json!({"system_prompt": system_prompt, "updated": now_str()});
-        v["personas"] = personas;
-        save_json(&self.file, &v)
-    }
-    pub fn switch(&self, name: &str) -> Result<()> {
-        let mut v = self.load();
-        let personas = v.get("personas").cloned().unwrap_or_else(|| json!({}));
-        if personas.get(name).is_none() {
-            return Ok(());
+        if !out.iter().any(|p| p.get("name").and_then(|n| n.as_str()) == Some("default")) {
+            out.insert(0, default_persona());
+            let _ = save_json(&self.file, &out);
         }
-        v["active"] = json!(name);
-        save_json(&self.file, &v)
+        out
+    }
+    pub fn list(&self) -> Vec<Value> {
+        self.load()
+    }
+    pub fn exists(&self, name: &str) -> bool {
+        self.load().iter().any(|p| p.get("name").and_then(|n| n.as_str()) == Some(name))
+    }
+    /// 创建人格：name 做 slug 化（小写、空格→_、去非字母数字_），与 Python 一致。
+    pub fn create(&self, name: &str, display_name: &str, system_prompt: &str) -> Result<Value> {
+        let slug: String = name
+            .to_lowercase()
+            .replace(' ', "_")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let slug = if slug.is_empty() {
+            format!("persona_{}", now_unix())
+        } else {
+            slug
+        };
+        let mut list = self.load();
+        if list.iter().any(|p| p.get("name").and_then(|n| n.as_str()) == Some(slug.as_str())) {
+            return Err(AppError::Other("名称已存在".into()));
+        }
+        let persona = json!({
+            "name": slug,
+            "display_name": if display_name.is_empty() { name } else { display_name },
+            "system_prompt": system_prompt,
+            "style_prompt": "",
+            "owner_prompt": "",
+            "is_default": false,
+        });
+        list.push(persona.clone());
+        save_json(&self.file, &list)?;
+        Ok(persona)
+    }
+    /// 按 name 更新 display_name/system_prompt/style_prompt/owner_prompt。
+    pub fn update(&self, name: &str, fields: &Value) -> Result<()> {
+        let mut list = self.load();
+        let mut found = false;
+        for p in list.iter_mut() {
+            if p.get("name").and_then(|n| n.as_str()) == Some(name) {
+                if let Some(o) = p.as_object_mut() {
+                    for k in ["display_name", "system_prompt", "style_prompt", "owner_prompt"] {
+                        if let Some(v) = fields.get(k) {
+                            o.insert(k.to_string(), v.clone());
+                        }
+                    }
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(AppError::Other("人格不存在".into()));
+        }
+        save_json(&self.file, &list)
     }
     pub fn delete(&self, name: &str) -> Result<()> {
-        let mut v = self.load();
-        let mut personas = v.get("personas").cloned().unwrap_or_else(|| json!({}));
-        if let Some(obj) = personas.as_object_mut() {
-            obj.remove(name);
-        }
-        v["personas"] = personas;
-        if v.get("active").and_then(|a| a.as_str()) == Some(name) {
-            v["active"] = json!("default");
-        }
-        save_json(&self.file, &v)
+        let mut list = self.load();
+        list.retain(|p| p.get("name").and_then(|n| n.as_str()) != Some(name));
+        save_json(&self.file, &list)
     }
     pub fn reset(&self) -> Result<()> {
-        let v = json!({"active": "default", "personas": {}});
-        save_json(&self.file, &v)
+        save_json(&self.file, &json!([default_persona()]))
     }
-    pub fn active_system_prompt(&self) -> String {
-        let v = self.load();
-        let active = v.get("active").and_then(|a| a.as_str()).unwrap_or("default");
-        v.get("personas")
-            .and_then(|p| p.get(active))
-            .and_then(|p| p.get("system_prompt"))
-            .and_then(|s| s.as_str())
+    /// 当前激活人格的 system_prompt（active 来自配置 ACTIVE_PERSONA）。
+    pub fn active_system_prompt(&self, active: &str) -> String {
+        let list = self.load();
+        for p in &list {
+            if p.get("name").and_then(|n| n.as_str()) == Some(active) {
+                return p.get("system_prompt").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            }
+        }
+        list.iter()
+            .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("default"))
+            .and_then(|p| p.get("system_prompt").and_then(|s| s.as_str()))
             .unwrap_or("")
             .to_string()
     }

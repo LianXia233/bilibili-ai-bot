@@ -53,7 +53,7 @@ fn normalize_for_detection(text: &str) -> String {
         })
         .into_owned();
     // [.] → .
-    let re_bracket = regex::Regex::new(r"[\[\({]\s*\.\s*[\]\)}]").unwrap();
+    let re_bracket = regex::Regex::new(r"[\[(\{]\s*\.\s*[\])\}]").unwrap();
     value = re_bracket.replace_all(&value, ".").into_owned();
     value = value.replace('。', ".").replace('．', ".").replace('｡', ".");
     // 汉字「点」在两段 ASCII 字母数字之间 → .
@@ -257,7 +257,6 @@ impl PrivateMessageClient {
     }
 
     async fn get_sessions(&self) -> Result<Vec<Value>> {
-        let cfg = self.config.read().unwrap().clone();
         let payload = self
             .http
             .get(SESSIONS_URL)
@@ -275,7 +274,6 @@ impl PrivateMessageClient {
             .await?;
         let data: Value = payload.json().await?;
         if data.get("code").and_then(|c| c.as_i64()) != Some(0) {
-            let _ = cfg;
             return Err(AppError::Api {
                 code: data.get("code").and_then(|c| c.as_i64()).unwrap_or(-1),
                 msg: data.get("message").and_then(|m| m.as_str()).unwrap_or("获取私信会话失败").to_string(),
@@ -461,10 +459,14 @@ impl PrivateMessageClient {
             let mut reached_limit = false;
 
             for message in messages.iter().rev() {
-                let msg_key = message.get("msg_key").and_then(|v| v.as_str())
-                    .or_else(|| message.get("msg_seqno").and_then(|v| v.as_str()))
-                    .unwrap_or("")
-                    .to_string();
+                // msg_key / msg_seqno 可能是字符串或数字（B站私信 payload 为数字）
+                let msg_key = message
+                    .get("msg_key")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .or_else(|| message.get("msg_key").and_then(|v| v.as_i64()).map(|n| n.to_string()))
+                    .or_else(|| message.get("msg_seqno").and_then(|v| v.as_str().map(|s| s.to_string())))
+                    .or_else(|| message.get("msg_seqno").and_then(|v| v.as_i64()).map(|n| n.to_string()))
+                    .unwrap_or_default();
                 let msg_seqno = message.get("msg_seqno").and_then(|v| v.as_i64()).unwrap_or(0);
                 let sender_uid = message.get("sender_uid").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let msg_type = message.get("msg_type").and_then(|v| v.as_i64()).unwrap_or(0);
