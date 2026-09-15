@@ -83,13 +83,12 @@ async fn generate_dynamic_content(bot: &Bot) -> Option<String> {
 
 /// OpenAI 兼容生图：请求 modalities:["image"]，解析响应中的图片。
 async fn generate_image(bot: &Bot, prompt: &str) -> Option<PathBuf> {
-    let (base_url, api_key, candidates) = {
+    let candidates = {
         let cfg = bot.config.read().unwrap().clone();
-        let (u, k, c) = cfg.model_of("image");
-        (u, k, c)
+        cfg.model_of("image")
     };
     let mut last_err = String::new();
-    for model in candidates {
+    for (base_url, api_key, model) in candidates {
         let url = format!("{base_url}/chat/completions");
         let body = json!({
             "model": model,

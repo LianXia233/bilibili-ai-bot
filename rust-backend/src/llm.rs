@@ -71,16 +71,16 @@ impl LlmClient {
         max_tokens: i64,
     ) -> Result<LlmResult> {
         let cfg = self.config.read().unwrap().clone();
-        let (base_url, api_key, candidates) = cfg.model_of(scene);
-        if base_url.is_empty() || api_key.is_empty() || candidates.is_empty() {
+        let candidates = cfg.model_of(scene);
+        if candidates.is_empty() {
             return Err(AppError::Llm(format!("场景 {scene} 未配置模型（base_url/api_key/model）")));
         }
-        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let tpm = cfg.rate_limit_tpm(scene);
         let reasoning_floor = cfg.get_i64("MAX_TOKENS_REASONING_FLOOR");
 
         let mut last_err = String::new();
-        for model in candidates {
+        for (base_url, api_key, model) in candidates {
+            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
             let est = (max_tokens as f64 * 0.6) as i64 + 64;
             let wait = self.rate.record(est, tpm);
             if wait > 0 {

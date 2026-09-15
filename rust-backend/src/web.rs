@@ -908,8 +908,10 @@ async fn api_model_test(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>)
         return json_resp(StatusCode::BAD_REQUEST, json!({"ok": false, "error": format!("未知模型类型: {model_type}")}));
     }
     let cfg = ctx.config.read().unwrap().clone();
-    let (base_url, api_key, candidates) = cfg.model_of(model_type);
-    let model = candidates.first().cloned().unwrap_or_default();
+    let candidates = cfg.model_of(model_type);
+    let Some((base_url, api_key, model)) = candidates.into_iter().next() else {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"ok": false, "error": format!("模型类型 {model_type} 未配置（base_url/api_key/model）")}));
+    };
     let start = std::time::Instant::now();
     let client = reqwest::Client::new();
     let url = format!("{base_url}/chat/completions");
@@ -1030,8 +1032,10 @@ async fn api_chat_imagine(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value
         _ => prompt.clone(),
     };
     // 生图（与 dynamic 同款 OpenAI 兼容 modalities）
-    let (base_url, api_key, candidates) = cfg.model_of("image");
-    let model = candidates.first().cloned().unwrap_or_default();
+    let candidates = cfg.model_of("image");
+    let Some((base_url, api_key, model)) = candidates.into_iter().next() else {
+        return json_resp(StatusCode::BAD_REQUEST, json!({"error": "图像模型未配置（base_url/api_key/model）"}));
+    };
     let client = reqwest::Client::new();
     let payload = json!({
         "model": model,

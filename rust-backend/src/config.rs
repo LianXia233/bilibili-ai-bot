@@ -231,20 +231,26 @@ impl Config {
     }
 
     // ---------- 模型场景解析 ----------
-    /// 场景相关 base_url / api_key / model 与候选回退模型。
-    pub fn model_of(&self, scene: &str) -> (String, String, Vec<String>) {
+    /// 场景候选通道列表：(base_url, api_key, model)，顺序为 主模型 → 兜底模型（→ 备用通道）。
+    ///
+    /// 与 Python `_model_candidates` 对齐：chat 场景独有第三条路「备用通道」
+    /// （OR_BACKUP_MODEL/URL/KEY，默认 OpenRouter 免费池）；模型池激活时整体取代 OR_CHAT_*。
+    pub fn model_of(&self, scene: &str) -> Vec<(String, String, String)> {
+        let mut out: Vec<(String, String, String)> = Vec::new();
+        let push = |out: &mut Vec<(String, String, String)>, base: &str, key: &str, model: &str| {
+            if !model.is_empty() && !base.is_empty() && !key.is_empty() {
+                out.push((base.to_string(), key.to_string(), model.to_string()));
+            }
+        };
         // chat 场景支持「对话模型池」：激活池条目时整体取代 OR_CHAT_* 四键
         // （与 Python get_model_config 对齐：池条目留空字段回落全局默认）。
         if scene == "chat" {
             if let Some(item) = self.get_active_chat_model() {
                 let base_url = if item.url.is_empty() { self.get_str("OR_BASE_URL") } else { item.url.clone() };
                 let key = if item.key.is_empty() { self.get_str("OR_API_KEY") } else { item.key.clone() };
-                let mut candidates = vec![item.model.clone()];
-                if !item.fallback.is_empty() {
-                    candidates.push(item.fallback.clone());
-                }
-                candidates.retain(|m| !m.is_empty());
-                return (base_url, key, candidates);
+                push(&mut out, &base_url, &key, &item.model);
+                push(&mut out, &base_url, &key, &item.fallback);
+                return out;
             }
         }
         let (model_k, url_k, key_k, fb_k) = match scene {
@@ -265,13 +271,24 @@ impl Config {
                 k
             }
         };
-        let mut candidates = vec![self.get_str(model_k)];
+        let model_id = self.get_str(model_k);
         let fb = self.get_str(fb_k);
-        if !fb.is_empty() {
-            candidates.push(fb);
+        push(&mut out, &base_url, &key, &model_id);
+        push(&mut out, &base_url, &key, &fb);
+        // 备用通道是对话类独有的第三条路（与 Python _model_candidates 对齐）
+        if scene == "chat" {
+            let b_model = self.get_str("OR_BACKUP_MODEL");
+            let b_url = {
+                let u = self.get_str("OR_BACKUP_URL");
+                if u.is_empty() { base_url.clone() } else { u }
+            };
+            let b_key = {
+                let k = self.get_str("OR_BACKUP_KEY");
+                if k.is_empty() { key.clone() } else { k }
+            };
+            push(&mut out, &b_url, &b_key, &b_model);
         }
-        candidates.retain(|m| !m.is_empty());
-        (base_url, key, candidates)
+        out
     }
 
     pub fn max_tokens_of(&self, scene: &str) -> i64 {
