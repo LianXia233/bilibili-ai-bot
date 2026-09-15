@@ -468,7 +468,13 @@ impl PrivateMessageClient {
                     .or_else(|| message.get("msg_seqno").and_then(|v| v.as_i64()).map(|n| n.to_string()))
                     .unwrap_or_default();
                 let msg_seqno = message.get("msg_seqno").and_then(|v| v.as_i64()).unwrap_or(0);
-                let sender_uid = message.get("sender_uid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                // sender_uid 可能是字符串或数字（与 Python str(message.get("sender_uid")) 对齐），
+                // 否则数字型 sender_uid 会解析为空串，导致「自己发给自己的消息」无法被识别而自我回复
+                let sender_uid = message
+                    .get("sender_uid")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .or_else(|| message.get("sender_uid").and_then(|v| v.as_i64()).map(|n| n.to_string()))
+                    .unwrap_or_default();
                 let msg_type = message.get("msg_type").and_then(|v| v.as_i64()).unwrap_or(0);
                 let mut timestamp = message.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(now);
                 if timestamp > 10_000_000_000 {

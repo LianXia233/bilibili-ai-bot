@@ -195,7 +195,8 @@ impl BiliClient {
                     if payload.get("code").and_then(|c| c.as_i64()) == Some(0) && is_login {
                         (true, format!("Cookie 有效（{uname}）"))
                     } else {
-                        (false, format!("Cookie 已失效（{}", payload.get("message").and_then(|m| m.as_str()).unwrap_or("未知原因")).to_string() + "）"))
+                        let msg = payload.get("message").and_then(|m| m.as_str()).unwrap_or("未知原因");
+                        (false, format!("Cookie 已失效（{msg}）"))
                     }
                 }
                 Err(_) => (false, "nav 接口解析失败".into()),
