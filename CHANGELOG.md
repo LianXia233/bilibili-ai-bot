@@ -61,6 +61,7 @@
 | 2026-09-16 | `security(panel)` | 面板加固：Cookie 加 SameSite、签名常量时间比较、默认口令启动告警、上传限流、子进程超时 | 安全加固 |
 | 2026-09-16 | `feat(rust-backend)` | 2026-09-15 更新全量移植到 Rust 版：永久记忆分层装填 / 成品条款 / 记忆双页签+定时清空 / 对话模型池 / 记忆一键清空 / 私信复读修复 等 9 项 | 功能移植 |
 | 2026-09-16 | `feat(rust-backend)` | 对话备用通道 OR_BACKUP_MODEL/URL/KEY 补全（chat 专属第三条路，部署实机大模型配置迁移必需） | 功能移植 |
+| 2026-09-16 | `ops` | 实机部署 rust-backend：停用 Python 双服务、systemd 单进程接管、config/data 全量迁移 | 部署 |
 
 ### fix(rust-backend) — rust-backend 全量代码审计与修复（8 项）
 
@@ -85,6 +86,20 @@
 - 行为对齐：图片消息构造、动态文案键名、私信 `sender_uid` 解析均与 Python 参考实现逐点核对
 
 **已知边界**（未改动，保持与 Python 一致）：默认口令 `admin()` 为上游设计，已加启动告警，公网部署仍需配置 `CHAT_PASSWORD`。
+
+### ops — 实机部署 rust-backend
+
+生产实机（Python 版）替换为 rust-backend 单进程版。部署前完成四项兼容核验：① 数据格式（memory/user_profiles/permanent/affection/private_message_state 等与 Python 逐文件比对）；② 配置键差集（实机 109 键 vs Rust 默认表，仅缺 OR_BACKUP_* 与 AUTO_BLOCK_ON_AFFECTION——前者已补实现、后者已使用）；③ glibc（本地 2.35 构建 / 实机 2.41 运行，向后兼容）；④ 本地以实机 config+data 冒烟全绿。
+
+| 步骤 | 结果 |
+|------|------|
+| 备份 | /opt/bak-bilibili-rs-pre-deploy-20260916-0730.tar.gz（4.2MB，原目录保留可回滚） |
+| 旧版移除 | systemctl stop + disable bilibili-bot（ai.py）与 bilibili-panel（local-chat.py），进程已退出 |
+| 新版部署 | /opt/bilibili-ai-bot-rs（二进制 + chat.html + config.json + data/ 全量）；systemd `bilibili-rs` 单进程 worker+web，端口 5000，CHAT_PASSWORD 环境变量注入 |
+| 大模型配置迁移 | config.json 全键迁移：OR_CHAT/VISION/SEARCH/IMAGE_*、模型池 4 条（ACTIVE=2）、OR_BACKUP_* 备用通道、EMBED/SILICON、RATE_LIMIT_*_TPM |
+| 验证 | health 200、登录同密码、stats/pool/temp API 全通；Bot 主循环真实回复评论（LLM 调用成功）、好感度更新、systemd active |
+| 安全 | 公网 403 为实机既有 YJ-FIREWALL 白名单（旧版同样受限），非新版引入 |
+
 
 ### feat(rust-backend) — 2026-09-15 更新全量移植（9 项）
 
