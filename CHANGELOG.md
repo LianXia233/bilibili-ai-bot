@@ -20,6 +20,7 @@
 
 | 日期 | 类型 | 标题 | 影响面 |
 |------|------|------|--------|
+| 2026-09-16 | `chore(cleanup)` | 移除 Python/Flask 版后端（7 个 .py + Requirements.txt + tests/），仓库仅保留 rust-backend；README / DEPLOY 同步改为 Rust 部署 | 结构调整 |
 | 2026-09-16 | `fix(security)` | WebUI 登录「连接失败」：非安全上下文（HTTP 公网访问）下 Web Crypto 不可用，加密通道全链路 noble 纯 JS 回退 | 故障修复 |
 | 2026-09-16 | `fix(private_msgs)` | 私信复读死循环：内容回显去重，B 站把 bot 自己回复误标为对方消息时直接跳过 | 故障修复 |
 | 2026-09-16 | `feat(security)` | HTTP 应用层加密通信：X25519 + HKDF-SHA256 + AES-256-GCM，防被动抓包读取 API 正文 | 安全加固 |
@@ -498,6 +499,16 @@ if not ENABLE_SLEEP:      # 默认 False -> 全天在线
 ---
 
 ## [2026-09-16]
+
+### chore(cleanup) — 移除 Python/Flask 版后端，仓库仅保留 rust-backend
+
+背景：Rust 版（`rust-backend/`，Axum + tokio）已功能等价并上线生产，Python/Flask 版（`ai.py` / `local-chat.py` / `config.py` / `dynamic.py` / `private_messages.py` / `bili_login.py` / `Proactive.py` / `Requirements.txt` / `tests/`）从仓库移除，避免双后端并存导致混淆与重复维护。
+
+同步更新：
+- `README.md`：badge 改为 Rust/Axum；项目结构树只列 rust-backend；快速开始改为 `cargo build --release` + 单进程启动（`--base-dir . --port 5000`）；`config.py` / `ai.py` 引用改指 `config.rs` / `bot.rs`。
+- `DEPLOY.md`：整体改写为 Rust 部署指南（单 systemd 服务 `bilibili-rs`、`--no-bot`/`--no-web` 拆分说明、加密握手自检、升级流程、安全加固清单）。
+
+生产机自 2026-09-16 起已运行 Rust 版，Python 版无残留。
 
 ### fix(security) — WebUI 登录「连接失败」：非安全上下文下 Web Crypto 不可用，加密通道全链路 noble 回退
 

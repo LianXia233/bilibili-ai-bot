@@ -10,8 +10,7 @@
 
 <br>
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white)
-![Flask](https://img.shields.io/badge/Flask-Web%20Panel-000000?style=flat-square&logo=flask&logoColor=white)
+![Rust](https://img.shields.io/badge/Backend-Rust%20%2F%20Axum-DEA584?style=flat-square&logo=rust&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-4B5563?style=flat-square&logo=linux&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-0F9D58?style=flat-square)
 
@@ -201,20 +200,25 @@
 
 ```
 bilibili-ai-bot/
-├── ai.py               # 主程序：评论/私信监听、主动行为调度、记忆管理
-├── private_messages.py # 私信轮询、发送、去重与安全判断
-├── bili_login.py       # B站二维码登录
-├── Proactive.py        # 主动刷视频 + 评论模块
-├── dynamic.py          # 动态发布模块
-├── local-chat.py       # Flask Web 面板 + 本地聊天后端
+├── rust-backend/         # Rust 后端（Axum + tokio + reqwest，唯一后端）
+│   ├── src/
+│   │   ├── bot.rs        # Bot 主循环：评论/@ 轮询、回复生成、好感度、记忆压缩
+│   │   ├── web.rs        # Web 面板：登录、聊天、记忆、人格、配置、安全中心
+│   │   ├── crypto_http.rs# 应用层加密（X25519 + HKDF-SHA256 + AES-256-GCM）
+│   │   ├── private_msgs.rs # 私信轮询、安全判定、内容回显去重
+│   │   ├── bili_api.rs   # B站 API 封装（WBI 签名、BV↔aid、Cookie 刷新）
+│   │   ├── bili_login.rs # 扫码登录
+│   │   ├── proactive.rs  # 主动刷视频 + 评论
+│   │   ├── dynamic.rs    # 动态发布
+│   │   ├── config.rs     # 配置管理（热更新、模型路由）
+│   │   ├── memory.rs     # 记忆（语义检索、永久记忆、压缩）
+│   │   ├── llm.rs        # 模型调用（chat/vision/search/image）
+│   │   └── personality.rs# 性格演化
+│   └── Cargo.toml
 ├── chat.html           # Web 前端（聊天 + 管理面板）
 ├── static/             # 前端静态资源（背景图、角色立绘、Logo）
-├── config.py           # 配置管理（热更新、Cookie 刷新）
-├── config.json         # 运行时配置（自动生成，勿上传）
 ├── config.example.json # 配置示例
-├── Requirements.txt    # Python 依赖
-├── data/               # 运行时数据（记忆、好感度、日志等）
-├── tests/              # 单元测试
+├── data/               # 运行时数据（记忆、好感度、日志等，勿上传）
 ├── DEPLOY.md           # 生产部署（systemd / 反向代理 / 安全加固）
 ├── CHANGELOG.md        # 更新日志（相对上游的变更，唯一变更记录）
 ├── FIXES.md            # 问题根因与排查记录
@@ -229,17 +233,18 @@ bilibili-ai-bot/
 
 | 项 | 要求 |
 |------|------|
-| Python | 3.8+ |
+| 后端 | Rust 1.98+（仅构建需要；部署直接用 release 二进制，见 [DEPLOY.md](DEPLOY.md)） |
 | B站账号 | 可在面板扫码登录，也可手动填写 Cookie |
 | AI API Key | 任何兼容 OpenAI 格式的 API 均可 |
 | Embedding API Key | 可选，用于记忆语义检索 |
 
-### 2. 安装
+### 2. 构建
 
 ```bash
 git clone https://github.com/LianXia233/bilibili-ai-bot.git
-cd bilibili-ai-bot
-pip install -r Requirements.txt
+cd bilibili-ai-bot/rust-backend
+cargo build --release
+# 产物：target/release/bilibili-ai-bot-rs
 ```
 
 ### 3. 配置
@@ -268,14 +273,14 @@ cp config.example.json config.json
 ### 4. 启动
 
 ```bash
-# 启动评论监听 + 主动行为（后台运行建议用 tmux 或 screen）
-python ai.py
+# 在仓库根目录（含 config.json / chat.html / data/）运行，单进程同时跑 Bot 主循环 + Web 面板
+./rust-backend/target/release/bilibili-ai-bot-rs --base-dir . --port 5000
 
-# 启动 Web 面板（另开一个终端）
-python local-chat.py
+# 只跑 Web 面板（不跑评论轮询）
+./rust-backend/target/release/bilibili-ai-bot-rs --base-dir . --port 5000 --no-bot
 ```
 
-访问 `http://你的IP:5000`，默认密码 `admin()`。
+访问 `http://你的IP:5000`，默认密码 `admin()`；面板口令可用环境变量 `CHAT_PASSWORD` 注入。
 
 > 生产环境不要停留在默认口令上，部署细节见 [DEPLOY.md](DEPLOY.md)。
 
@@ -455,7 +460,7 @@ tier 2/3 这类「锦上添花」的内容。同层内按写入时间**新的先
 
 三点行为约定：
 
-1. **留空 = 沿用默认值**。面板输入框留空则该项不写入 `config.json`，由 `config.py` 的默认值兜住。
+1. **留空 = 沿用默认值**。面板输入框留空则该项不写入 `config.json`，由 `config.rs` 的默认值兜住。
 2. **改完立即生效**，不需要重启 Bot（`get_max_tokens()` 每次读盘，不是启动时快照）。
 3. **调大只抬高上限**，不会凭空增加费用 —— 实际计费仍按模型真实产出的 token 数。
 
@@ -628,7 +633,7 @@ Embedding 模型没配置（`EMBED_MODEL` 为空串）导致记忆检索抛异�
 
 <br>
 
-目前 Bot 会监听你账号下所有视频的新评论。如需限制范围，可修改 `ai.py` 中的评论获取逻辑。
+目前 Bot 会监听你账号下所有视频的新评论。如需限制范围，可修改 `rust-backend/src/bot.rs` 中的评论获取逻辑。
 
 </details>
 
