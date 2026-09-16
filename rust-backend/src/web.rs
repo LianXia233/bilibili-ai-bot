@@ -562,13 +562,65 @@ async fn api_user_detail(State(ctx): State<Arc<WebCtx>>, AxumPath(uid): AxumPath
     .into_response()
 }
 
-// ---------- 成本 ----------
+// ---------- 成本 / 模型调用统计 ----------
+/// 返回成本与模型调用统计：
+/// - total_all / calls_all：跨日累计
+/// - days：按日倒序 [{date,total,calls,input_tokens,output_tokens,models:{模型:{calls,input_tokens,output_tokens,cost}}}]
+/// - models：跨日按模型聚合（WebUI「模型调用统计」数据源，能看出具体用的哪个模型）
 async fn api_cost_stats(State(ctx): State<Arc<WebCtx>>) -> Response {
     let cost: Value = load_json(&ctx.path("cost_log.json"), json!({}));
     let today = crate::util::today_str();
     let today_entry = cost.get(&today).cloned().unwrap_or(json!({}));
+    let obj = match cost.as_object() {
+        Some(o) => o,
+        None => return Json(json!({"total_all": 0.0, "calls_all": 0, "days": [], "models": {}, "date": today})).into_response(),
+    };
+    let mut days: Vec<Value> = Vec::new();
+    let mut total_all = 0.0f64;
+    let mut calls_all: i64 = 0;
+    let mut models_all: std::collections::BTreeMap<String, (i64, i64, i64, f64)> = std::collections::BTreeMap::new();
+    for (date, v) in obj.iter() {
+        let Some(day) = v.as_object() else { continue };
+        let total = day.get("total").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let calls = day.get("calls").and_then(|x| x.as_i64()).unwrap_or(0);
+        let input_tokens = day.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+        let output_tokens = day.get("output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+        total_all += total;
+        calls_all += calls;
+        let mut models = std::collections::BTreeMap::new();
+        if let Some(ms) = day.get("models").and_then(|m| m.as_object()) {
+            for (name, e) in ms {
+                let eo = match e.as_object() { Some(o) => o, None => continue };
+                let calls = eo.get("calls").and_then(|x| x.as_i64()).unwrap_or(0);
+                let it = eo.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+                let ot = eo.get("output_tokens").and_then(|x| x.as_i64()).unwrap_or(0);
+                let c = eo.get("cost").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                models.insert(name.clone(), json!({"calls": calls, "input_tokens": it, "output_tokens": ot, "cost": (c * 1e6).round() / 1e6}));
+                let e = models_all.entry(name.clone()).or_insert((0, 0, 0, 0.0));
+                e.0 += calls; e.1 += it; e.2 += ot; e.3 += c;
+            }
+        }
+        days.push(json!({
+            "date": date,
+            "total": (total * 1e6).round() / 1e6,
+            "calls": calls,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "models": json!(models),
+        }));
+    }
+    days.sort_by(|a, b| b["date"].as_str().unwrap_or("").cmp(a["date"].as_str().unwrap_or("")));
+    let models_summary: std::collections::BTreeMap<String, Value> = models_all
+        .into_iter()
+        .map(|(k, (calls, it, ot, c))| {
+            (k.clone(), json!({"calls": calls, "input_tokens": it, "output_tokens": ot, "cost": (c * 1e6).round() / 1e6}))
+        })
+        .collect();
     Json(json!({
-        "by_day": cost,
+        "total_all": (total_all * 1e6).round() / 1e6,
+        "calls_all": calls_all,
+        "days": days,
+        "models": models_summary,
         "today": today_entry,
         "date": today,
     }))
@@ -1640,7 +1692,8 @@ async fn api_upload_image(State(ctx): State<Arc<WebCtx>>, headers: HeaderMap, bo
 
 // ---------- 静态文件 ----------
 async fn serve_index(State(ctx): State<Arc<WebCtx>>) -> Response {
-    serve_file(&ctx, "chat.html")
+    // 页面永不缓存：用户改版后必须立即拉到最新 chat.html，避免旧版 UI 反复复现
+    serve_file(&ctx, "chat.html", true)
 }
 
 async fn serve_avatar(State(ctx): State<Arc<WebCtx>>) -> Response {
@@ -1650,14 +1703,14 @@ async fn serve_avatar(State(ctx): State<Arc<WebCtx>>) -> Response {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return StatusCode::NOT_FOUND.into_response();
     }
-    serve_file(&ctx, &format!("data/images/{name}"))
+    serve_file(&ctx, &format!("data/images/{name}"), false)
 }
 
 async fn serve_image(State(ctx): State<Arc<WebCtx>>, AxumPath(name): AxumPath<String>) -> Response {
     if name.contains('/') || name.contains('\\') || name.contains("..") {
         return StatusCode::NOT_FOUND.into_response();
     }
-    serve_file(&ctx, &format!("data/images/{name}"))
+    serve_file(&ctx, &format!("data/images/{name}"), false)
 }
 
 async fn api_health() -> Response {
@@ -1674,7 +1727,7 @@ fn image_mime(name: &str) -> &'static str {
     }
 }
 
-fn serve_file(ctx: &WebCtx, rel: &str) -> Response {
+fn serve_file(ctx: &WebCtx, rel: &str, no_cache: bool) -> Response {
     let path = Path::new(&ctx.base_dir).join(rel);
     match std::fs::read(&path) {
         Ok(bytes) => {
@@ -1691,7 +1744,19 @@ fn serve_file(ctx: &WebCtx, rel: &str) -> Response {
             } else {
                 "application/octet-stream"
             };
-            ([(header::CONTENT_TYPE, mime)], bytes).into_response()
+            let mut resp = ([(header::CONTENT_TYPE, mime)], bytes).into_response();
+            if no_cache {
+                resp.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+                );
+                resp.headers_mut().insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
+                resp.headers_mut().insert(
+                    header::EXPIRES,
+                    header::HeaderValue::from_static("0"),
+                );
+            }
+            resp
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }

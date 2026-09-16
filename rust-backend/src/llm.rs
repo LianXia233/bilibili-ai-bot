@@ -281,7 +281,10 @@ pub fn log_cost(
             "cost": (cost * 1e6).round() / 1e6,
         }));
     }
-    let model_key = if model.contains('/') { model.to_string() } else { source.to_string() };
+    // 按模型记账：必须能看出「具体是哪个模型」——优先用实际模型名（API 返回/请求的 model），
+    // 来源名仅作兜底。旧逻辑 model 不含 '/' 时记成来源名，导致 hy3/qwen/glm 全部混进
+    // 「本地聊天/私信回复」等键，WebUI 统计看不到具体模型。
+    let model_key = if !model.trim().is_empty() { model.to_string() } else { source.to_string() };
     if let Some(models) = day_obj.get_mut("models").and_then(|ms| ms.as_object_mut()) {
         let entry = models
             .entry(model_key)

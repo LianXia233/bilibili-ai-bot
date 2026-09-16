@@ -4,6 +4,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="color-scheme" content="light dark">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <link rel="icon" type="image/svg+xml" href="static/img/logo/triangles.svg">
 <script>
 /* 主题初始化：置于 head 首部同步执行，避免首帧主题闪烁。
@@ -1983,6 +1986,18 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
   </div>
   <div class="panel-content">
     <div id="costTotal" style="font-size:16px;font-weight:600;color:var(--ice-blue);margin-bottom:16px;">累计总花费：$0</div>
+
+    <!-- 模型调用统计（具体是哪个模型） -->
+    <div class="settings-card" style="margin-bottom:16px;">
+      <div class="settings-card-header">
+        <span class="settings-card-title">📊 模型调用统计</span>
+        <span id="modelStatSummary" style="font-size:12px;color:var(--text-dim);"></span>
+      </div>
+      <div class="settings-card-body">
+        <div id="modelStatTable"></div>
+        <div id="modelStatChart" style="width:100%;height:240px;margin-top:10px;"></div>
+      </div>
+    </div>
 
     <!-- 手动记录费用 -->
     <div class="settings-card" style="margin-bottom:16px;">
@@ -4152,15 +4167,44 @@ async function clearMemories(target) {
   } catch(e) { toast('清空失败', 'error'); }
 }
 
-// ===== 费用统计 =====
+// ===== 费用统计 / 模型调用统计 =====
+function renderModelStats(models, totalCalls) {
+  const el = document.getElementById('modelStatTable');
+  const entries = Object.entries(models || {}).sort((a, b) => b[1].calls - a[1].calls);
+  if (!entries.length) {
+    el.innerHTML = '<p style="color:var(--text-dim);font-size:12.5px;margin:0;">暂无模型调用记录（模型发起调用后自动统计）</p>';
+    const chart = document.getElementById('modelStatChart');
+    if (chart) chart.style.display = 'none';
+    return;
+  }
+  const chart = document.getElementById('modelStatChart');
+  if (chart) chart.style.display = 'block';
+  el.innerHTML = entries.map(([name, m]) => {
+    const short = name.includes('/') ? name.split('/').pop() : name;
+    const pct = totalCalls ? (m.calls / totalCalls * 100) : 0;
+    return `<div style="margin-bottom:9px;">
+      <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:3px;gap:8px;">
+        <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(short)} <span style="color:var(--text-dim);font-size:11px;">${m.calls}次 · ${(m.input_tokens||0).toLocaleString()}+${(m.output_tokens||0).toLocaleString()} tok</span></span>
+        <span style="color:var(--ice-blue);white-space:nowrap;">${pct.toFixed(1)}% · $${(m.cost||0).toFixed(4)}</span>
+      </div>
+      <div style="background:rgba(126,200,227,0.12);border-radius:5px;height:8px;overflow:hidden;">
+        <div style="width:${Math.max(pct, 1.5)}%;height:100%;background:linear-gradient(90deg,#5cc8ff,#7ec8e3);border-radius:5px;transition:width .3s;"></div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
 async function loadCost() {
   try {
-    const resp = await fetch('/api/cost/stats');
+    const resp = await fetch('/api/cost/stats', {cache: 'no-store'});
     const data = await resp.json();
-    document.getElementById('costTotal').textContent = '累计总花费：$' + data.total_all;
+    document.getElementById('costTotal').textContent = '累计总花费：$' + (data.total_all ?? 0);
+    document.getElementById('modelStatSummary').textContent = '共 ' + (data.calls_all ?? 0) + ' 次调用';
+    renderModelStats(data.models || {}, data.calls_all || 0);
     const list = document.getElementById('costList');
-    if (!data.days.length) { list.innerHTML = '<p style="color:var(--text-dim)">暂无调用记录</p>'; return; }
-    list.innerHTML = data.days.map(d => {
+    const days = data.days || [];
+    if (!days.length) { list.innerHTML = '<p style="color:var(--text-dim)">暂无调用记录</p>'; return; }
+    list.innerHTML = days.map(d => {
       // 按模型分的明细
       let modelHtml = '';
       if (d.models && Object.keys(d.models).length > 0) {
