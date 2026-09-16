@@ -20,6 +20,7 @@
 
 | 日期 | 类型 | 标题 | 影响面 |
 |------|------|------|--------|
+| 2026-09-16 | `fix(security)` | WebUI 登录「连接失败」：非安全上下文（HTTP 公网访问）下 Web Crypto 不可用，加密通道全链路 noble 纯 JS 回退 | 故障修复 |
 | 2026-09-16 | `fix(private_msgs)` | 私信复读死循环：内容回显去重，B 站把 bot 自己回复误标为对方消息时直接跳过 | 故障修复 |
 | 2026-09-16 | `feat(security)` | HTTP 应用层加密通信：X25519 + HKDF-SHA256 + AES-256-GCM，防被动抓包读取 API 正文 | 安全加固 |
 | 2026-09-16 | `fix(panel)` | 图片上传间歇失败：文件名随机后缀含 `/` 破坏路径（历史遗留 ~9% 失败率） | 故障修复 |
@@ -497,6 +498,17 @@ if not ENABLE_SLEEP:      # 默认 False -> 全天在线
 ---
 
 ## [2026-09-16]
+
+### fix(security) — WebUI 登录「连接失败」：非安全上下文下 Web Crypto 不可用，加密通道全链路 noble 回退
+
+根因：`crypto.subtle`（Web Crypto）仅在安全上下文（https / localhost）可用；用明文 HTTP 从公网访问面板时其为 `undefined`。加密层此前仅对 X25519 做了 noble 回退，HKDF-SHA256 与 AES-256-GCM 仍直接调用 `crypto.subtle`，导致从公网 HTTP 访问时加密通道初始化必然失败：登录页无指纹提示、点击「进入」报「连接失败」（强制刷新无效，非缓存问题）。
+
+修复（chat.html）：
+- 新增 `subtleOk` 探测；`hkdf` / `gcmEnc` / `gcmDec` 在 subtle 不可用时回退到 noble 纯 JS 实现（@noble/hashes 的 HKDF-SHA256、@noble/ciphers 的 AES-256-GCM，与既有 @noble/curves 同源、均为经审计的成熟库）；
+- CDN 改用 jsDelivr `+esm` 端点：直接 import `esm/*.js` 会因包内 bare import（如 `@noble/hashes/sha512`）在浏览器无法解析而失败；
+- 错误提示细化：加密组件加载失败（CDN 不可达）与加密通道未就绪分别给出可操作文案，不再笼统显示「连接失败」。
+
+验证：非安全上下文（屏蔽 crypto.subtle）实测登录成功、面板进入、业务 API 加密往返正常（服务端解开 noble 密文）；原生路径回归无异常；生产机已部署（chat.html md5 与本地一致）。
 
 ### fix(private_msgs) — 私信复读死循环：内容回显去重（recent_sent）
 

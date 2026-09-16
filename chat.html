@@ -2816,7 +2816,7 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
 (function () {
   const MZ = window.MZ_CRYPTO = {
     ready: null, sessionId: null, c2s: null, s2c: null, counter: 0,
-    seq: Promise.resolve(), fp: null
+    seq: Promise.resolve(), fp: null, lastErr: null
   };
   const enc = new TextEncoder(), dec = new TextDecoder();
   function b64(u8) { let s = ''; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); }
@@ -2825,7 +2825,11 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
 
   // ---- X25519：原生 Web Crypto 优先（Chrome 113+/Edge/Firefox 128+），
   // Safari 回退 @noble/curves（经审计的小型现代库，CDN 加载）----
-  let xNativeOk = null, nobleMod = null;
+  // 注意：crypto.subtle 仅在安全上下文（https / localhost）可用；用明文 HTTP
+  // 从公网访问时其为 undefined，此时 X25519 / HKDF / AES-GCM 全部走 noble 纯 JS 回退。
+  let subtleOk = false;
+  try { subtleOk = !!(window.crypto && window.crypto.subtle); } catch (e) { subtleOk = false; }
+  let xNativeOk = null, nobleMod = null, nobleHashesMod = null, nobleCiphersMod = null;
   async function xDetectNative() {
     if (xNativeOk !== null) return xNativeOk;
     try { await crypto.subtle.generateKey({name: 'X25519'}, true, ['deriveBits']); xNativeOk = true; }
@@ -2834,8 +2838,23 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
   }
   async function loadNoble() {
     if (nobleMod) return nobleMod;
-    nobleMod = await import('https://cdn.jsdelivr.net/npm/@noble/curves@1.6.0/esm/ed25519.js');
+    // 用 jsDelivr +esm 端点：把包内 bare import 重写为可解析的绝对 URL
+    // （直接 import esm/*.js 会在浏览器因内部 '@noble/...' 裸导入而失败）
+    nobleMod = await import('https://cdn.jsdelivr.net/npm/@noble/curves@1.6.0/esm/ed25519.js/+esm');
     return nobleMod;
+  }
+  async function loadNobleHashes() {
+    if (nobleHashesMod) return nobleHashesMod;
+    const hk = await import('https://cdn.jsdelivr.net/npm/@noble/hashes@1.5.0/esm/hkdf.js/+esm');
+    const sh = await import('https://cdn.jsdelivr.net/npm/@noble/hashes@1.5.0/esm/sha2.js/+esm');
+    nobleHashesMod = { hkdf: hk.hkdf, sha256: sh.sha256 };
+    return nobleHashesMod;
+  }
+  async function loadNobleCiphers() {
+    if (nobleCiphersMod) return nobleCiphersMod;
+    const m = await import('https://cdn.jsdelivr.net/npm/@noble/ciphers@1.2.1/esm/aes.js/+esm');
+    nobleCiphersMod = { gcm: m.gcm };
+    return nobleCiphersMod;
   }
   async function xGen() {
     if (await xDetectNative()) {
@@ -2856,16 +2875,28 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
     return m.x25519.getSharedSecret(priv, pubBytes);
   }
   async function hkdf(ikm, salt, info) {
-    const key = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
-    return new Uint8Array(await crypto.subtle.deriveBits({name: 'HKDF', hash: 'SHA-256', salt, info}, key, 256));
+    if (subtleOk) {
+      const key = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+      return new Uint8Array(await crypto.subtle.deriveBits({name: 'HKDF', hash: 'SHA-256', salt, info}, key, 256));
+    }
+    const m = await loadNobleHashes();
+    return m.hkdf(m.sha256, ikm, salt, info, 32);
   }
   async function gcmEnc(keyBytes, nonce, aad, plain) {
-    const key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['encrypt']);
-    return new Uint8Array(await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: aad}, key, plain));
+    if (subtleOk) {
+      const key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['encrypt']);
+      return new Uint8Array(await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: aad}, key, plain));
+    }
+    const m = await loadNobleCiphers();
+    return new Uint8Array(m.gcm(keyBytes, nonce, aad).encrypt(plain));
   }
   async function gcmDec(keyBytes, nonce, aad, ct) {
-    const key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['decrypt']);
-    return new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: nonce, additionalData: aad}, key, ct));
+    if (subtleOk) {
+      const key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['decrypt']);
+      return new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: nonce, additionalData: aad}, key, ct));
+    }
+    const m = await loadNobleCiphers();
+    return new Uint8Array(m.gcm(keyBytes, nonce, aad).decrypt(ct));
   }
 
   async function cryptoInit() {
@@ -2894,7 +2925,7 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
 
   function cryptoEnsure() {
     if (!MZ.ready) {
-      MZ.ready = cryptoInit().catch(e => { MZ.ready = null; MZ.sessionId = null; throw e; });
+      MZ.ready = cryptoInit().catch(e => { MZ.ready = null; MZ.sessionId = null; MZ.lastErr = e; throw e; });
     }
     return MZ.ready;
   }
@@ -3086,7 +3117,17 @@ async function doLogin() {
       document.getElementById('loginPassword').focus();
     }
   } catch(e) {
-    errEl.textContent = '连接失败';
+    const mz = window.MZ_CRYPTO;
+    let msg = '连接失败';
+    if (mz && mz.lastErr) {
+      const le = String(mz.lastErr && mz.lastErr.message ? mz.lastErr.message : mz.lastErr);
+      msg = /import|noble|crypto|CDN|jsdelivr/i.test(le)
+        ? '加密组件加载失败：请检查网络后刷新重试（需可访问 jsDelivr CDN），或改用 HTTPS 访问'
+        : '加密通道建立失败：' + le.slice(0, 80);
+    } else if (mz && !mz.fp) {
+      msg = '无法连接加密服务：请确认服务端已运行新版协议（/api/crypto/handshake）';
+    }
+    errEl.textContent = msg;
     errEl.style.display = 'block';
   }
 }
