@@ -513,4 +513,21 @@ impl PersonaStore {
             .unwrap_or("")
             .to_string()
     }
+
+    /// 当前激活人格的完整提示词：(system_prompt, style_prompt, owner_prompt)。
+    /// 与 Python `_get_active_persona` 对齐：style_prompt 优先于默认说话风格、owner_prompt
+    /// 单独注入（Rust 此前只取 system_prompt，导致自定义人格的风格/态度指令全部丢失）。
+    pub fn active_persona_full(&self, active: &str) -> (String, String, String) {
+        let list = self.load();
+        let fallback = json!({});
+        let p = match list.iter().find(|p| p.get("name").and_then(|n| n.as_str()) == Some(active)) {
+            Some(p) => p,
+            None => list
+                .iter()
+                .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("default"))
+                .unwrap_or(&fallback),
+        };
+        let get = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        (get("system_prompt"), get("style_prompt"), get("owner_prompt"))
+    }
 }

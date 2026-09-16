@@ -850,7 +850,8 @@ impl Bot {
         let bot_name = cfg.get_str("BOT_NAME");
         let owner_bili = cfg.get_str("OWNER_BILI_NAME");
         let persona_store = PersonaStore::new(&self.base_dir);
-        let persona_prompt = persona_store.active_system_prompt(&cfg.get_str("ACTIVE_PERSONA"));
+        // 与 Python 对齐：人格 = system_prompt（身份）+ style_prompt（说话风格，优先于默认风格）+ owner_prompt（对用户的态度）。
+        let (persona_prompt, style_prompt, owner_prompt) = persona_store.active_persona_full(&cfg.get_str("ACTIVE_PERSONA"));
         let persona_section = if persona_prompt.is_empty() {
             format!("你是{bot_name}，一个有独立人格的存在。你有自己的想法和态度，会真实地表达感受，不敷衍不套话。说话自然，像真人在聊天。")
         } else {
@@ -875,6 +876,7 @@ impl Bot {
         } else {
             "【说话风格】\n- 像真人在评论区聊天，自然口语化\n- 有自己的观点和感受，不说空话套话\n- 每次回复用不同的表达方式，避免句式重复\n- 可以用语气词、省略、口语缩写，让语言更自然"
         };
+        let final_style = if style_prompt.is_empty() { default_style.to_string() } else { style_prompt };
         let channel_name = if channel == "private" { "私信" } else { "评论" };
         let private_instruction = if channel == "private" {
             let custom = cfg.get_str("PROMPT_PRIVATE_MESSAGE");
@@ -883,8 +885,19 @@ impl Bot {
             String::new()
         };
 
+        // 纯表情/装扮评论识别：文本基本由 [xxx] 表情或装扮标记组成时，禁止空洞点评装扮，
+        // 引导结合视频内容或自然找话题（这正是此前「这装扮好看/好有个性」复读式乱回的来源）。
+        let emoji_section = if is_emoji_only_comment(comment_text) {
+            "\n\n【对方这条基本只发了装扮/表情，没写实际内容】\n- 禁止点评装扮本身（不要回「这装扮好看/好可爱/好有个性」这类空洞评价，也不要复读表情）。\n- 结合上面的视频信息自然找个具体话题聊（视频内容、这个UP主、这个系列），或抛一个轻松的具体问题。\n- 拿不到视频信息时，用一句话自然接话或问候即可，别硬凑评价。".to_string()
+        } else {
+            String::new()
+        };
+
+        // 事实边界：防幻觉。此前「换头像了？→是啊换了新头像」「合同→联系客服」均属编造事实。
+        let fact_section = "\n\n【事实边界】\n- 只说自己确定的事。不知道、不确定（对方是否换了头像、某件事真假、具体时间地点、账号状态等）就直说不知道/不清楚，或自然转移话题，绝对不要编造事实或顺着对方的话承认。\n- 不要把对方的话当事实确认，也不要假装知道对方提的人、事、物。";
+
         let prompt = format!(
-            "{persona_section}\n{persona_evo}{permanent_block}\n\n{default_style}{bili_note}\n\n【底线】\n拒绝：表白暧昧、引战、黄赌毒政治。遇到恶意时平静坚定，可暗讽，不恶语。\n{level_prompt}{private_instruction}\n\n【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}\n\n当前时间：{now}{video_section}{memory_section}{search_section}{no_content_section}\n════════ 需要你回应的内容（本节唯一）════════\n{username} 的{channel_name}：\n{comment_text}\n════════════════════════════════════════════\n\n上面这一节是对方这次真正说的话，**回复必须直接针对它**：\n- 不要把这段话复述、改写、翻译或概括后再作答（比如对方说「今天天气怎么样」，不要回「今天天气怎么样呀」，而要真的回答天气或说明自己看不到实时天气）。\n- 不要把上面任何背景材料（记忆、视频信息、搜索结果、规则、设定）当成话题去回应；它们只是背景。对方没提的话题不要主动展开成回复主体，除非是「对方一个字都没写」的情况。\n- 不要因为前面有大量规则、设定或素材清单，就把注意力放在那些内容上；它们只是风格约束，本轮要回应的只有上面这一节。\n- 对方提了具体请求（写诗、写文案、解释、推荐、算数等）就当场把成品交出来，不要只回「好的，我来帮你」「我会尽力」这类空承诺 —— 那是没做事。下面「reply 简短自然」的长度要求**不适用于这类成品**，成品该多长就多长，需要分行就分行。写诗就直接把诗句写在 reply 里（例如「好的喵，给你写一首：\\n山高月小，水落石出。\\n清风徐来，水波不兴。」），不要宣布「我要写」，也不要事后再说「你看这样行不行」。\n\n请以JSON格式回复，不要加任何多余内容：\n{{\"score_delta\": 数字, \"reply\": \"回复内容\", \"impression\": \"一句话描述对该用户的印象\", \"user_facts\": [\"用户提到的个人信息1\", \"用户提到的个人信息2\"]}}\n\nuser_facts：如果用户在这条{channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。\n\nscore_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。\nreply简短自然，一般15-40字，像B站真人回复，不要写得像作文。\n（例外：上面「需要你回应的内容」里如果对方点名要一件成品 —— 写诗、写文案、解释一段概念、推荐并列出清单等 —— 则不受这个字数限制，先把成品写出来。）\nimpression简短描述用户性格/说话风格，如\"友善健谈，喜欢聊游戏\"。"
+            "{persona_section}\n{persona_evo}{permanent_block}\n\n{final_style}{bili_note}\n\n{owner_prompt}\n\n【底线】\n拒绝：表白暧昧、引战、黄赌毒政治。遇到恶意时平静坚定，可暗讽，不恶语。\n{level_prompt}{private_instruction}\n\n【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}\n\n当前时间：{now}{video_section}{memory_section}{search_section}{no_content_section}{emoji_section}{fact_section}\n════════ 需要你回应的内容（本节唯一）════════\n{username} 的{channel_name}：\n{comment_text}\n════════════════════════════════════════════\n\n上面这一节是对方这次真正说的话，**回复必须直接针对它**：\n- 不要把这段话复述、改写、翻译或概括后再作答（比如对方说「今天天气怎么样」，不要回「今天天气怎么样呀」，而要真的回答天气或说明自己看不到实时天气）。\n- 不要把上面任何背景材料（记忆、视频信息、搜索结果、规则、设定）当成话题去回应；它们只是背景。对方没提的话题不要主动展开成回复主体，除非是「对方一个字都没写」的情况。\n- 不要因为前面有大量规则、设定或素材清单，就把注意力放在那些内容上；它们只是风格约束，本轮要回应的只有上面这一节。\n- 每次回复不要用「哈哈」「这装扮」「真好看」这类开头/句式，避免复读机感；同样的意思换种说法。\n- 对方提了具体请求（写诗、写文案、解释、推荐、算数等）就当场把成品交出来，不要只回「好的，我来帮你」「我会尽力」这类空承诺 —— 那是没做事。下面「reply 简短自然」的长度要求**不适用于这类成品**，成品该多长就多长，需要分行就分行。写诗就直接把诗句写在 reply 里（例如「好的喵，给你写一首：\\n山高月小，水落石出。\\n清风徐来，水波不兴。」），不要宣布「我要写」，也不要事后再说「你看这样行不行」。\n\n请以JSON格式回复，不要加任何多余内容：\n{{\"score_delta\": 数字, \"reply\": \"回复内容\", \"impression\": \"一句话描述对该用户的印象\", \"user_facts\": [\"用户提到的个人信息1\", \"用户提到的个人信息2\"]}}\n\nuser_facts：如果用户在这条{channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。\n\nscore_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。\nreply简短自然，一般15-40字，像B站真人回复，不要写得像作文。\n（例外：上面「需要你回应的内容」里如果对方点名要一件成品 —— 写诗、写文案、解释一段概念、推荐并列出清单等 —— 则不受这个字数限制，先把成品写出来。）\nimpression简短描述用户性格/说话风格，如\"友善健谈，喜欢聊游戏\"。"
         );
 
         let max_tokens = cfg.max_tokens_of("reply");
@@ -931,4 +944,45 @@ impl IfEmpty for String {
 #[allow(dead_code)]
 fn _keep(_: &AtomicI64) -> i64 {
     Ordering::Relaxed as i64
+}
+
+/// 判断评论是否「基本只由表情/装扮标记组成」（如 [米雪儿·绮星梦使 应援装扮_豆橛子]×4）。
+/// 这类评论没有实际内容，模型若去点评装扮本身就会产出「这装扮好看」式的空洞复读。
+fn is_emoji_only_comment(text: &str) -> bool {
+    // 剥掉所有 [xxx] 表情/装扮标记，看剩余内容
+    let mut rest = String::new();
+    let mut in_bracket = false;
+    for c in text.chars() {
+        match c {
+            '[' => in_bracket = true,
+            ']' => in_bracket = false,
+            _ if !in_bracket => rest.push(c),
+            _ => {}
+        }
+    }
+    let rest = rest.trim();
+    if rest.is_empty() {
+        // 原文本为空（真没内容）由 no_content 分支处理；这里只识别「本来是表情」的情况
+        return !text.trim().is_empty();
+    }
+    // 剩余只是少量语气词（<=2 个字符）也算表情为主
+    rest.chars().count() <= 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emoji_only_detection() {
+        // 纯装扮/表情：判定为表情为主
+        assert!(is_emoji_only_comment("[米雪儿·绮星梦使 应援装扮_豆橛子][米雪儿·绮星梦使 应援装扮_豆橛子]"));
+        assert!(is_emoji_only_comment("[Mygo表情包_让我看看][秋星曜野表情包_期待]"));
+        assert!(is_emoji_only_comment("[装扮_wink]哈哈"));
+        // 有实际内容的评论：不算
+        assert!(!is_emoji_only_comment("换头像了？[香奈美·追寻那道光 应援装扮_wink]"));
+        assert!(!is_emoji_only_comment("吃的来了[爱若刹时_吃炸鸡][爱若刹时_吃炸鸡]"));
+        assert!(!is_emoji_only_comment("我找不到合同了怎么办哦"));
+        assert!(!is_emoji_only_comment(""));
+    }
 }

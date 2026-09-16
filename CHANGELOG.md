@@ -63,6 +63,7 @@
 | 2026-09-16 | `feat(rust-backend)` | 对话备用通道 OR_BACKUP_MODEL/URL/KEY 补全（chat 专属第三条路，部署实机大模型配置迁移必需） | 功能移植 |
 | 2026-09-16 | `ops` | 实机部署 rust-backend：停用 Python 双服务、systemd 单进程接管、config/data 全量迁移 | 部署 |
 | 2026-09-16 | `feat(rust-backend)` | 记忆功能防乱回复优化：相关度过滤注入、记忆格式标注、回复防重复、记忆写入截断、性格演化稳定 | 功能优化 |
+| 2026-09-16 | `fix(rust-backend)` | 回复乱回根因修复：人格 style/owner 提示词丢失、激活通用人格、纯表情评论空洞点评、幻觉编造事实 | 缺陷修复 |
 
 ### fix(rust-backend) — rust-backend 全量代码审计与修复（8 项）
 
@@ -87,6 +88,21 @@
 - 行为对齐：图片消息构造、动态文案键名、私信 `sender_uid` 解析均与 Python 参考实现逐点核对
 
 **已知边界**（未改动，保持与 Python 一致）：默认口令 `admin()` 为上游设计，已加启动告警，公网部署仍需配置 `CHAT_PASSWORD`。
+
+### fix(rust-backend) — 回复乱回根因修复
+
+排查实机真实回复样本后定位四类根因并修复（提交后将部署实机）：
+
+| 根因 | 证据 | 修复 |
+|------|------|------|
+| 激活了通用 AI 人格 | 实机 ACTIVE_PERSONA="1"（5 行通用模板人格），定制猫娘人格 default 未被激活；回复呈客服腔（「合同丢失可以联系客服」） | 实机配置切回 ACTIVE_PERSONA=default（面板可随时切换） |
+| Rust 丢失 style_prompt/owner_prompt | Python 用 `style_prompt 优先于默认风格 + owner_prompt 单独注入`，Rust 只取 system_prompt，猫娘「可爱」风格与态度指令全部丢失 | 新增 active_persona_full()，bot 回复完整注入三段（对齐 ai.py） |
+| 纯表情评论空洞点评 | 回复样本「这装扮很好看/好可爱/好有个性」反复复读 | 识别纯表情/装扮评论（剥掉 [xxx] 后无实质内容），注入专门指令：禁止点评装扮、结合视频找话题 |
+| 幻觉编造事实 | 「换头像了？→是啊，换了新头像」「合同→请联系客服」 | prompt 增加【事实边界】：不确定的事直说不知道，禁止编造或顺着对方承认 |
+| 复读机句式 | 「哈哈」开头频繁 | prompt 禁止「哈哈/这装扮/真好看」式开头与重复句式 |
+
+验证：cargo check/clippy 无新增警告；3 项单元测试全绿（含 is_emoji_only_comment 识别）。
+
 
 ### feat(rust-backend) — 记忆功能防乱回复优化
 
