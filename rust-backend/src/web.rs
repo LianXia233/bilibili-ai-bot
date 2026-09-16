@@ -408,13 +408,9 @@ async fn api_chat(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Re
         let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
         llm_messages.push(json!({"role": role, "content": content}));
     }
-    let mut user_entry = if image_filename.is_empty() {
-        json!({"role": "user", "content": user_msg})
-    } else {
-        json!({"role": "user", "content": user_msg, "image": image_filename})
-    };
-    // 组装 LLM 消息：图片 + 文本合并为单条 content 数组（与 Python _generate_reply 对齐）；
-    // 图片缺失/不可读时降级为纯文本，绝不丢掉用户文字消息。
+    // 组装 LLM 消息：无图时 content 用纯字符串——部分模型（hy3 等）不支持 content 数组，
+    // 会把数组消息当成「用户没说话」，导致对任何输入都回「你好像不想说话/沉默」类套话。
+    // 有图时使用 OpenAI 兼容的 content 数组；图片缺失/不可读时降级为纯文本，绝不丢掉用户文字消息。
     let mut content: Vec<Value> = Vec::new();
     if !image_filename.is_empty() {
         let img_path = ctx.path("images").join(&image_filename);
@@ -437,7 +433,14 @@ async fn api_chat(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Re
     if content.is_empty() {
         content.push(json!({"type": "text", "text": "（发送了一张图片）"}));
     }
-    llm_messages.push(json!({"role": "user", "content": Value::Array(content)}));
+    let mut user_entry = json!({"role": "user", "content": user_msg});
+    if image_filename.is_empty() {
+        // 无图：纯字符串，所有模型通道都能正确读到用户消息
+        llm_messages.push(json!({"role": "user", "content": user_msg}));
+    } else {
+        user_entry["content"] = Value::Array(content.clone());
+        llm_messages.push(json!({"role": "user", "content": Value::Array(content)}));
+    }
 
     let max_tokens = cfg.max_tokens_of("chat");
     match ctx.llm.complete("chat", json!(llm_messages), max_tokens).await {
