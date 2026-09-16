@@ -699,6 +699,8 @@ impl Bot {
             }
             let ok = self.private.send_text(&mid, &result.reply).await;
             if ok {
+                // 记录已发送内容：下一轮 B站 把该回复以「对方消息」读回时直接跳过（防复读）
+                self.private.record_sent(&mid, &result.reply);
                 tracing::info!("已回复私信 {username}({mid})：{}", truncate(&result.reply, 60));
                 count += 1;
                 let current = affection.get(&mid).and_then(|v| v.as_i64()).unwrap_or(0);

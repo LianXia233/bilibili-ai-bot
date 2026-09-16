@@ -215,15 +215,74 @@ pub struct PrivateMessageClient {
     pub http: reqwest::Client,
     pub config: Arc<RwLock<Config>>,
     pub state_file: PathBuf,
+    /// 内容回显去重：记录本 bot 最近对该会话发送过的回复（content, unix_ts）。
+    /// B站 svr_sync 拉取接口会把 bot 自己刚发的消息在下一轮以 sender_uid=对方 返回，
+    /// 仅靠 sender_uid==self_uid 无法拦截，导致「回复→读回→再回复」的复读死循环。
+    /// 命中「1 小时内对同一会话发送过相同内容」的消息直接跳过。
+    recent_sent: std::sync::RwLock<std::collections::HashMap<String, Vec<(String, i64)>>>,
 }
+
+const RECENT_SENT_TTL_SECS: i64 = 3600;
+const RECENT_SENT_MAX_PER_TALKER: usize = 50;
 
 impl PrivateMessageClient {
     pub fn new(config: Arc<RwLock<Config>>, base_dir: &str) -> Self {
         let http = reqwest::Client::builder().cookie_store(true).build().expect("私信 client 构建失败");
+        let mut recent_sent: std::collections::HashMap<String, Vec<(String, i64)>> = std::collections::HashMap::new();
+        let st = crate::util::load_json::<serde_json::Value>(&crate::util::data_path(base_dir, "private_message_state.json"), serde_json::json!({}));
+        if let Some(map) = st.get("recent_sent").and_then(|v| v.as_object()) {
+            for (mid, arr) in map {
+                let mut list: Vec<(String, i64)> = Vec::new();
+                if let Some(items) = arr.as_array() {
+                    for it in items {
+                        if let (Some(c), Some(t)) = (it.get(0).and_then(|x| x.as_str()), it.get(1).and_then(|x| x.as_i64())) {
+                            list.push((c.to_string(), t));
+                        }
+                    }
+                }
+                if !list.is_empty() {
+                    recent_sent.insert(mid.clone(), list);
+                }
+            }
+        }
         PrivateMessageClient {
             http,
             config,
             state_file: crate::util::data_path(base_dir, "private_message_state.json"),
+            recent_sent: std::sync::RwLock::new(recent_sent),
+        }
+    }
+
+    /// 记录一次已发送的回复（内容回显去重）。
+    pub fn record_sent(&self, talker_id: &str, content: &str) {
+        if content.trim().is_empty() {
+            return;
+        }
+        let now = crate::util::now_unix();
+        let mut map = self.recent_sent.write().unwrap();
+        let entry = map.entry(talker_id.to_string()).or_default();
+        entry.retain(|(_, ts)| now - *ts <= RECENT_SENT_TTL_SECS);
+        entry.push((content.to_string(), now));
+        if entry.len() > RECENT_SENT_MAX_PER_TALKER {
+            let keep = entry.len() - RECENT_SENT_MAX_PER_TALKER;
+            entry.drain(..keep);
+        }
+        let persist: serde_json::Value = map.iter().map(|(k, v)| {
+            (k.clone(), serde_json::json!(v.iter().map(|(c, t)| serde_json::json!([c, t])).collect::<Vec<_>>()))
+        }).collect();
+        let mut st: serde_json::Value = crate::util::load_json(&self.state_file, serde_json::json!({}));
+        st["recent_sent"] = persist;
+        let _ = crate::util::save_json(&self.state_file, &st);
+    }
+
+    /// 内容回显检查：最近 1 小时内是否对同一会话发送过相同内容。
+    fn is_recent_sent(&self, talker_id: &str, content: &str) -> bool {
+        let now = crate::util::now_unix();
+        let map = self.recent_sent.read().unwrap();
+        if let Some(list) = map.get(talker_id) {
+            list.iter().any(|(c, ts)| now - *ts <= RECENT_SENT_TTL_SECS && c == content)
+        } else {
+            false
         }
     }
 
@@ -495,6 +554,12 @@ impl PrivateMessageClient {
                 if content.is_empty() {
                     continue;
                 }
+                // 内容回显去重：B站 可能把 bot 自己刚发的回复在下一轮以 sender_uid=对方 返回，
+                // sender_uid 过滤无法拦截；命中最近 1 小时对同一会话发送过的相同内容即跳过。
+                if self.is_recent_sent(&talker_id.to_string(), &content) {
+                    tracing::debug!("私信内容回显跳过（{talker_id}）：{content}");
+                    continue;
+                }
                 let account = session.get("account_info").cloned().unwrap_or(json!({}));
                 let username = account.get("name").and_then(|v| v.as_str())
                     .or_else(|| account.get("uname").and_then(|v| v.as_str()))
@@ -593,5 +658,34 @@ impl PrivateMessageClient {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_sent_echo_dedup() {
+        let unique = format!("/tmp/recent_sent_test_rs_{}", std::process::id());
+        let _ = std::fs::remove_file(format!("{unique}/private_message_state.json"));
+        let _ = std::fs::remove_dir_all(&unique);
+        let cfg = Arc::new(RwLock::new(Config::load(PathBuf::from(format!("{unique}/cfg.json"))).unwrap_or_else(|_| Config { file: PathBuf::from(format!("{unique}/cfg.json")), raw: json!({}) })));
+        let client = PrivateMessageClient::new(cfg, &unique);
+        let mid = "3461581698501262";
+
+        // 未记录 → 不命中
+        assert!(!client.is_recent_sent(mid, "喵，你好"));
+        // 记录后命中
+        client.record_sent(mid, "喵，你好");
+        assert!(client.is_recent_sent(mid, "喵，你好"));
+        // 不同内容不命中
+        assert!(!client.is_recent_sent(mid, "喵，再见"));
+        // 不同会话不命中
+        assert!(!client.is_recent_sent("999", "喵，你好"));
+
+        // 空内容不记录不命中
+        client.record_sent(mid, "");
+        assert!(!client.is_recent_sent(mid, ""));
     }
 }
