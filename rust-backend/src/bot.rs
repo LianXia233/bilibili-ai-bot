@@ -307,10 +307,20 @@ impl Bot {
                 }
             }
 
-            // 评论 + @ 合并去重
-            let replies = self.bili.get_replies().await;
-            let at_replies = self.bili.get_at_replies().await;
-            let pending = BiliClient::merge_pending(vec![replies, at_replies]);
+            // 评论 + @ 合并去重（受 ENABLE_COMMENT_AUTO_REPLY / ENABLE_AT_AUTO_REPLY 独立控制；
+            // 两者都关闭时跳过 API 轮询，评论与 @ 自动回复完全停止，私信不受影响）
+            let mut streams: Vec<Vec<crate::bili_api::ReplyItem>> = Vec::new();
+            if cfg.get_bool("ENABLE_COMMENT_AUTO_REPLY") {
+                streams.push(self.bili.get_replies().await);
+            }
+            if cfg.get_bool("ENABLE_AT_AUTO_REPLY") {
+                streams.push(self.bili.get_at_replies().await);
+            }
+            let pending = if streams.is_empty() {
+                Vec::new()
+            } else {
+                BiliClient::merge_pending(streams)
+            };
 
             for reply in pending {
                 let rpid = reply.rpid;
@@ -341,7 +351,7 @@ impl Bot {
                 // 记忆上下文
                 let memory_context = self
                     .memory
-                    .build_memory_context(&memory, &reply.thread_id, &mid_str, &reply.content)
+                    .build_memory_context(&memory, &mid_str)
                     .await;
 
                 // 评论配图识别
@@ -677,7 +687,7 @@ impl Bot {
 
             // 生成回复（私信通道）
             let level = self.personality.get_level(affection.get(&mid).and_then(|v| v.as_i64()).unwrap_or(0), Some(&mid));
-            let memory_context = self.memory.build_memory_context(memory, &format!("dm:{mid}"), &mid, &content).await;
+            let memory_context = self.memory.build_memory_context(memory, &mid).await;
             let mut result = match self.generate_reply_and_score(&content, &username, level, &memory_context, None, false, "private").await {
                 Ok(r) => r,
                 Err(e) => {
@@ -821,7 +831,7 @@ impl Bot {
         let memory_section = if memory_context.is_empty() {
             String::new()
         } else {
-            format!("\n\n【记忆参考（背景材料：仅在与当前话题直接相关时参考，否则一律忽略；其中的历史发言禁止照搬复述，禁止把记忆里的旧话题当成现在要回应的话题）】\n{memory_context}")
+            format!("\n\n【对话上下文（记忆，已默认注入）】\n以下是对方过往的真实对话/互动记录，回复前必须先读完并理解：对方是谁、之前聊过什么、关系如何。\n回复须与这段历史连贯（记得的事要接得上），但禁止照搬复述历史发言，禁止把记忆里的旧话题当成当前要回应的话题；记忆里没有的信息不要编造，不知道就自然承认。\n{memory_context}")
         };
         let video_section = match video_context {
             Some(v) if !v.is_empty() => format!("\n\n【对方所在的视频】\n{v}\n（对方是在这个视频的评论区里说话的，可以自然引用上面的内容，但不要照抄标题）"),

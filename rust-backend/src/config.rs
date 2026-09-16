@@ -61,6 +61,9 @@ pub fn defaults() -> HashMap<&'static str, Value> {
     set("ENABLE_PRIVATE_MESSAGES", json!(false));
     set("PRIVATE_MESSAGE_AUTO_REPLY", json!(true));
     set("PRIVATE_MESSAGE_AUTO_BLOCK", json!(true));
+    // 评论 / @ 回复独立开关（默认关闭：评论与 @ 自动回复停止，仅私信按 ENABLE_PRIVATE_MESSAGES 独立运行；WebUI「系统设置 → 功能开关」可随时开启）
+    set("ENABLE_COMMENT_AUTO_REPLY", json!(false));
+    set("ENABLE_AT_AUTO_REPLY", json!(false));
     // 私信参数
     set("PRIVATE_MESSAGE_REPLY_SCOPE", json!("all"));
     set("PRIVATE_MESSAGE_REPLY_WHITELIST_UIDS", json!([]));
@@ -128,10 +131,9 @@ pub fn defaults() -> HashMap<&'static str, Value> {
     set("PERMANENT_MEMORY_CHAR_BUDGET", json!(2500));
     set("PERMANENT_MEMORY_INJECT", json!(40));
     // 临时记忆装填质量（防止无关历史注入导致乱回复）
-    set("MEMORY_THREAD_TAIL", json!(4));       // 线程最近 N 条（embedding 可用时按与当前话题相关度取）
-    set("MEMORY_THREAD_CHARS", json!(800));    // 线程记忆注入最大字符数
-    set("MEMORY_SEMANTIC_TOP", json!(3));      // 语义检索最多注入条数
-    set("MEMORY_SEMANTIC_MIN_SIM", json!(0.5)); // 语义记忆最低相关度（低于视为无关，不注入）
+    // 对话上下文预算：按用户聚合的历史对话默认注入上限（字符），默认 300K（用户指定）。
+    // 实际注入量由该用户记忆总量与相关度决定，通常远小于上限；仅当记忆很丰富时才接近 300K。
+    set("CONTEXT_MAX_CHARS", json!(300_000));
     // 回复防重复（同一用户连续类似话题时避免重复内容；0 关闭）
     set("REPLY_DEDUP_SIM", json!(0.85));       // 与最近回复的字符相似度阈值，超过则重新生成
     set("REPLY_DEDUP_LOOKBACK", json!(3));     // 对比最近 N 条自己发过的回复

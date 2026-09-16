@@ -4,7 +4,7 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::llm::{log_cost, LlmClient};
-use crate::util::{cosine_similarity, load_json, now_str, save_json, v_str};
+use crate::util::{load_json, now_str, save_json, v_str};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -134,81 +134,42 @@ impl MemoryStore {
         self.save(memory)
     }
 
-    /// 线程记忆：embedding 可用时按「与当前话题的相关度」取相关度最高的 tail 条
-    /// （跨话题时不再把无关历史全量注入）；完全没有相关记忆时退回时间最近 tail 条，
-    /// 避免冷场。
-    pub async fn get_thread_memories(
+    /// 用户独立会话上下文：按 user_id 聚合该用户全部历史对话（评论/@/私信共享一份），
+    /// **全部优先注入**（不按相关度挑拣——避免记忆被丢弃导致失忆/乱回），按时间正序排列；
+    /// 预算 max_chars（默认 300K，见 CONTEXT_MAX_CHARS）作为安全上限，
+    /// 超预算时保留「最近连续段」（倒序装入、装满即停、再反转回时间正序）。
+    /// 每个用户只有自己的一份会话记忆，互不串台；回复前默认注入，作为连贯上下文的来源。
+    pub async fn get_user_session_context(
         &self,
         memory: &[MemoryDoc],
-        thread_id: &str,
-        query_text: &str,
-        tail: usize,
+        user_id: &str,
+        max_chars: usize,
     ) -> Vec<String> {
-        let docs: Vec<&MemoryDoc> = memory.iter().filter(|m| m.thread_id == thread_id).collect();
-        if docs.is_empty() {
-            return Vec::new();
-        }
-        let tail = tail.max(1);
-        let query_emb = self.get_embedding(query_text).await;
-        if query_emb.is_empty() {
-            // embedding 不可用：按时间取最近 tail 条
-            let mut sorted = docs.clone();
-            sorted.sort_by_key(|m| m.time.clone());
-            return sorted.iter().rev().take(tail).rev().map(|m| m.text.clone()).collect();
-        }
-        let mut scored: Vec<(f32, &MemoryDoc)> = docs
+        let mut user_mems: Vec<&MemoryDoc> = memory
             .iter()
-            .map(|m| {
-                let s = if m.embedding.is_empty() {
-                    0.0
-                } else {
-                    cosine_similarity(&query_emb, &m.embedding)
-                };
-                (s, *m)
-            })
+            .filter(|m| m.user_id == user_id && m.thread_id != "compressed" && m.thread_id != "local")
             .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        // 最高相关度都不足 0.2（线程里确实没有相关历史）→ 退回最近 tail 条，避免完全冷场
-        if scored.first().map(|(s, _)| *s).unwrap_or(0.0) <= 0.2 {
-            let mut sorted = docs.clone();
-            sorted.sort_by_key(|m| m.time.clone());
-            return sorted.iter().rev().take(tail).rev().map(|m| m.text.clone()).collect();
-        }
-        let mut picked: Vec<&MemoryDoc> = scored.into_iter().take(tail).map(|(_, m)| m).collect();
-        picked.sort_by_key(|m| m.time.clone());
-        picked.iter().map(|m| m.text.clone()).collect()
-    }
-
-    pub async fn get_user_semantic_memories(&self, memory: &[MemoryDoc], user_id: &str, query_text: &str) -> Vec<String> {
-        let user_mems: Vec<&MemoryDoc> = memory.iter().filter(|m| m.user_id == user_id).collect();
         if user_mems.is_empty() {
             return Vec::new();
         }
-        let query_emb = self.get_embedding(query_text).await;
-        if query_emb.is_empty() {
-            return Vec::new();
+        user_mems.sort_by_key(|m| m.time.clone());
+        // 全部注入（时间正序）；超预算时保留最近连续段
+        let mut rev: Vec<String> = Vec::new();
+        let mut used = 0usize;
+        for m in user_mems.iter().rev() {
+            let t = m.text.clone();
+            let len = t.chars().count();
+            if used + len > max_chars && !rev.is_empty() {
+                break;
+            }
+            used += len;
+            rev.push(t);
+            if used >= max_chars {
+                break;
+            }
         }
-        let cfg = self.config.read().unwrap().clone();
-        let top: usize = {
-            let n = cfg.get_i64("MEMORY_SEMANTIC_TOP");
-            if n > 0 { n as usize } else { 3 }
-        };
-        let mut min_sim: f32 = cfg.get_f64("MEMORY_SEMANTIC_MIN_SIM") as f32;
-        if min_sim <= 0.0 {
-            min_sim = 0.5;
-        }
-        let mut scored: Vec<(f32, &MemoryDoc)> = user_mems
-            .iter()
-            .map(|m| (cosine_similarity(&query_emb, &m.embedding), *m))
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored
-            .into_iter()
-            .take(top)
-            .filter(|(s, _)| *s > min_sim)
-            // 带相关度标注，模型可据此判断哪些记忆更可靠
-            .map(|(s, m)| format!("{}（相关度 {:.2}）", m.text, s))
-            .collect()
+        rev.reverse();
+        rev
     }
 
     #[allow(dead_code)]
@@ -219,31 +180,22 @@ impl MemoryStore {
     }
 
     /// 构建记忆上下文：相关线程记忆 + 用户语义记忆 + 用户档案。
-    pub async fn build_memory_context(&self, memory: &[MemoryDoc], thread_id: &str, user_id: &str, query_text: &str) -> String {
+    pub async fn build_memory_context(&self, memory: &[MemoryDoc], user_id: &str) -> String {
         let cfg = self.config.read().unwrap().clone();
-        let tail: usize = {
-            let n = cfg.get_i64("MEMORY_THREAD_TAIL");
-            if n > 0 { n as usize } else { 4 }
-        };
-        let chars_cap: usize = {
-            let n = cfg.get_i64("MEMORY_THREAD_CHARS");
-            if n > 0 { n as usize } else { 800 }
+        let session_cap: usize = {
+            let n = cfg.get_i64("CONTEXT_MAX_CHARS");
+            if n > 0 { n as usize } else { 300_000 }
         };
         let mut parts: Vec<String> = Vec::new();
-        let thread = self.get_thread_memories(memory, thread_id, query_text, tail).await;
-        if !thread.is_empty() {
-            let joined = thread.join("\n");
-            let joined: String = if joined.chars().count() > chars_cap {
-                joined.chars().take(chars_cap).collect()
-            } else {
-                joined
-            };
-            parts.push(format!("【最近相关对话（仅与当前话题直接相关时参考，否则忽略）】\n{joined}"));
+        // 用户独立会话上下文：默认注入（每个用户自己的连续对话历史，跨评论/@/私信聚合，
+        // 全部优先注入、按时间正序；预算仅作安全上限，超限保留最近连续段）
+        let session = self.get_user_session_context(memory, user_id, session_cap).await;
+        if !session.is_empty() {
+            let joined = session.join("\n");
+            parts.push(format!("【与该用户的对话上下文（默认注入：先读这段历史理解对方是谁、聊过什么，再回复；据此保持连贯，禁止照搬复述历史发言）】\n{joined}"));
         }
-        let semantic = self.get_user_semantic_memories(memory, user_id, query_text).await;
-        if !semantic.is_empty() {
-            parts.push(format!("【历史相关记忆（其中的「bot 回复」是当时的历史发言，禁止照搬复述，仅作背景了解）】\n{}", semantic.join("\n")));
-        }
+        // 注：不再单独注入语义/线程检索段——会话上下文已全量包含该用户全部记忆，
+        // 再挑拣只会造成重复；跨用户记忆一律不注入（用户会话相互独立）。
         let profile = self.get_user_profile_context(user_id);
         if !profile.is_empty() {
             parts.push(profile);
@@ -789,4 +741,57 @@ pub fn clear_temp_memory(base_dir: &str, keep_days: i64, tag: &str) -> (bool, St
         .collect::<Vec<_>>()
         .join("；");
     (true, msg, cleared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    fn test_mgr(tmp: &std::path::Path) -> (MemoryStore, Arc<RwLock<Config>>) {
+        let cfg = Config::load(tmp.join("config.json")).unwrap();
+        let cfg = Arc::new(RwLock::new(cfg));
+        let llm = Arc::new(LlmClient::new(cfg.clone(), tmp.to_str().unwrap()));
+        (MemoryStore::new(cfg.clone(), llm, tmp.to_str().unwrap()), cfg)
+    }
+
+    #[tokio::test]
+    async fn user_session_isolated_and_budgeted() {
+        let tmp = std::env::temp_dir().join(format!("mem_test_{}_{}", std::process::id(), uuid_suffix()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let (mgr, cfg) = test_mgr(&tmp);
+        // 预算压到 60 字符，验证截断
+        crate::config::update_config(&cfg, &json!({"CONTEXT_MAX_CHARS": 60})).unwrap();
+        let mut memory: Vec<MemoryDoc> = Vec::new();
+        // 用户 A：两条较长记忆
+        mgr.save_record(&mut memory, "1", "t1", "uA", "甲", "今天一起看了星之卡比的新视频", "那个新作确实可爱喵").await.unwrap();
+        mgr.save_record(&mut memory, "2", "t1", "uA", "甲", "我周末想试试新出的甜品店", "听起来不错喵").await.unwrap();
+        // 用户 B：一条记忆（不应出现在 A 的会话里）
+        mgr.save_record(&mut memory, "3", "t1", "uB", "乙", "我是另一个人的完全无关内容", "嗯嗯").await.unwrap();
+        // 单独测用户 A 会话：只含 A，且总长度 ≤ 预算
+        let sess = mgr.get_user_session_context(&memory, "uA", 60).await;
+        assert!(!sess.is_empty(), "A 应有会话记忆");
+        let total: usize = sess.iter().map(|s| s.chars().count()).sum();
+        assert!(total <= 60, "会话注入应受预算约束, got {total}");
+        for s in &sess {
+            assert!(!s.contains("我是另一个人"), "会话串台: B 的记忆进入了 A 的上下文");
+        }
+        // 单独测用户 B：只有 B
+        let sess_b = mgr.get_user_session_context(&memory, "uB", 100).await;
+        assert_eq!(sess_b.len(), 1);
+        assert!(sess_b[0].contains("我是另一个人"));
+        // 全部注入：小预算下 A 只保留最近的连续片段，且该片段是 A 的最新对话
+        let sess_all = mgr.get_user_session_context(&memory, "uA", 1000).await;
+        let joined_all: String = sess_all.join("\n");
+        assert!(joined_all.contains("甜品店"), "全部注入应包含 A 的全部记忆");
+        assert!(joined_all.contains("星之卡比"), "全部注入应包含 A 的全部记忆");
+        // 清理
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn uuid_suffix() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().to_string()
+    }
 }

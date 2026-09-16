@@ -217,10 +217,16 @@ impl BiliClient {
             }
         };
         let items = payload["data"]["items"].as_array().cloned().unwrap_or_default();
+        let me = self.config.read().unwrap().get_str("DEDE_USER_ID");
         let mut out = Vec::new();
         for item in &items {
             let r = &item["item"];
             let user = &item["user"];
+            let mid = user.get("mid").and_then(|v| v.as_i64()).unwrap_or(0);
+            // 跳过自己发出的回复（B站回复流可能把 bot 自己的回复计入；不跳过会自回循环导致重复发送）
+            if !me.is_empty() && me != "0" && mid.to_string() == me {
+                continue;
+            }
             let root_rpid = r.get("root_id").and_then(|v| v.as_i64()).unwrap_or(0)
                 .max(r.get("source_id").and_then(|v| v.as_i64()).unwrap_or(0));
             let rpid = r.get("source_id").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -236,7 +242,7 @@ impl BiliClient {
                 rpid,
                 root_rpid,
                 oid,
-                thread_id: format!("{root_rpid}:{}", user.get("mid").and_then(|v| v.as_i64()).unwrap_or(0)),
+                thread_id: format!("{root_rpid}:{mid}"),
                 content_type: r.get("business_id").and_then(|v| v.as_i64()).unwrap_or(1),
                 content: if stripped.is_empty() { AT_EMPTY_CONTENT.to_string() } else { stripped },
                 raw_content: raw,

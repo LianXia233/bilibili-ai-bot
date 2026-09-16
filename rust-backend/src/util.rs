@@ -69,25 +69,6 @@ pub fn md5_hex(data: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// 余弦相似度；任一向量为空返回 0。
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.is_empty() || b.is_empty() || a.len() != b.len() {
-        return 0.0;
-    }
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
-    }
-    if na <= 0.0 || nb <= 0.0 {
-        return 0.0;
-    }
-    dot / (na.sqrt() * nb.sqrt())
-}
-
 /// HMAC-SHA256 hex（会话 Cookie 签名）。
 pub fn hmac_sha256_hex(secret: &[u8], data: &[u8]) -> String {
     
