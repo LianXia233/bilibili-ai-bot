@@ -6,13 +6,14 @@ use crate::bili_api::BiliClient;
 use crate::error::Result;
 use crate::bili_login::BiliQrLoginManager;
 use crate::config::Config;
+use crate::crypto_http::{self, CryptoError};
 use crate::llm::{log_cost, LlmClient};
 use crate::memory::{MemoryStore, PermanentMemory};
 use crate::personality::{PersonaStore, Personality};
 use crate::util::{b64_decode, hmac_sha256_hex, load_json, now_str, save_json};
-use axum::body::Body;
-use axum::extract::{Multipart, Path as AxumPath, State};
-use axum::http::{header, HeaderValue, Request, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{Path as AxumPath, State};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -25,6 +26,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use tower::ServiceExt;
 
 const DEFAULT_AUTH_PASSWORD: &str = "admin()";
 const COOKIE_NAME: &str = "rs_session";
@@ -40,6 +42,7 @@ pub struct WebCtx {
     pub permanent: PermanentMemory,
     pub secret_key: String,
     pub seal: RwLock<Option<RsaPrivateKey>>,
+    pub crypto: Arc<crypto_http::CryptoState>,
 }
 
 impl WebCtx {
@@ -147,7 +150,11 @@ fn json_resp(code: StatusCode, v: Value) -> Response {
 }
 
 // ---------- 登录 / 认证 ----------
-async fn api_login(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+async fn api_login(
+    State(ctx): State<Arc<WebCtx>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     let sealed = body.get("sealed").and_then(|v| v.as_str()).unwrap_or("");
     let (pwd, channel) = if !sealed.is_empty() {
         let raw = seal_decrypt(&ctx, sealed);
@@ -158,7 +165,15 @@ async fn api_login(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> R
     } else {
         (body.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string(), "plain")
     };
+    // 加密通道登录：由统一网关转发并携带 x-crypto-session，成功后标记会话已授权
+    let crypto_sid = headers
+        .get("x-crypto-session")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     if !pwd.is_empty() && pwd == ctx.auth_password() {
+        if let Some(sid) = crypto_sid.as_deref() {
+            ctx.crypto.mark_authed(sid);
+        }
         let cookie = session_cookie(&ctx, true);
         let mut resp = Json(json!({"ok": true, "channel": channel})).into_response();
         if let Ok(v) = HeaderValue::from_str(&format!(
@@ -1538,39 +1553,81 @@ async fn api_personas_switch(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Va
 }
 
 // ---------- 图片上传 ----------
-async fn api_upload_image(State(ctx): State<Arc<WebCtx>>, mut multipart: Multipart) -> Response {
+/// 同时支持两类上传：
+///  1) JSON：{"filename","mime","base64"} —— 加密通道网关直通格式（推荐）；
+///  2) multipart/form-data —— 兼容旧客户端（multer 解析）。
+/// 返回 {"ok","filename","url"} 或 {"error"}。
+async fn api_upload_image(State(ctx): State<Arc<WebCtx>>, headers: HeaderMap, body: Bytes) -> Response {
     const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
     let img_dir = ctx.path("images");
     std::fs::create_dir_all(&img_dir).ok();
-    loop {
-        let field = match multipart.next_field().await {
-            Ok(Some(f)) => f,
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!("multipart 解析失败: {e}");
-                break;
-            }
-        };
-        let name = field.file_name().unwrap_or("upload.jpg").to_string();
-        let ext = name.rsplit('.').next().unwrap_or("jpg").to_lowercase();
-        if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
-            continue;
+    let save = |data: Vec<u8>, ext: &str| -> Option<Response> {
+        if data.is_empty() || data.len() > MAX_UPLOAD_BYTES {
+            return None;
         }
-        let data = match field.bytes().await {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        if data.is_empty() {
-            continue;
-        }
-        if data.len() > MAX_UPLOAD_BYTES {
-            return json_resp(StatusCode::PAYLOAD_TOO_LARGE, json!({"error": "图片超过 10MB 上限"}));
-        }
-        // 时间戳 + 随机后缀，避免同一秒内两次上传互相覆盖
-        let fname = format!("{}_{}.{}", crate::util::now_unix(), crate::util::gen_token().chars().take(6).collect::<String>(), ext);
+        // 随机后缀用 hex（base64 含 '/' '+' 会破坏文件路径）
+        let rand: [u8; 4] = rand::random();
+        let suffix: String = rand.iter().map(|b| format!("{b:02x}")).collect();
+        let fname = format!("{}_{suffix}.{ext}", crate::util::now_unix());
         let target = img_dir.join(&fname);
-        if std::fs::write(&target, &data).is_ok() {
-            return Json(json!({"ok": true, "filename": fname, "url": format!("/data/images/{fname}")})).into_response();
+        match std::fs::write(&target, &data) {
+            Ok(()) => Some(Json(json!({"ok": true, "filename": fname, "url": format!("/data/images/{fname}")})).into_response()),
+            Err(e) => {
+                tracing::error!("upload write fail: {e} target={target:?}");
+                None
+            }
+        }
+    };
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if ct.contains("multipart/form-data") {
+        // multipart 兼容分支（旧客户端）
+        let boundary = ct
+            .split(';')
+            .find_map(|p| p.trim().strip_prefix("boundary="))
+            .unwrap_or("----biliCrypto")
+            .to_string();
+        let body_stream = futures_util::stream::once(async move {
+            Ok::<Bytes, std::convert::Infallible>(body)
+        });
+        let mut mp = multer::Multipart::new(body_stream, boundary);
+        loop {
+            let field = match mp.next_field().await {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(_) => break,
+            };
+            let name = field.file_name().unwrap_or("upload.jpg").to_string();
+            let ext = name.rsplit('.').next().unwrap_or("jpg").to_lowercase();
+            if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+                continue;
+            }
+            let data = match field.bytes().await {
+                Ok(d) => d.to_vec(),
+                Err(_) => continue,
+            };
+            if let Some(r) = save(data, &ext) {
+                return r;
+            }
+        }
+    } else {
+        // JSON 直通分支（加密通道网关格式）
+        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let name = v.get("filename").and_then(|x| x.as_str()).unwrap_or("upload.jpg");
+        let ext = name.rsplit('.').next().unwrap_or("jpg").to_lowercase();
+        let mime_ok = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp");
+        let data = v
+            .get("base64")
+            .and_then(|x| x.as_str())
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            .unwrap_or_default();
+        if mime_ok {
+            if let Some(r) = save(data, &ext) {
+                return r;
+            }
         }
     }
     json_resp(StatusCode::BAD_REQUEST, json!({"error": "上传失败"}))
@@ -1635,8 +1692,202 @@ fn serve_file(ctx: &WebCtx, rel: &str) -> Response {
     }
 }
 
+// ---------- 应用层加密通信（对外） ----------
+// 协议 v1：X25519 密钥协商 + HKDF-SHA256 派生 + AES-256-GCM。
+// 对外仅暴露：/（页面）、/api/health（无敏感）、/api/crypto/handshake、
+// /api/crypto/session、/api/crypto/destroy、/api/data（加密统一入口）。
+// 其余全部业务 API 仅存在于 internal router，明文端点不再对外可达。
+
+fn crypto_plain_err(code: &'static str, msg: &str, status: StatusCode) -> Response {
+    json_resp(status, json!({"error": msg, "code": code}))
+}
+
+async fn api_crypto_handshake(State(ctx): State<Arc<WebCtx>>) -> Response {
+    Json(ctx.crypto.handshake_json()).into_response()
+}
+
+async fn api_crypto_session(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+    let client_public = body
+        .get("client_public")
+        .and_then(|v| v.as_str())
+        .and_then(|s| b64_decode(s).ok())
+        .filter(|b| b.len() == 32)
+        .map(|b| <[u8; 32]>::try_from(b).unwrap());
+    let Some(client_public) = client_public else {
+        return crypto_plain_err("bad_client_public", "client_public 非法", StatusCode::BAD_REQUEST);
+    };
+    let (session_id, server_public, ttl) = ctx.crypto.create_session(client_public);
+    Json(json!({
+        "v": crypto_http::PROTO_VERSION,
+        "session_id": session_id,
+        "server_public": crate::util::b64_encode(&server_public),
+        "ttl": ttl,
+    }))
+    .into_response()
+}
+
+async fn api_crypto_destroy(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
+    let sid = body.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    if sid.is_empty() {
+        return crypto_plain_err("bad_session", "缺少 session_id", StatusCode::BAD_REQUEST);
+    }
+    ctx.crypto.destroy(sid);
+    Json(json!({"ok": true})).into_response()
+}
+
+/// 统一加密网关：解析 envelope -> 校验会话/counter -> AES-GCM 解密 ->
+/// 转发内部业务路由 -> 加密响应。
+async fn api_crypto_rpc(
+    State(ctx): State<Arc<WebCtx>>,
+    internal: Router,
+    Json(env): Json<Value>,
+) -> Response {
+    let v = env.get("v").and_then(|x| x.as_u64()).unwrap_or(0);
+    if v != crypto_http::PROTO_VERSION {
+        return crypto_plain_err("bad_envelope", "不支持的协议版本", StatusCode::BAD_REQUEST);
+    }
+    let sid = match env.get("session_id").and_then(|x| x.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return crypto_plain_err("bad_envelope", "缺少 session_id", StatusCode::BAD_REQUEST),
+    };
+    let counter = match env.get("counter").and_then(|x| x.as_u64()) {
+        Some(c) => c,
+        None => return crypto_plain_err("bad_envelope", "缺少 counter", StatusCode::BAD_REQUEST),
+    };
+    let nonce_b64 = match env.get("nonce").and_then(|x| x.as_str()) {
+        Some(s) => s.to_string(),
+        None => return crypto_plain_err("bad_envelope", "缺少 nonce", StatusCode::BAD_REQUEST),
+    };
+    let nonce = match b64_decode(&nonce_b64) {
+        Ok(b) if b.len() == 12 => <[u8; 12]>::try_from(b).unwrap(),
+        _ => return crypto_plain_err("bad_envelope", "nonce 非法", StatusCode::BAD_REQUEST),
+    };
+    let ct = match env.get("ciphertext").and_then(|x| x.as_str()).and_then(|s| b64_decode(s).ok()) {
+        Some(c) => c,
+        None => return crypto_plain_err("bad_envelope", "ciphertext 非法", StatusCode::BAD_REQUEST),
+    };
+
+    // 会话校验 + counter 消费（锁内原子；通过即视为已消费，重放必拒）
+    let (c2s, s2c, authed) = match ctx.crypto.consume(&sid, counter) {
+        Ok(s) => s,
+        Err(CryptoError::UnknownSession) => {
+            return crypto_plain_err("unknown_session", "会话不存在或已销毁", StatusCode::FORBIDDEN)
+        }
+        Err(CryptoError::Expired) => {
+            return crypto_plain_err("session_expired", "会话已过期，请刷新页面", StatusCode::FORBIDDEN)
+        }
+        Err(CryptoError::Replay) => {
+            return crypto_plain_err("counter_replay", "counter 非法或请求重放", StatusCode::FORBIDDEN)
+        }
+    };
+
+    // AES-GCM 解密（AAD 绑定 envelope 外层字段）
+    let aad = crypto_http::aad_bytes(v, &sid, counter, &nonce_b64);
+    let plain = match crypto_http::decrypt_payload(&c2s, &nonce, &aad, &ct) {
+        Some(p) => p,
+        None => {
+            return crypto_plain_err("decrypt_failed", "密文验证失败", StatusCode::UNPROCESSABLE_ENTITY)
+        }
+    };
+    let inner: Value = match serde_json::from_slice(&plain) {
+        Ok(x) => x,
+        Err(_) => return crypto_plain_err("bad_payload", "负载解析失败", StatusCode::BAD_REQUEST),
+    };
+    let path = inner.get("path").and_then(|x| x.as_str()).unwrap_or("");
+    let method = inner.get("method").and_then(|x| x.as_str()).unwrap_or("POST");
+    let body = inner.get("body").cloned().unwrap_or(Value::Null);
+    if !path.starts_with("/api/") {
+        return crypto_plain_err("bad_payload", "非法路径", StatusCode::BAD_REQUEST);
+    }
+
+    // 构造内部转发请求：已授权会话附带有效 Cookie；未授权只能访问 public 路由
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("x-crypto-session", &sid);
+    if authed {
+        let c = session_cookie(&ctx, true);
+        builder = builder.header(header::COOKIE, format!("{COOKIE_NAME}={c}"));
+    }
+    // 业务负载统一按 JSON 直通内部路由（含上传：JSON base64 格式由
+    // api_upload_image 直接解析，不再经 multipart 转换，避免边界解析间歇失败）
+    let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+    let req = match builder.body(Body::from(body_bytes)) {
+        Ok(r) => r,
+        Err(_) => return crypto_plain_err("internal_error", "请求构造失败", StatusCode::BAD_REQUEST),
+    };
+
+    let resp = match internal.clone().oneshot(req).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("加密网关内部转发失败 {path}: {e}");
+            return crypto_plain_err("internal_error", "内部路由错误", StatusCode::BAD_GATEWAY);
+        }
+    };
+    let status = resp.status().as_u16();
+    let (_, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, 128 * 1024 * 1024).await {
+        Ok(b) => b.to_vec(),
+        Err(_) => Vec::new(),
+    };
+    // 业务响应统一为 JSON；若为二进制（当前业务 API 均为 JSON，兜底处理）则用 base64
+    let resp_payload = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(j) => json!({"status": status, "body": j}),
+        Err(_) => json!({
+            "status": status,
+            "body": Value::Null,
+            "body_base64": crate::util::b64_encode(&bytes),
+        }),
+    };
+
+    // 加密响应（使用 s2c 密钥，nonce 随机，counter 回显请求序号）
+    let rnonce = crypto_http::random_nonce();
+    let rnonce_b64 = crate::util::b64_encode(&rnonce);
+    let raad = crypto_http::aad_bytes(v, &sid, counter, &rnonce_b64);
+    let rct = match crypto_http::encrypt_payload(
+        &s2c,
+        &rnonce,
+        &raad,
+        &serde_json::to_vec(&resp_payload).unwrap_or_default(),
+    ) {
+        Some(c) => c,
+        None => return crypto_plain_err("internal_error", "响应加密失败", StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    Json(json!({
+        "v": crypto_http::PROTO_VERSION,
+        "session_id": sid,
+        "counter": counter,
+        "nonce": rnonce_b64,
+        "ciphertext": crate::util::b64_encode(&rct),
+    }))
+    .into_response()
+}
+
 // ---------- 建图与启动 ----------
+/// 对外路由器：静态页面 + 健康检查 + 加密协议端点 + 统一加密网关。
+/// 业务明文路由（build_internal_router）仅由网关内部转发。
 pub fn build_router(ctx: Arc<WebCtx>) -> Router {
+    let internal = build_internal_router(ctx.clone());
+    let rpc = {
+        let r = internal.clone();
+        move |state: State<Arc<WebCtx>>, json: Json<Value>| api_crypto_rpc(state, r.clone(), json)
+    };
+    Router::new()
+        .route("/", get(serve_index))
+        .route("/api/health", get(api_health))
+        .route("/api/crypto/handshake", get(api_crypto_handshake))
+        .route("/api/crypto/session", post(api_crypto_session))
+        .route("/api/crypto/destroy", post(api_crypto_destroy))
+        .route("/api/data", post(rpc))
+        .route("/media/bot-avatar", get(serve_avatar))
+        .route("/data/images/:name", get(serve_image))
+        .with_state(ctx)
+}
+
+/// 内部路由器：全部业务 /api/* 明文路由 + Cookie 会话认证。
+/// 仅被统一加密网关 /api/data 内部转发调用，不直接对外暴露。
+fn build_internal_router(ctx: Arc<WebCtx>) -> Router {
     Router::new()
         .route("/", get(serve_index))
         .route("/api/health", get(api_health))

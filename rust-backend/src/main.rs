@@ -5,6 +5,7 @@ mod bili_api;
 mod bili_login;
 mod bot;
 mod config;
+mod crypto_http;
 mod dynamic;
 mod error;
 mod llm;
@@ -112,6 +113,7 @@ fn main() {
                 permanent: memory::PermanentMemory::new(&base_dir),
                 secret_key: secret,
                 seal: std::sync::RwLock::new(seal),
+                crypto: Arc::new(crypto_http::CryptoState::new(&base_dir)),
             });
             web::serve(ctx, port).await;
         } else {

@@ -2808,6 +2808,155 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
 </div>
 
 <script>
+// ===== 应用层加密通道 v1（X25519 + HKDF-SHA256 + AES-256-GCM）=====
+// 目标：明文 HTTP 下，让被动网络抓包无法直接读取 API 请求/响应正文。
+// 明确边界：浏览器端 JS 非可信环境；该方案不等价 HTTPS，无法对抗主动中间人
+// （攻击者若篡改 HTML/JS 可改写加密代码）；被动抓包者仍可见 IP / URL / 时间 / 大小 / 频率。
+// 服务器身份锚点 = 长期静态 X25519 公钥指纹（首次使用 TOFU 核对，见 loginHint 提示）。
+(function () {
+  const MZ = window.MZ_CRYPTO = {
+    ready: null, sessionId: null, c2s: null, s2c: null, counter: 0,
+    seq: Promise.resolve(), fp: null
+  };
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  function b64(u8) { let s = ''; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); }
+  function unb64(s) { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
+  function concat() { let n = 0; for (const a of arguments) n += a.length; const out = new Uint8Array(n); let o = 0; for (const a of arguments) { out.set(a, o); o += a.length; } return out; }
+
+  // ---- X25519：原生 Web Crypto 优先（Chrome 113+/Edge/Firefox 128+），
+  // Safari 回退 @noble/curves（经审计的小型现代库，CDN 加载）----
+  let xNativeOk = null, nobleMod = null;
+  async function xDetectNative() {
+    if (xNativeOk !== null) return xNativeOk;
+    try { await crypto.subtle.generateKey({name: 'X25519'}, true, ['deriveBits']); xNativeOk = true; }
+    catch (e) { xNativeOk = false; }
+    return xNativeOk;
+  }
+  async function loadNoble() {
+    if (nobleMod) return nobleMod;
+    nobleMod = await import('https://cdn.jsdelivr.net/npm/@noble/curves@1.6.0/esm/ed25519.js');
+    return nobleMod;
+  }
+  async function xGen() {
+    if (await xDetectNative()) {
+      const kp = await crypto.subtle.generateKey({name: 'X25519'}, true, ['deriveBits']);
+      const pub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey));
+      return {priv: kp.privateKey, pub};
+    }
+    const m = await loadNoble();
+    const priv = m.x25519.utils.randomPrivateKey();
+    return {priv, pub: m.x25519.getPublicKey(priv)};
+  }
+  async function xDerive(priv, pubBytes) {
+    if (await xDetectNative()) {
+      const pubKey = await crypto.subtle.importKey('raw', pubBytes, {name: 'X25519'}, false, []);
+      return new Uint8Array(await crypto.subtle.deriveBits({name: 'X25519', public: pubKey}, priv, 256));
+    }
+    const m = await loadNoble();
+    return m.x25519.getSharedSecret(priv, pubBytes);
+  }
+  async function hkdf(ikm, salt, info) {
+    const key = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+    return new Uint8Array(await crypto.subtle.deriveBits({name: 'HKDF', hash: 'SHA-256', salt, info}, key, 256));
+  }
+  async function gcmEnc(keyBytes, nonce, aad, plain) {
+    const key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['encrypt']);
+    return new Uint8Array(await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: aad}, key, plain));
+  }
+  async function gcmDec(keyBytes, nonce, aad, ct) {
+    const key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['decrypt']);
+    return new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: nonce, additionalData: aad}, key, ct));
+  }
+
+  async function cryptoInit() {
+    const hs = await (await _origFetch('/api/crypto/handshake', {cache: 'no-store'})).json();
+    if (!hs || hs.v !== 1 || !hs.server_static_pub) throw new Error('加密握手失败');
+    // 服务器身份指纹 TOFU pinning（首次记录，后续变化则警告）
+    MZ.fp = hs.fingerprint;
+    try {
+      const prev = localStorage.getItem('bili-crypto-fp');
+      if (prev && prev !== hs.fingerprint) console.warn('服务器身份指纹变化：', prev, '->', hs.fingerprint);
+      localStorage.setItem('bili-crypto-fp', hs.fingerprint);
+    } catch (e) {}
+    const kp = await xGen();
+    const sr = await (await _origFetch('/api/crypto/session', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({v: 1, client_public: b64(kp.pub)})})).json();
+    if (!sr || !sr.session_id || !sr.server_public) throw new Error('加密会话建立失败');
+    const sharedEph = await xDerive(kp.priv, unb64(sr.server_public));
+    const sharedSt = await xDerive(kp.priv, unb64(hs.server_static_pub));
+    const ikm = concat(sharedEph, sharedSt);
+    const salt = concat(enc.encode('bili-ai-bot-crypto-v1'), kp.pub, unb64(sr.server_public), unb64(hs.server_static_pub));
+    MZ.sessionId = sr.session_id;
+    MZ.c2s = await hkdf(ikm, salt, enc.encode('c2s'));
+    MZ.s2c = await hkdf(ikm, salt, enc.encode('s2c'));
+    MZ.counter = 0;
+    MZ.seq = Promise.resolve();
+  }
+
+  function cryptoEnsure() {
+    if (!MZ.ready) {
+      MZ.ready = cryptoInit().catch(e => { MZ.ready = null; MZ.sessionId = null; throw e; });
+    }
+    return MZ.ready;
+  }
+
+  // 加密请求：串行队列保证 counter 严格递增（服务端严格校验，防重放）
+  function cryptoEnvelopeRequest(path, method, body, retried) {
+    const run = MZ.seq.then(async () => {
+      await cryptoEnsure();
+      MZ.counter += 1;
+      const counter = MZ.counter;
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const aad = enc.encode('1|' + MZ.sessionId + '|' + counter + '|' + b64(nonce));
+      const plain = enc.encode(JSON.stringify({path: path, method: method, body: body}));
+      const ct = await gcmEnc(MZ.c2s, nonce, aad, plain);
+      const resp = await _origFetch('/api/data', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({v: 1, session_id: MZ.sessionId, counter: counter, nonce: b64(nonce), ciphertext: b64(ct)})});
+      const env = await resp.json();
+      if (env.error) {
+        const code = env.code;
+        // 会话失效：重建会话（登录态丢失）后重试一次
+        if ((code === 'unknown_session' || code === 'session_expired') && !retried) {
+          MZ.ready = null; MZ.sessionId = null;
+          return cryptoEnvelopeRequest(path, method, body, true);
+        }
+        const e = new Error(env.error || '加密通道错误'); e.code = code; throw e;
+      }
+      const rnonce = unb64(env.nonce);
+      const raad = enc.encode('1|' + MZ.sessionId + '|' + counter + '|' + b64(rnonce));
+      const rplain = await gcmDec(MZ.s2c, rnonce, raad, unb64(env.ciphertext));
+      return JSON.parse(dec.decode(rplain));
+    });
+    MZ.seq = run.catch(() => {});
+    return run;
+  }
+
+  // ---- 拦截全部业务 /api/*：走加密通道（/api/crypto/* 与 /api/health 除外）----
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (url.startsWith('/api/') && !url.startsWith('/api/crypto/') && url !== '/api/health') {
+      const opts = init || {};
+      const method = (opts.method || (input && input.method) || 'GET').toUpperCase();
+      let body = null;
+      if (opts.body != null) {
+        if (typeof opts.body === 'string') {
+          try { body = JSON.parse(opts.body); } catch (e) { body = opts.body; }
+        } else {
+          body = opts.body;
+        }
+      }
+      return cryptoEnvelopeRequest(url, method, body).then(out => {
+        if (out.body_base64) {
+          const bin = atob(out.body_base64); const u = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+          return new Response(u, {status: out.status || 200, headers: {'Content-Type': 'application/octet-stream'}});
+        }
+        return new Response(JSON.stringify(out.body), {status: out.status || 200, headers: {'Content-Type': 'application/json'}});
+      });
+    }
+    return _origFetch(input, init);
+  };
+})();
+
 // ===== Toast 通知 =====
 function toast(msg, type = 'info', duration = 2500) {
   const container = document.getElementById('toastContainer');
@@ -2875,14 +3024,21 @@ async function mzSeal(text) {
   }
 }
 
-// 传输层不是 HTTPS 时，明确告知"浏览器没给加密能力"，不假装已加密
+// 传输层不是 HTTPS 时，明确说明应用层加密状态与安全边界（不假装已加密）
 function renderSecurityHint(data) {
   if (!data || data.tls !== false) return;
   const el = document.getElementById('loginHint');
   if (!el) return;
-  const extra = '当前连接为明文 HTTP，浏览器在该环境下不提供加密能力，密码只能明文提交；建议改用 HTTPS 地址访问。';
-  el.textContent = el.textContent ? el.textContent + ' ' + extra : extra;
-  el.style.display = 'block';
+  const crypto = window.MZ_CRYPTO;
+  if (crypto && crypto.fp) {
+    const extra = '当前为 HTTP + 应用层加密（X25519 / AES-256-GCM），可防被动抓包读取正文；服务器身份指纹 ' + crypto.fp + '，首次使用时请在可信渠道核对。该方案不等价 HTTPS。';
+    el.textContent = el.textContent ? el.textContent + ' ' + extra : extra;
+    el.style.display = 'block';
+  } else {
+    const extra = '加密通道未就绪：登录与 API 可能以明文传输，请确认服务端已启用新版加密协议。';
+    el.textContent = el.textContent ? el.textContent + ' ' + extra : extra;
+    el.style.display = 'block';
+  }
 }
 
 async function checkAuth() {
@@ -2980,9 +3136,9 @@ async function uploadAvatarFile(type, event) {
   if (!file) return;
   if (file.size > 5 * 1024 * 1024) { toast('图片太大，最大5MB', 'error'); return; }
   try {
-    const formData = new FormData();
-    formData.append('image', file);
-    const resp = await apiFetch('/api/upload_image', {method: 'POST', body: formData});
+    const dataUrl = await readFileAsDataURL(file);
+    const {mime, base64} = splitDataUrl(dataUrl, file.type || 'image/jpeg');
+    const resp = await apiFetch('/api/upload_image', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({filename: file.name || 'upload.jpg', mime: mime, base64: base64})});
     const data = await resp.json();
     if (data.error) { toast('上传失败：' + data.error, 'error'); return; }
     const inputId = type === 'bot' ? 'inp_BOT_AVATAR' : 'inp_USER_AVATAR';
@@ -3091,10 +3247,29 @@ function removeImage() {
   document.getElementById('previewImg').src = '';
 }
 
+// 读取本地文件为 dataURL（加密通道上传复用）
+function readFileAsDataURL(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = () => rej(new Error('读取文件失败'));
+    r.readAsDataURL(file);
+  });
+}
+
+// 将 dataURL 拆成 mime 与 base64 正文（供加密 JSON 载荷上传）
+function splitDataUrl(dataUrl, fallbackMime) {
+  const comma = dataUrl.indexOf(',');
+  const meta = dataUrl.slice(0, comma);
+  const mime = (meta.match(/^data:(.*?);/) || [null, ''])[1] || fallbackMime || 'image/jpeg';
+  return {mime: mime, base64: dataUrl.slice(comma + 1)};
+}
+
 async function uploadImage(file) {
-  const formData = new FormData();
-  formData.append('image', file);
-  const resp = await fetch('/api/upload_image', {method: 'POST', body: formData});
+  // 经加密通道上传：文件转 base64 后随 JSON 载荷加密（服务端还原 multipart）
+  const dataUrl = await readFileAsDataURL(file);
+  const {mime, base64} = splitDataUrl(dataUrl, file.type || 'image/jpeg');
+  const resp = await apiFetch('/api/upload_image', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({filename: file.name || 'upload.jpg', mime: mime, base64: base64})});
   const data = await resp.json();
   if (data.error) throw new Error(data.error);
   return data;
