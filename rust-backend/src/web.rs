@@ -312,7 +312,8 @@ async fn api_config_raw(State(ctx): State<Arc<WebCtx>>) -> Response {
     if let Some(obj) = raw.as_object_mut() {
         obj.remove("CHAT_MODEL_POOL");
     }
-    Json(raw).into_response()
+    // 统一为 {config: ...} 包装，与前端 loadSettings 等读取契约一致
+    Json(json!({"config": raw})).into_response()
 }
 
 async fn api_config_update(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Value>) -> Response {
@@ -1807,9 +1808,11 @@ async fn api_crypto_destroy(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Val
 
 /// 统一加密网关：解析 envelope -> 校验会话/counter -> AES-GCM 解密 ->
 /// 转发内部业务路由 -> 加密响应。
+#[allow(clippy::too_many_arguments)]
 async fn api_crypto_rpc(
     State(ctx): State<Arc<WebCtx>>,
     internal: Router,
+    headers: HeaderMap,
     Json(env): Json<Value>,
 ) -> Response {
     let v = env.get("v").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1870,15 +1873,27 @@ async fn api_crypto_rpc(
         return crypto_plain_err("bad_payload", "非法路径", StatusCode::BAD_REQUEST);
     }
 
-    // 构造内部转发请求：已授权会话附带有效 Cookie；未授权只能访问 public 路由
+    // 构造内部转发请求：优先透传浏览器 Cookie（保持登录态，页面刷新后依旧有效）；
+    // 无浏览器 Cookie 时，加密会话已授权则补发新会话 Cookie；否则只能访问 public 路由。
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
         .header("content-type", "application/json")
         .header("x-crypto-session", &sid);
-    if authed {
-        let c = session_cookie(&ctx, true);
-        builder = builder.header(header::COOKIE, format!("{COOKIE_NAME}={c}"));
+    let client_cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    match client_cookie {
+        Some(cc) => {
+            builder = builder.header(header::COOKIE, cc);
+        }
+        None if authed => {
+            let c = session_cookie(&ctx, true);
+            builder = builder.header(header::COOKIE, format!("{COOKIE_NAME}={c}"));
+        }
+        None => {}
     }
     // 业务负载统一按 JSON 直通内部路由（含上传：JSON base64 格式由
     // api_upload_image 直接解析，不再经 multipart 转换，避免边界解析间歇失败）
@@ -1896,7 +1911,13 @@ async fn api_crypto_rpc(
         }
     };
     let status = resp.status().as_u16();
-    let (_, body) = resp.into_parts();
+    let (parts, body) = resp.into_parts();
+    // 登录等接口的 Set-Cookie 必须透传回浏览器，否则刷新页面即失去登录态
+    let set_cookie = parts
+        .headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     let bytes = match axum::body::to_bytes(body, 128 * 1024 * 1024).await {
         Ok(b) => b.to_vec(),
         Err(_) => Vec::new(),
@@ -1924,14 +1945,20 @@ async fn api_crypto_rpc(
         Some(c) => c,
         None => return crypto_plain_err("internal_error", "响应加密失败", StatusCode::INTERNAL_SERVER_ERROR),
     };
-    Json(json!({
+    let mut final_resp = Json(json!({
         "v": crypto_http::PROTO_VERSION,
         "session_id": sid,
         "counter": counter,
         "nonce": rnonce_b64,
         "ciphertext": crate::util::b64_encode(&rct),
     }))
-    .into_response()
+    .into_response();
+    if let Some(sc) = set_cookie {
+        if let Ok(val) = header::HeaderValue::from_str(&sc) {
+            final_resp.headers_mut().insert(header::SET_COOKIE, val);
+        }
+    }
+    final_resp
 }
 
 // ---------- 建图与启动 ----------
@@ -1941,7 +1968,9 @@ pub fn build_router(ctx: Arc<WebCtx>) -> Router {
     let internal = build_internal_router(ctx.clone());
     let rpc = {
         let r = internal.clone();
-        move |state: State<Arc<WebCtx>>, json: Json<Value>| api_crypto_rpc(state, r.clone(), json)
+        move |state: State<Arc<WebCtx>>, headers: HeaderMap, json: Json<Value>| {
+            api_crypto_rpc(state, r.clone(), headers, json)
+        }
     };
     Router::new()
         .route("/", get(serve_index))

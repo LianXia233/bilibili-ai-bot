@@ -4434,9 +4434,13 @@ async function loadPersonality() {
 
 // ===== 系统设置 =====
 async function loadSettings() {
+  // 模型池 + 记忆统计独立加载：不因单套配置解析失败而阻塞（各自失败各自提示）
+  fetchModelPool();
+  loadMemStats();
   try {
     const cfgResp = await fetch('/api/config/raw');
     const cfgData = await cfgResp.json();
+    if (!cfgData || cfgData.error || !cfgData.config) throw new Error((cfgData && cfgData.error) || '配置读取失败');
     const cfg = cfgData.config;
 
     // 全局
@@ -4448,10 +4452,6 @@ async function loadSettings() {
     document.getElementById('inp_OR_CHAT_KEY').value = cfg.OR_CHAT_KEY || '';
     document.getElementById('inp_OR_CHAT_MODEL').value = cfg.OR_CHAT_MODEL || '';
     document.getElementById('inp_OR_CHAT_MODEL_FALLBACK').value = cfg.OR_CHAT_MODEL_FALLBACK || '';
-
-    // 对话模型池 + 记忆统计（单独接口，失败不影响设置页其余内容）
-    fetchModelPool();
-    loadMemStats();
 
     // 视觉模型
     document.getElementById('inp_OR_VISION_URL').value = cfg.OR_VISION_URL || '';
@@ -4500,6 +4500,7 @@ async function loadSettings() {
     updateCookieStatus(cookieData.valid, cookieData.info);
   } catch(e) {
     console.error('加载设置失败:', e);
+    toast('设置加载失败：' + (e && e.message ? e.message : '请确认已登录'), 'error');
   }
 }
 
@@ -5489,11 +5490,12 @@ async function fetchModelPool() {
   try {
     const resp = await apiFetch('/api/models/pool/list');
     const data = await resp.json();
+    if (!data || data.error) throw new Error((data && data.error) || '模型池读取失败');
     modelPool = (data.items || []);
     modelPoolActive = (typeof data.active === 'number') ? data.active : -1;
     // 少于 5 个时补足空位 —— 用户要求「至少能填 5 个」
     while (modelPool.length < 5) modelPool.push(blankSlot());
-  } catch(e) { toast('模型池读取失败', 'error'); }
+  } catch(e) { toast('模型池读取失败：' + (e && e.message ? e.message : '请确认已登录'), 'error'); }
   expandedPool = {};
   loadModelPool();
 }
