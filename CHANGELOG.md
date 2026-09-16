@@ -25,6 +25,7 @@
 | 2026-09-16 | `feat(bot)` | 记忆改为「按用户独立会话 + 全部优先注入」：跨评论 / @ / 私信聚合该用户全部历史对话，回复前默认注入上下文（按时间正序，预算仅作安全上限），不再按相关度挑拣导致失忆 / 乱回复 | 行为变更 |
 | 2026-09-16 | `feat(panel)` | WebUI 新增「评论自动回复」「@回复」两个独立开关（默认关闭，仅私信通道独立运行），控制台与配置均可切换 | 功能新增 |
 | 2026-09-16 | `fix(bot)` | 评论自回循环：B 站把 bot 自己发出的回复回流为新评论时直接跳过（与私信同款防御） | 故障修复 |
+| 2026-09-16 | `fix(panel,crypto)` | WebUI 模型池配置不显示四根因：加密网关透传 Cookie/Set-Cookie、config/raw 统一 `{config}` 包装、模型池独立加载不被配置解析阻塞、失败不再静默 | 故障修复 |
 | 2026-09-16 | `chore(cleanup)` | 移除 Python/Flask 版后端（7 个 .py + Requirements.txt + tests/），仓库仅保留 rust-backend；README / DEPLOY 同步改为 Rust 部署 | 结构调整 |
 | 2026-09-16 | `fix(security)` | WebUI 登录「连接失败」：非安全上下文（HTTP 公网访问）下 Web Crypto 不可用，加密通道全链路 noble 纯 JS 回退 | 故障修复 |
 | 2026-09-16 | `fix(private_msgs)` | 私信复读死循环：内容回显去重，B 站把 bot 自己回复误标为对方消息时直接跳过 | 故障修复 |
@@ -565,6 +566,32 @@ if not ENABLE_SLEEP:      # 默认 False -> 全天在线
 `/` 被当作路径分隔符使目标路径落入不存在的子目录（如 `images/<ts>_/8B6Xe.png`），
 `fs::write` 报 `ENOENT`。修复：随机后缀改用 hex（8 个十六进制字符，路径安全）；
 同步将加密网关的上传负载改为 JSON base64 直通（保留 multipart 兼容分支）。
+
+### fix(panel,crypto) — WebUI 模型池配置不显示：四个根因一次性修复
+
+现象：系统设置页「模型池」始终显示「当前未启用池 · 已配置 0 条」，看不到 3 条
+已配置模型（hy3 / qwen3.8-flash / glm-4-flash）与当前生效项。经后端 `/api/models/pool/list`
+实测（加密 RPC）返回完全正常（items=3、active=2、key 掩码），问题锁定在前端加载链路。
+
+修复（rust-backend/src/web.rs + chat.html）：
+
+1. **加密网关丢 Cookie / Set-Cookie**：`api_crypto_rpc` 转发内部路由时不带浏览器 Cookie、
+   不透传登录接口的 Set-Cookie → 页面刷新后新加密会话调业务 API 全部返回 `{"error":"未登录"}`
+   （HTTP 200，前端拿不到状态码），设置页与模型池读取全部失败。修复：网关优先透传浏览器
+   Cookie，无 Cookie 且加密会话已授权时补发新会话 Cookie，响应头透传 Set-Cookie。
+2. **config/raw 契约不匹配**：`api_config_raw` 返回原始 config 对象，而前端 6 处均按
+   `cfgData.config` 读取 → `cfgData.config` 为 undefined → `loadSettings` 抛错 → toast
+   「设置加载失败」且 `fetchModelPool` 被 try 内跳过永不执行。修复：后端统一返回
+   `{"config": raw}`（一处改、六处兼容）。
+3. **模型池加载被单套配置解析失败阻塞**：`fetchModelPool` / `loadMemStats` 原在 try 内，
+   配置解析一旦抛错即跳过。修复：提前到 try 外独立加载（各自失败各自提示）。
+4. **失败静默**：`fetchModelPool` 无 error 校验，失败时 items 为空数组被当「0 条」渲染。
+   修复：增加 `data.error` 校验与带明文错误信息的 toast。
+
+验证：本地 5999 实例 curl 全绿（登录 Set-Cookie 透传 ✓、新会话带 Cookie 调 pool/list
+items=3 ✓、config/raw keys=['config'] ✓、无 Cookie 仍 401 ✓）；浏览器实测设置页正常加载
+（Bot 名称等配置显示）、模型池渲染 3 条且「当前生效: glm-4-flash · 已配置 3 条」、
+刷新后登录态保持；生产机部署后同款加密 RPC 验证全绿。
 
 ---
 
