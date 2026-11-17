@@ -7,8 +7,9 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::llm::{log_cost, needs_search, truncate, LlmClient};
 use crate::memory::{MemoryDoc, MemoryStore, PermanentMemory};
-use crate::personality::{Personality, PersonaStore};
+use crate::personality::{PersonaStore, Personality};
 use crate::private_msgs::{assess_private_message, is_protected_sender, reply_scope_allows, PrivateMessageClient};
+use crate::session::{ReplyContext, SessionStore};
 use crate::util::{load_json, now_str, now_unix, save_json};
 use chrono::Timelike;
 use serde_json::{json, Value};
@@ -23,6 +24,8 @@ pub struct Bot {
     pub bili: Arc<BiliClient>,
     pub llm: Arc<LlmClient>,
     pub memory: Arc<MemoryStore>,
+    /// 多用户会话隔离层：按 B 站 mid 建立 / 读取 / 清理独立会话。
+    pub session: SessionStore,
     pub personality: Arc<Personality>,
     pub private: Arc<PrivateMessageClient>,
     pub permanent: PermanentMemory,
@@ -46,6 +49,7 @@ impl Bot {
         base_dir: &str,
     ) -> Bot {
         let memory = Arc::new(MemoryStore::new(config.clone(), llm.clone(), base_dir));
+        let session = SessionStore::new(base_dir);
         let personality = Arc::new(Personality::new(config.clone(), llm.clone(), base_dir));
         let private = Arc::new(PrivateMessageClient::new(config.clone(), base_dir));
         Bot {
@@ -53,6 +57,7 @@ impl Bot {
             bili,
             llm,
             memory,
+            session,
             personality,
             private,
             permanent: PermanentMemory::new(base_dir),
@@ -187,7 +192,10 @@ impl Bot {
             tracing::info!("临时记忆清空：{msg}");
         }
         // 同步进程内存态：只改文件不同步的话，后续 save 会把旧条目连同新条目写回文件
-        self.memory.load()
+        let memory = self.memory.load();
+        // 会话索引以 memory.json 为准重建：清空/裁剪后不留下「有索引、无正文」的会话
+        self.session.rebuild_from_memory(&memory);
+        memory
     }
 
     pub fn is_active_time(&self) -> bool {
@@ -217,6 +225,9 @@ impl Bot {
         let mut replied = self.personality.load_replied();
         let mut affection = self.personality.load_affection();
         let mut memory = self.memory.load();
+        // 历史用户可能早于会话索引存在：启动时按 memory.json 补建索引（不重写正文）
+        let session_count = self.session.rebuild_from_memory(&memory);
+        tracing::info!("会话索引已就绪：{session_count} 个用户会话（按 mid 隔离）");
         let mut schedule = self.load_schedule();
         let mut failed_attempts: HashMap<i64, i64> = HashMap::new();
 
@@ -348,10 +359,9 @@ impl Bot {
 
                 // 视频上下文
                 let video_context = self.get_video_context(reply.oid, reply.content_type).await;
-                // 记忆上下文
-                let memory_context = self
-                    .memory
-                    .build_memory_context(&memory, &mid_str)
+                // 回复上下文：固定人设（全局同一份） + 该用户独立会话（按 mid 隔离）
+                let reply_context = self
+                    .build_reply_context(&memory, &mid_str, &reply.username, "comment")
                     .await;
 
                 // 评论配图识别
@@ -400,7 +410,7 @@ impl Bot {
                         &comment_text,
                         &reply.username,
                         level,
-                        &memory_context,
+                        &reply_context,
                         video_context.as_deref(),
                         reply.no_content,
                         "comment",
@@ -436,7 +446,7 @@ impl Bot {
                             &comment_text,
                             &reply.username,
                             level,
-                            &memory_context,
+                            &reply_context,
                             video_context.as_deref(),
                             reply.no_content,
                             "comment",
@@ -551,6 +561,12 @@ impl Bot {
                             .save_record(&mut memory, &rpid.to_string(), &reply.thread_id, &mid_str, &reply.username, &reply.content, &ai_reply)
                             .await
                             .ok();
+                        // 会话索引：记录本轮成功交互（正文已由 save_record 落盘）
+                        let channel_tag = if reply.via == "at" { "at" } else { "comment" };
+                        let persona = self.config.read().unwrap().get_str("ACTIVE_PERSONA");
+                        if let Err(e) = self.session.record_turn(&mid_str, &reply.username, channel_tag, &persona) {
+                            tracing::warn!("会话索引写入失败（{mid_str}）：{e}");
+                        }
                         self.memory.compress_user_memory(&mut memory, &mid_str, &reply.username).await.ok();
                     }
                     Ok(None) => {
@@ -579,6 +595,7 @@ impl Bot {
             bili: self.bili.clone(),
             llm: self.llm.clone(),
             memory: self.memory.clone(),
+            session: self.session.clone(),
             personality: self.personality.clone(),
             private: self.private.clone(),
             permanent: PermanentMemory::new(&self.base_dir),
@@ -685,10 +702,10 @@ impl Bot {
                 continue;
             }
 
-            // 生成回复（私信通道）
+            // 生成回复（私信通道）；上下文 = 固定人设 + 该用户独立会话（与评论 / @ 共用同一份会话）
             let level = self.personality.get_level(affection.get(&mid).and_then(|v| v.as_i64()).unwrap_or(0), Some(&mid));
-            let memory_context = self.memory.build_memory_context(memory, &mid).await;
-            let mut result = match self.generate_reply_and_score(&content, &username, level, &memory_context, None, false, "private").await {
+            let reply_context = self.build_reply_context(memory.as_slice(), &mid, &username, "private").await;
+            let mut result = match self.generate_reply_and_score(&content, &username, level, &reply_context, None, false, "private").await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("私信回复生成失败 {mid}: {e}");
@@ -701,7 +718,7 @@ impl Bot {
             // 回复防重复：私信连续聊天最容易复读，同样做一次去重重试
             if self.reply_is_duplicate(memory, &mid, &result.reply) {
                 tracing::info!("私信回复与历史高度相似，重新生成（{mid}）");
-                if let Ok(r2) = self.generate_reply_and_score(&content, &username, level, &memory_context, None, false, "private").await {
+                if let Ok(r2) = self.generate_reply_and_score(&content, &username, level, &reply_context, None, false, "private").await {
                     if !r2.reply.is_empty() {
                         result = r2;
                     }
@@ -730,6 +747,10 @@ impl Bot {
                     embedding: Vec::new(),
                 });
                 self.memory.save(memory).ok();
+                let persona = cfg.get_str("ACTIVE_PERSONA");
+                if let Err(e) = self.session.record_turn(&mid, &username, "private", &persona) {
+                    tracing::warn!("会话索引写入失败（{mid}）：{e}");
+                }
             } else {
                 tracing::warn!("私信发送失败 {username}({mid})，不再重试");
             }
@@ -814,13 +835,46 @@ impl Bot {
         Some(format!("【当前视频信息】\n标题：{title}\nUP主：{owner_name}\n内容概括：{analysis}"))
     }
 
+    /// 组装一次回复的上下文：固定人设（全局同一份） + 该用户独立会话（按 mid 隔离）。
+    /// 人设只从 personas.json / 永久规则读取，会话只从 memory.json 中该用户的记录读取；
+    /// 两者渲染时拼接，但不会互相写入对方存储——换人设不会污染会话，会话也不会串台。
+    async fn build_reply_context(&self, memory: &[MemoryDoc], user_id: &str, username: &str, channel: &str) -> ReplyContext {
+        let cfg = self.config.read().unwrap().clone();
+        let persona = self.persona_prompt(&cfg, channel);
+        let user_context = self.session.render_user_context(&self.memory, memory, user_id, username).await;
+        ReplyContext::new(user_id, username, &persona, &user_context)
+    }
+
+    /// 固定人设段：所有用户共用同一份（人格身份/说话风格/对用户态度 + 性格演化 + 永久规则）。
+    /// 每次回复重新读取一次，面板改人设后立即生效，不缓存在会话里。
+    fn persona_prompt(&self, cfg: &Config, channel: &str) -> String {
+        let block = PersonaStore::new(&self.base_dir).active_block(&cfg.get_str("ACTIVE_PERSONA"));
+        let owner_bili = cfg.get_str("OWNER_BILI_NAME");
+        let bili_note = if owner_bili.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}的B站账号名是\"{owner_bili}\"，是同一个人。", cfg.get_str("OWNER_NAME").if_empty_or("主人"))
+        };
+        // 永久记忆：人工维护的最高优先级规则，分层注入（tier 0/1 全量 + 表情包池摘要），
+        // 与 Python build_permanent_block 对齐；prompt 中永久记忆为纯人工写入，模型不再产出。
+        let permanent = crate::memory::build_permanent_block(cfg, &self.permanent.load());
+        let evolution = self.personality.get_personality_prompt();
+        let extra = if permanent.is_empty() {
+            evolution
+        } else {
+            format!("{evolution}\n{permanent}")
+        };
+        block.render(&cfg.get_str("BOT_NAME"), channel, &bili_note, &extra)
+    }
+
     /// 回复生成（与 generate_reply_and_score 对齐的 JSON 契约）。
+    /// `context` 携带固定人设与该用户的独立会话：人设在前、会话在后，两者互不覆盖。
     pub async fn generate_reply_and_score(
         &self,
         comment_text: &str,
         username: &str,
         level: &str,
-        memory_context: &str,
+        context: &ReplyContext,
         video_context: Option<&str>,
         no_content: bool,
         channel: &str,
@@ -828,11 +882,14 @@ impl Bot {
         let cfg = self.config.read().unwrap().clone();
         let now = now_str();
         let level_prompt = self.personality.level_prompt(level);
-        let memory_section = if memory_context.is_empty() {
-            String::new()
+        // 人设：正常由调用方随该用户会话一起传入；只传了记忆文本时在此补齐，
+        // 保证每个用户的提示词开头都是同一份固定人设。
+        let persona_section = if context.persona_section().is_empty() {
+            self.persona_prompt(&cfg, channel)
         } else {
-            format!("\n\n【对话上下文（记忆，已默认注入）】\n以下是对方过往的真实对话/互动记录，回复前必须先读完并理解：对方是谁、之前聊过什么、关系如何。\n回复须与这段历史连贯（记得的事要接得上），但禁止照搬复述历史发言，禁止把记忆里的旧话题当成当前要回应的话题；记忆里没有的信息不要编造，不知道就自然承认。\n{memory_context}")
+            context.persona_section()
         };
+        let memory_section = context.user_section();
         let video_section = match video_context {
             Some(v) if !v.is_empty() => format!("\n\n【对方所在的视频】\n{v}\n（对方是在这个视频的评论区里说话的，可以自然引用上面的内容，但不要照抄标题）"),
             _ => String::new(),
@@ -859,36 +916,6 @@ impl Bot {
             }
         }
 
-        let bot_name = cfg.get_str("BOT_NAME");
-        let owner_bili = cfg.get_str("OWNER_BILI_NAME");
-        let persona_store = PersonaStore::new(&self.base_dir);
-        // 与 Python 对齐：人格 = system_prompt（身份）+ style_prompt（说话风格，优先于默认风格）+ owner_prompt（对用户的态度）。
-        let (persona_prompt, style_prompt, owner_prompt) = persona_store.active_persona_full(&cfg.get_str("ACTIVE_PERSONA"));
-        let persona_section = if persona_prompt.is_empty() {
-            format!("你是{bot_name}，一个有独立人格的存在。你有自己的想法和态度，会真实地表达感受，不敷衍不套话。说话自然，像真人在聊天。")
-        } else {
-            persona_prompt
-        };
-        let persona_evo = self.personality.get_personality_prompt();
-        // 永久记忆：人工维护的最高优先级规则，分层注入（tier 0/1 全量 + 表情包池摘要），
-        // 与 Python build_permanent_block 对齐；prompt 中永久记忆为纯人工写入，模型不再产出。
-        let permanent_block = crate::memory::build_permanent_block(&cfg, &self.permanent.load());
-        let permanent_block = if permanent_block.is_empty() {
-            String::new()
-        } else {
-            format!("\n{permanent_block}")
-        };
-        let bili_note = if !owner_bili.is_empty() {
-            format!("\n{}的B站账号名是\"{owner_bili}\"，是同一个人。", cfg.get_str("OWNER_NAME").if_empty_or("主人"))
-        } else {
-            String::new()
-        };
-        let default_style = if channel == "private" {
-            "【说话风格】\n- 像真人在B站私信里聊天，自然口语化\n- 有自己的观点和感受，不说空话套话\n- 每次回复用不同的表达方式，避免句式重复\n- 可以用语气词、省略、口语缩写，让语言更自然"
-        } else {
-            "【说话风格】\n- 像真人在评论区聊天，自然口语化\n- 有自己的观点和感受，不说空话套话\n- 每次回复用不同的表达方式，避免句式重复\n- 可以用语气词、省略、口语缩写，让语言更自然"
-        };
-        let final_style = if style_prompt.is_empty() { default_style.to_string() } else { style_prompt };
         let channel_name = if channel == "private" { "私信" } else { "评论" };
         let private_instruction = if channel == "private" {
             let custom = cfg.get_str("PROMPT_PRIVATE_MESSAGE");
@@ -909,7 +936,7 @@ impl Bot {
         let fact_section = "\n\n【事实边界】\n- 只说自己确定的事。不知道、不确定（对方是否换了头像、某件事真假、具体时间地点、账号状态等）就直说不知道/不清楚，或自然转移话题，绝对不要编造事实或顺着对方的话承认。\n- 不要把对方的话当事实确认，也不要假装知道对方提的人、事、物。";
 
         let prompt = format!(
-            "{persona_section}\n{persona_evo}{permanent_block}\n\n{final_style}{bili_note}\n\n{owner_prompt}\n\n【底线】\n拒绝：表白暧昧、引战、黄赌毒政治。遇到恶意时平静坚定，可暗讽，不恶语。\n{level_prompt}{private_instruction}\n\n【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}\n\n当前时间：{now}{video_section}{memory_section}{search_section}{no_content_section}{emoji_section}{fact_section}\n════════ 需要你回应的内容（本节唯一）════════\n{username} 的{channel_name}：\n{comment_text}\n════════════════════════════════════════════\n\n上面这一节是对方这次真正说的话，**回复必须直接针对它**：\n- 不要把这段话复述、改写、翻译或概括后再作答（比如对方说「今天天气怎么样」，不要回「今天天气怎么样呀」，而要真的回答天气或说明自己看不到实时天气）。\n- 不要把上面任何背景材料（记忆、视频信息、搜索结果、规则、设定）当成话题去回应；它们只是背景。对方没提的话题不要主动展开成回复主体，除非是「对方一个字都没写」的情况。\n- 不要因为前面有大量规则、设定或素材清单，就把注意力放在那些内容上；它们只是风格约束，本轮要回应的只有上面这一节。\n- 每次回复不要用「哈哈」「这装扮」「真好看」这类开头/句式，避免复读机感；同样的意思换种说法。\n- 对方提了具体请求（写诗、写文案、解释、推荐、算数等）就当场把成品交出来，不要只回「好的，我来帮你」「我会尽力」这类空承诺 —— 那是没做事。下面「reply 简短自然」的长度要求**不适用于这类成品**，成品该多长就多长，需要分行就分行。写诗就直接把诗句写在 reply 里（例如「好的喵，给你写一首：\\n山高月小，水落石出。\\n清风徐来，水波不兴。」），不要宣布「我要写」，也不要事后再说「你看这样行不行」。\n\n请以JSON格式回复，不要加任何多余内容：\n{{\"score_delta\": 数字, \"reply\": \"回复内容\", \"impression\": \"一句话描述对该用户的印象\", \"user_facts\": [\"用户提到的个人信息1\", \"用户提到的个人信息2\"]}}\n\nuser_facts：如果用户在这条{channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。\n\nscore_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。\nreply简短自然，一般15-40字，像B站真人回复，不要写得像作文。\n（例外：上面「需要你回应的内容」里如果对方点名要一件成品 —— 写诗、写文案、解释一段概念、推荐并列出清单等 —— 则不受这个字数限制，先把成品写出来。）\nimpression简短描述用户性格/说话风格，如\"友善健谈，喜欢聊游戏\"。"
+            "{persona_section}\n\n【底线】\n拒绝：表白暧昧、引战、黄赌毒政治。遇到恶意时平静坚定，可暗讽，不恶语。\n{level_prompt}{private_instruction}\n\n【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}\n\n当前时间：{now}{video_section}{memory_section}{search_section}{no_content_section}{emoji_section}{fact_section}\n════════ 需要你回应的内容（本节唯一）════════\n{username} 的{channel_name}：\n{comment_text}\n════════════════════════════════════════════\n\n上面这一节是对方这次真正说的话，**回复必须直接针对它**：\n- 不要把这段话复述、改写、翻译或概括后再作答（比如对方说「今天天气怎么样」，不要回「今天天气怎么样呀」，而要真的回答天气或说明自己看不到实时天气）。\n- 不要把上面任何背景材料（记忆、视频信息、搜索结果、规则、设定）当成话题去回应；它们只是背景。对方没提的话题不要主动展开成回复主体，除非是「对方一个字都没写」的情况。\n- 不要因为前面有大量规则、设定或素材清单，就把注意力放在那些内容上；它们只是风格约束，本轮要回应的只有上面这一节。\n- 每次回复不要用「哈哈」「这装扮」「真好看」这类开头/句式，避免复读机感；同样的意思换种说法。\n- 对方提了具体请求（写诗、写文案、解释、推荐、算数等）就当场把成品交出来，不要只回「好的，我来帮你」「我会尽力」这类空承诺 —— 那是没做事。下面「reply 简短自然」的长度要求**不适用于这类成品**，成品该多长就多长，需要分行就分行。写诗就直接把诗句写在 reply 里（例如「好的喵，给你写一首：\\n山高月小，水落石出。\\n清风徐来，水波不兴。」），不要宣布「我要写」，也不要事后再说「你看这样行不行」。\n\n请以JSON格式回复，不要加任何多余内容：\n{{\"score_delta\": 数字, \"reply\": \"回复内容\", \"impression\": \"一句话描述对该用户的印象\", \"user_facts\": [\"用户提到的个人信息1\", \"用户提到的个人信息2\"]}}\n\nuser_facts：如果用户在这条{channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。\n\nscore_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。\nreply简短自然，一般15-40字，像B站真人回复，不要写得像作文。\n（例外：上面「需要你回应的内容」里如果对方点名要一件成品 —— 写诗、写文案、解释一段概念、推荐并列出清单等 —— 则不受这个字数限制，先把成品写出来。）\nimpression简短描述用户性格/说话风格，如\"友善健谈，喜欢聊游戏\"。"
         );
 
         let max_tokens = cfg.max_tokens_of("reply");

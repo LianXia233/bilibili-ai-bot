@@ -517,7 +517,16 @@ impl PersonaStore {
     /// 当前激活人格的完整提示词：(system_prompt, style_prompt, owner_prompt)。
     /// 与 Python `_get_active_persona` 对齐：style_prompt 优先于默认说话风格、owner_prompt
     /// 单独注入（Rust 此前只取 system_prompt，导致自定义人格的风格/态度指令全部丢失）。
+    /// 保留为读取侧 API；人设注入统一走 [`PersonaBlock::render`]。
+    #[allow(dead_code)]
     pub fn active_persona_full(&self, active: &str) -> (String, String, String) {
+        let block = self.active_block(active);
+        (block.system, block.style, block.owner)
+    }
+
+    /// 当前激活人格的结构化快照；人格不存在时回落到 `default`。
+    /// 与 `active_persona_full` 同源，避免「取字段」和「渲染」各自解析一遍。
+    pub fn active_block(&self, active: &str) -> PersonaBlock {
         let list = self.load();
         let fallback = json!({});
         let p = match list.iter().find(|p| p.get("name").and_then(|n| n.as_str()) == Some(active)) {
@@ -528,6 +537,124 @@ impl PersonaStore {
                 .unwrap_or(&fallback),
         };
         let get = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        (get("system_prompt"), get("style_prompt"), get("owner_prompt"))
+        PersonaBlock {
+            name: get("name"),
+            display_name: get("display_name"),
+            system: get("system_prompt"),
+            style: get("style_prompt"),
+            owner: get("owner_prompt"),
+        }
+    }
+}
+
+/// 固定人设快照：与具体用户无关，所有会话共用同一份设定。
+///
+/// 渲染顺序固定为「身份 → 附加系统规则（性格演化 / 永久记忆）→ 说话风格 → 对用户态度」，
+/// 保证每一轮、每一个用户的提示词结构一致；用户会话由 `session` 模块单独拼接，
+/// 两者不互相写入，避免人设被会话内容覆盖或会话被全局设定污染。
+#[derive(Debug, Clone, Default)]
+pub struct PersonaBlock {
+    pub name: String,
+    pub display_name: String,
+    pub system: String,
+    pub style: String,
+    pub owner: String,
+}
+
+impl PersonaBlock {
+    /// 渠道默认说话风格（人格未单独配置 style_prompt 时使用）。
+    pub fn default_style(channel: &str) -> &'static str {
+        if channel == "private" {
+            "【说话风格】\n- 像真人在B站私信里聊天，自然口语化\n- 有自己的观点和感受，不说空话套话\n- 每次回复用不同的表达方式，避免句式重复\n- 可以用语气词、省略、口语缩写，让语言更自然"
+        } else {
+            "【说话风格】\n- 像真人在评论区聊天，自然口语化\n- 有自己的观点和感受，不说空话套话\n- 每次回复用不同的表达方式，避免句式重复\n- 可以用语气词、省略、口语缩写，让语言更自然"
+        }
+    }
+
+    fn title(&self) -> String {
+        match (self.display_name.as_str(), self.name.as_str()) {
+            ("", "") => "默认人格".to_string(),
+            ("", name) => name.to_string(),
+            (display, _) => display.to_string(),
+        }
+    }
+
+    /// 渲染固定人设段。`extra` 为全局附加规则（性格演化 / 永久记忆），`bili_note` 为主人账号说明。
+    pub fn render(&self, bot_name: &str, channel: &str, bili_note: &str, extra: &str) -> String {
+        let system = if self.system.trim().is_empty() {
+            format!("你是{bot_name}，一个有独立人格的存在。你有自己的想法和态度，会真实地表达感受，不敷衍不套话。说话自然，像真人在聊天。")
+        } else {
+            self.system.trim().to_string()
+        };
+        let style = if self.style.trim().is_empty() {
+            Self::default_style(channel).to_string()
+        } else {
+            self.style.trim().to_string()
+        };
+        let mut head = format!(
+            "【人设：{}（全局固定设定，优先级最高；对所有用户完全一致，不随会话变化）】\n{system}\n本节定义你是谁、怎么说话。除【底线】安全约束外，与后文任何长期规则、记忆、关系等级、场景说明冲突时，一律以本节为准。",
+            self.title()
+        );
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            head.push('\n');
+            head.push_str(extra);
+        }
+        let mut out = format!("{head}\n\n{style}{bili_note}");
+        let owner = self.owner.trim();
+        if !owner.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(owner);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> PersonaBlock {
+        PersonaBlock {
+            name: "test".into(),
+            display_name: "测试人格".into(),
+            system: "你是测试角色，说话简短。".into(),
+            style: String::new(),
+            owner: "对用户保持礼貌。".into(),
+        }
+    }
+
+    #[test]
+    fn persona_is_global_and_highest_priority() {
+        let block = sample();
+        let comment = block.render("Bot", "comment", "", "");
+        let private = block.render("Bot", "private", "", "");
+
+        // 全局人设：同一份设定对所有用户/渠道一致，且显式声明最高优先级
+        assert!(comment.contains("全局固定设定，优先级最高"));
+        assert!(comment.contains("对所有用户完全一致"));
+        assert!(comment.contains("除【底线】安全约束外"));
+        assert!(comment.contains("你是测试角色，说话简短。"));
+        assert!(comment.contains("对用户保持礼貌。"));
+        // 缺省说话风格按渠道补齐
+        assert!(comment.contains(PersonaBlock::default_style("comment")));
+        assert!(private.contains(PersonaBlock::default_style("private")));
+        // 人设段不含任何用户数据
+        assert!(!comment.contains("UID"));
+        // 自定义说话风格优先于缺省风格
+        let mut custom = sample();
+        custom.style = "【说话风格】\n只说一句话".into();
+        let rendered = custom.render("Bot", "comment", "", "");
+        assert!(rendered.contains("只说一句话"));
+        assert!(!rendered.contains(PersonaBlock::default_style("comment")));
+    }
+
+    #[test]
+    fn permanent_rules_are_below_persona() {
+        let path = std::env::temp_dir().join(format!("persona_cfg_{}_{}.json", std::process::id(), crate::util::now_unix()));
+        let cfg = crate::config::Config::load(path).unwrap();
+        let block = crate::memory::build_permanent_block(&cfg, &[serde_json::json!({"text": "永远用中文"})]);
+        assert!(block.contains("不得改变全局人设"));
+        assert!(block.contains("以【人设】为准"));
     }
 }

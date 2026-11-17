@@ -179,7 +179,11 @@ impl MemoryStore {
         docs.iter().rev().take(limit).map(|m| m.text.clone()).collect()
     }
 
-    /// 构建记忆上下文：相关线程记忆 + 用户语义记忆 + 用户档案。
+    /// 构建记忆上下文：用户独立会话 + 用户档案。
+    ///
+    /// 保留给旧调用方；Bot 统一走 [`crate::session::SessionStore::render_user_context`]，
+    /// 由会话层额外带上会话档案，并与人设分开渲染。
+    #[allow(dead_code)]
     pub async fn build_memory_context(&self, memory: &[MemoryDoc], user_id: &str) -> String {
         let cfg = self.config.read().unwrap().clone();
         let session_cap: usize = {
@@ -620,7 +624,7 @@ pub fn build_permanent_block(config: &Config, perm: &[Value]) -> String {
     let mut blocks: Vec<String> = Vec::new();
     if !kept_list.is_empty() {
         blocks.push(
-            "【最高优先级规则（人工设定，必须遵守）】\n以下是主人亲手写下的规则，优先级高于本提示词中的其他风格描述；若与【说话风格】【今日状态】等段落冲突，一律以本段为准。\n"
+            "【人工设定的长期规则（必须遵守，但不得改变全局人设）】\n以下是主人亲手写下的规则，在不违背【人设】身份、语气与【底线】的范围内优先遵守；若与【人设】冲突，一律以【人设】为准；若与【今日状态】等风格描述冲突，以本段为准。\n"
                 .to_string()
                 + &kept_list.iter().map(|t| format!("- {t}")).collect::<Vec<_>>().join("\n"),
         );

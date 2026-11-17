@@ -1481,6 +1481,8 @@ async fn api_memory_temp_clear(State(ctx): State<Arc<WebCtx>>, Json(body): Json<
     }
     let keep_days = body.get("keep_days").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
     let (ok, msg, cleared) = crate::memory::clear_temp_memory(&ctx.base_dir, keep_days, "panelclear");
+    // 会话索引以 memory.json 为准重建：面板清空 / 裁剪后不留下「有索引、无正文」的会话
+    crate::session::SessionStore::new(&ctx.base_dir).rebuild_from_memory(&ctx.memory.load());
     if !ok {
         return Json(json!({"ok": true, "msg": "暂时没有可清空的临时记忆", "cleared": []})).into_response();
     }
@@ -2080,9 +2082,13 @@ pub fn load_seal_key(base_dir: &str) -> Option<RsaPrivateKey> {
     let key = RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).ok()?;
     let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).ok()?;
     std::fs::create_dir_all(path.parent()?).ok()?;
-    use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::write(&path, pem.as_bytes());
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    // 私钥权限收紧仅在 Unix 有意义；Windows 不支持 Unix 权限位，跳过即可（避免非 Unix 目标编译失败）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Some(key)
 }
 

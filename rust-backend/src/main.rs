@@ -13,6 +13,7 @@ mod memory;
 mod personality;
 mod private_msgs;
 mod proactive;
+mod session;
 mod util;
 mod web;
 
