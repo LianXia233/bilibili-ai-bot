@@ -390,7 +390,73 @@ pub fn default_persona() -> Value {
         "system_prompt": "你是一个友善的 AI 聊天助手。你有自己的性格和态度，说话自然随意，像朋友一样聊天。",
         "style_prompt": "【说话风格】\n- 轻松自然，像朋友聊天\n- 有自己的态度和想法，不无脑附和\n- 可以适当调侃和开玩笑\n- 回复简洁，1-3句话为主",
         "owner_prompt": "【对用户的态度】\n- 友善、真诚、自然\n- 不过度客气，也不过度热情\n- 像一个值得信赖的朋友",
+        "begin_dialogs": [],
     })
+}
+
+/// 人格示例对话上限：5 对（用户 / 助手交替），避免把人格文件写成巨型 few-shot。
+pub const BEGIN_DIALOGS_MAX_ITEMS: usize = 10;
+/// 单条示例对话最大字符数。
+pub const BEGIN_DIALOG_MAX_CHARS: usize = 1000;
+
+/// 从 persona 的 `begin_dialogs` 字段宽容读取：支持字符串数组与 `{role, content}` 对象数组。
+fn dialogs_from_value(value: Option<&Value>) -> Vec<String> {
+    let Some(arr) = value.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            if let Some(s) = item.as_str() {
+                Some(s.to_string())
+            } else {
+                item.get("content").and_then(|c| c.as_str()).map(|s| s.to_string())
+            }
+        })
+        .collect()
+}
+
+/// 写入前校验：必须成对、不超上限、不为空。
+pub fn validate_begin_dialogs(dialogs: &[String]) -> std::result::Result<(), String> {
+    if dialogs.is_empty() {
+        return Ok(());
+    }
+    if dialogs.len() % 2 != 0 {
+        return Err("示例对话必须成对（用户 / 助手交替），当前为奇数条".into());
+    }
+    if dialogs.len() > BEGIN_DIALOGS_MAX_ITEMS {
+        return Err(format!(
+            "示例对话最多 {BEGIN_DIALOGS_MAX_ITEMS} 条（{} 对）",
+            BEGIN_DIALOGS_MAX_ITEMS / 2
+        ));
+    }
+    for (idx, text) in dialogs.iter().enumerate() {
+        if text.trim().is_empty() {
+            return Err(format!("第 {} 条示例对话为空", idx + 1));
+        }
+        if text.chars().count() > BEGIN_DIALOG_MAX_CHARS {
+            return Err(format!(
+                "第 {} 条示例对话超过 {BEGIN_DIALOG_MAX_CHARS} 字",
+                idx + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 读取 / 注入前的归一化：去空白、超长截断、去多余条目并保证成对。
+pub fn normalize_begin_dialogs(dialogs: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = dialogs
+        .iter()
+        .map(|s| s.trim().chars().take(BEGIN_DIALOG_MAX_CHARS).collect::<String>())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if out.len() > BEGIN_DIALOGS_MAX_ITEMS {
+        out.truncate(BEGIN_DIALOGS_MAX_ITEMS);
+    }
+    if out.len() % 2 != 0 {
+        out.pop();
+    }
+    out
 }
 
 /// personas 存储：文件为 persona 对象**列表**（与 Python / chat.html 契约一致），
@@ -441,7 +507,24 @@ impl PersonaStore {
         self.load().iter().any(|p| p.get("name").and_then(|n| n.as_str()) == Some(name))
     }
     /// 创建人格：name 做 slug 化（小写、空格→_、去非字母数字_），与 Python 一致。
+    /// 保留为无示例对话的兼容入口；面板统一走 [`PersonaStore::create_full`]。
+    #[allow(dead_code)]
     pub fn create(&self, name: &str, display_name: &str, system_prompt: &str) -> Result<Value> {
+        self.create_full(name, display_name, system_prompt, &[])
+    }
+
+    /// 创建人格（含 AstrBot 风格的全局示例对话）。
+    /// 示例对话按「用户 / 助手」成对保存，注入时只作为全局 few-shot，不写入任何用户会话。
+    pub fn create_full(
+        &self,
+        name: &str,
+        display_name: &str,
+        system_prompt: &str,
+        begin_dialogs: &[String],
+    ) -> Result<Value> {
+        let raw: Vec<String> = begin_dialogs.iter().map(|s| s.trim().to_string()).collect();
+        validate_begin_dialogs(&raw).map_err(AppError::Other)?;
+        let dialogs = normalize_begin_dialogs(&raw);
         let slug: String = name
             .to_lowercase()
             .replace(' ', "_")
@@ -463,23 +546,35 @@ impl PersonaStore {
             "system_prompt": system_prompt,
             "style_prompt": "",
             "owner_prompt": "",
+            "begin_dialogs": dialogs,
             "is_default": false,
         });
         list.push(persona.clone());
         save_json(&self.file, &list)?;
         Ok(persona)
     }
-    /// 按 name 更新 display_name/system_prompt/style_prompt/owner_prompt。
+    /// 按 name 更新 display_name/system_prompt/style_prompt/owner_prompt/begin_dialogs。
     pub fn update(&self, name: &str, fields: &Value) -> Result<()> {
         let mut list = self.load();
         let mut found = false;
         for p in list.iter_mut() {
             if p.get("name").and_then(|n| n.as_str()) == Some(name) {
+                // 先算好并校验新的示例对话，避免写入一半才发现非法。
+                let dialogs = if let Some(v) = fields.get("begin_dialogs") {
+                    let raw: Vec<String> = dialogs_from_value(Some(v)).iter().map(|s| s.trim().to_string()).collect();
+                    validate_begin_dialogs(&raw).map_err(AppError::Other)?;
+                    Some(normalize_begin_dialogs(&raw))
+                } else {
+                    None
+                };
                 if let Some(o) = p.as_object_mut() {
                     for k in ["display_name", "system_prompt", "style_prompt", "owner_prompt"] {
                         if let Some(v) = fields.get(k) {
                             o.insert(k.to_string(), v.clone());
                         }
+                    }
+                    if let Some(dialogs) = dialogs {
+                        o.insert("begin_dialogs".to_string(), json!(dialogs));
                     }
                 }
                 found = true;
@@ -543,6 +638,7 @@ impl PersonaStore {
             system: get("system_prompt"),
             style: get("style_prompt"),
             owner: get("owner_prompt"),
+            begin_dialogs: normalize_begin_dialogs(&dialogs_from_value(p.get("begin_dialogs"))),
         }
     }
 }
@@ -559,6 +655,8 @@ pub struct PersonaBlock {
     pub system: String,
     pub style: String,
     pub owner: String,
+    /// 全局示例对话（用户 / 助手交替成对），对应 AstrBot 的 `begin_dialogs`。
+    pub begin_dialogs: Vec<String>,
 }
 
 impl PersonaBlock {
@@ -608,6 +706,25 @@ impl PersonaBlock {
         }
         out
     }
+
+    /// 渲染全局示例对话（对应 AstrBot `begin_dialogs`）。
+    /// 只属于人格层，对所有用户同一份；由上下文装配插在该用户历史之前，
+    /// 既示范语气，也不会被误当成某个用户的历史，更不会写入会话存储。
+    pub fn render_begin_dialogs(&self, bot_name: &str) -> String {
+        if self.begin_dialogs.is_empty() {
+            return String::new();
+        }
+        let bot = if bot_name.trim().is_empty() { "助手" } else { bot_name.trim() };
+        let mut lines = vec![
+            "【人设示例对话（全局固定，对所有用户一致；只示范语气与相处方式，不是任何用户的历史记录）】"
+                .to_string(),
+        ];
+        for (idx, text) in self.begin_dialogs.iter().enumerate() {
+            let who = if idx % 2 == 0 { "用户" } else { bot };
+            lines.push(format!("{who}：{text}"));
+        }
+        lines.join("\n")
+    }
 }
 
 #[cfg(test)]
@@ -621,6 +738,7 @@ mod tests {
             system: "你是测试角色，说话简短。".into(),
             style: String::new(),
             owner: "对用户保持礼貌。".into(),
+            begin_dialogs: Vec::new(),
         }
     }
 
@@ -656,5 +774,34 @@ mod tests {
         let block = crate::memory::build_permanent_block(&cfg, &[serde_json::json!({"text": "永远用中文"})]);
         assert!(block.contains("不得改变全局人设"));
         assert!(block.contains("以【人设】为准"));
+    }
+
+    #[test]
+    fn begin_dialogs_are_validated_and_rendered_as_global_examples() {
+        // 必须成对
+        let odd = vec!["你好".to_string(), "你好呀".to_string(), "多出来一句".to_string()];
+        assert!(validate_begin_dialogs(&odd).is_err());
+        // 空条目与超长条目被拒绝
+        assert!(validate_begin_dialogs(&["  ".to_string(), "回复".to_string()]).is_err());
+        let long = "啊".repeat(BEGIN_DIALOG_MAX_CHARS + 1);
+        assert!(validate_begin_dialogs(&[long, "回复".to_string()]).is_err());
+        // 成对通过
+        let good = vec!["你好".to_string(), "你好呀，今天想聊点什么？".to_string()];
+        assert!(validate_begin_dialogs(&good).is_ok());
+
+        let mut block = sample();
+        block.begin_dialogs = good.clone();
+        let rendered = block.render_begin_dialogs("Bot");
+        assert!(rendered.contains("全局固定"));
+        assert!(rendered.contains("不是任何用户的历史记录"));
+        assert!(rendered.contains("用户：你好"));
+        assert!(rendered.contains("Bot：你好呀"));
+        // 示例对话属于人格层，不进入人设规则段，也不含用户标识
+        assert!(!block.render("Bot", "comment", "", "").contains("用户：你好"));
+        assert!(!rendered.contains("UID"));
+
+        // 读取时容错：奇数条自动丢弃末尾，保证注入的始终成对
+        assert_eq!(normalize_begin_dialogs(&odd).len(), 2);
+        assert!(normalize_begin_dialogs(&["  ".to_string(), "回复".to_string()]).is_empty());
     }
 }

@@ -1584,7 +1584,13 @@ async fn api_personas_create(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Va
         return json_resp(StatusCode::BAD_REQUEST, json!({"error": "名称不能为空"}));
     }
     let display_name = body.get("display_name").and_then(|v| v.as_str()).unwrap_or("");
-    match PersonaStore::new(&ctx.base_dir).create(name, display_name, prompt) {
+    // 与 AstrBot 对齐：人格可带全局示例对话（用户 / 助手成对）
+    let dialogs: Vec<String> = body
+        .get("begin_dialogs")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    match PersonaStore::new(&ctx.base_dir).create_full(name, display_name, prompt, &dialogs) {
         Ok(persona) => Json(json!({"ok": true, "persona": persona})).into_response(),
         Err(e) => json_resp(StatusCode::BAD_REQUEST, json!({"error": e.to_string()})),
     }
@@ -1595,9 +1601,13 @@ async fn api_personas_update(State(ctx): State<Arc<WebCtx>>, Json(body): Json<Va
     if name.is_empty() {
         return json_resp(StatusCode::BAD_REQUEST, json!({"error": "缺少名称"}));
     }
-    match PersonaStore::new(&ctx.base_dir).update(name, &body) {
+    let store = PersonaStore::new(&ctx.base_dir);
+    if !store.exists(name) {
+        return json_resp(StatusCode::NOT_FOUND, json!({"error": "人格不存在"}));
+    }
+    match store.update(name, &body) {
         Ok(_) => Json(json!({"ok": true})).into_response(),
-        Err(e) => json_resp(StatusCode::NOT_FOUND, json!({"error": e.to_string()})),
+        Err(e) => json_resp(StatusCode::BAD_REQUEST, json!({"error": e.to_string()})),
     }
 }
 

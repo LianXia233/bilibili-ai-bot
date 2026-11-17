@@ -61,6 +61,8 @@ pub struct ReplyContext {
     pub user_id: String,
     pub username: String,
     pub persona: String,
+    /// 人设示例对话（全局固定，所有用户同一份，不属于任何用户历史）。
+    pub examples: String,
     pub user_context: String,
 }
 
@@ -70,8 +72,15 @@ impl ReplyContext {
             user_id: SessionStore::normalize_user_id(user_id),
             username: username.trim().to_string(),
             persona: persona.trim().to_string(),
+            examples: String::new(),
             user_context: user_context.trim().to_string(),
         }
+    }
+
+    /// 附加全局示例对话（人设层，所有用户一致；不写入会话存储）。
+    pub fn with_examples(mut self, examples: &str) -> Self {
+        self.examples = examples.trim().to_string();
+        self
     }
 
     /// 固定人设段（全局同一份，不含任何用户数据）。
@@ -92,17 +101,27 @@ impl ReplyContext {
         )
     }
 
-    /// 完整渲染（人设在前、会话在后），主要供测试与排障查看实际注入结构。
+    /// 示例对话段（放在人设之后、该用户会话之前）。
+    pub fn example_section(&self) -> String {
+        if self.examples.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", self.examples)
+        }
+    }
+
+    /// 完整渲染（人设 → 示例对话 → 用户会话），主要供测试与排障查看实际注入结构。
     #[allow(dead_code)]
     pub fn render(&self) -> String {
-        let persona = self.persona_section();
-        let user = self.user_section();
-        match (persona.is_empty(), user.is_empty()) {
-            (true, true) => String::new(),
-            (true, false) => user.trim_start().to_string(),
-            (false, true) => persona,
-            (false, false) => format!("{persona}{user}"),
-        }
+        [
+            self.persona_section(),
+            self.examples.trim().to_string(),
+            self.user_section().trim_start().to_string(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
     }
 }
 
@@ -468,10 +487,11 @@ mod tests {
             .unwrap();
 
         let persona = "【人设（固定设定）】\n测试人格\n\n【说话风格】\n简洁";
+        let examples = "【人设示例对话（全局固定）】\n用户：你好\nBot：你好呀";
         let user_a = fx.store.render_user_context(&fx.memory, &fx.docs, "uA", "甲").await;
         let user_b = fx.store.render_user_context(&fx.memory, &fx.docs, "uB", "乙").await;
-        let ctx_a = ReplyContext::new("uA", "甲", persona, &user_a);
-        let ctx_b = ReplyContext::new("uB", "乙", persona, &user_b);
+        let ctx_a = ReplyContext::new("uA", "甲", persona, &user_a).with_examples(examples);
+        let ctx_b = ReplyContext::new("uB", "乙", persona, &user_b).with_examples(examples);
 
         assert!(ctx_a.render().contains("星之卡比"), "A 会话应包含自己的历史");
         assert!(!ctx_a.render().contains("另一个人"), "A 会话串入了 B 的内容");
@@ -479,11 +499,18 @@ mod tests {
         assert!(!ctx_b.render().contains("星之卡比"), "B 会话串入了 A 的内容");
         // 人设对每个用户完全一致，且排在会话之前
         assert_eq!(ctx_a.persona_section(), ctx_b.persona_section());
+        // 示例对话同样全局一致，且只属于人设层，不混入任何用户会话
+        assert_eq!(ctx_a.examples, ctx_b.examples);
+        assert!(!user_a.contains("人设示例对话") && !user_b.contains("人设示例对话"));
         let rendered = ctx_a.render();
         assert!(rendered.starts_with("【人设"), "人设必须稳定排在最前");
         assert!(
-            rendered.find("【人设").unwrap() < rendered.find("本用户会话").unwrap(),
-            "人设应先于用户会话注入"
+            rendered.find("【人设").unwrap() < rendered.find("人设示例对话").unwrap(),
+            "示例对话应排在人设之后"
+        );
+        assert!(
+            rendered.find("人设示例对话").unwrap() < rendered.find("本用户会话").unwrap(),
+            "示例对话应先于该用户会话注入"
         );
         // 人设不写进任何用户会话存储
         assert!(!user_a.contains("测试人格") && !user_b.contains("测试人格"));

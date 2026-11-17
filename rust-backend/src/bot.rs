@@ -840,14 +840,14 @@ impl Bot {
     /// 两者渲染时拼接，但不会互相写入对方存储——换人设不会污染会话，会话也不会串台。
     async fn build_reply_context(&self, memory: &[MemoryDoc], user_id: &str, username: &str, channel: &str) -> ReplyContext {
         let cfg = self.config.read().unwrap().clone();
-        let persona = self.persona_prompt(&cfg, channel);
+        let (persona, examples) = self.persona_parts(&cfg, channel);
         let user_context = self.session.render_user_context(&self.memory, memory, user_id, username).await;
-        ReplyContext::new(user_id, username, &persona, &user_context)
+        ReplyContext::new(user_id, username, &persona, &user_context).with_examples(&examples)
     }
 
-    /// 固定人设段：所有用户共用同一份（人格身份/说话风格/对用户态度 + 性格演化 + 永久规则）。
-    /// 每次回复重新读取一次，面板改人设后立即生效，不缓存在会话里。
-    fn persona_prompt(&self, cfg: &Config, channel: &str) -> String {
+    /// 固定人设段 + 全局示例对话（对应 AstrBot 的 system_prompt + begin_dialogs）。
+    /// 两者都属于人格层，对所有用户同一份，不写入任何用户会话。
+    fn persona_parts(&self, cfg: &Config, channel: &str) -> (String, String) {
         let block = PersonaStore::new(&self.base_dir).active_block(&cfg.get_str("ACTIVE_PERSONA"));
         let owner_bili = cfg.get_str("OWNER_BILI_NAME");
         let bili_note = if owner_bili.is_empty() {
@@ -855,8 +855,8 @@ impl Bot {
         } else {
             format!("\n{}的B站账号名是\"{owner_bili}\"，是同一个人。", cfg.get_str("OWNER_NAME").if_empty_or("主人"))
         };
-        // 永久记忆：人工维护的最高优先级规则，分层注入（tier 0/1 全量 + 表情包池摘要），
-        // 与 Python build_permanent_block 对齐；prompt 中永久记忆为纯人工写入，模型不再产出。
+        // 永久记忆：人工维护的长期规则，分层注入（tier 0/1 全量 + 表情包池摘要），
+        // 与 Python build_permanent_block 对齐；规则不得改变全局人设。
         let permanent = crate::memory::build_permanent_block(cfg, &self.permanent.load());
         let evolution = self.personality.get_personality_prompt();
         let extra = if permanent.is_empty() {
@@ -864,7 +864,15 @@ impl Bot {
         } else {
             format!("{evolution}\n{permanent}")
         };
-        block.render(&cfg.get_str("BOT_NAME"), channel, &bili_note, &extra)
+        let bot_name = cfg.get_str("BOT_NAME");
+        let persona = block.render(&bot_name, channel, &bili_note, &extra);
+        let examples = block.render_begin_dialogs(&bot_name);
+        (persona, examples)
+    }
+
+    /// 只取固定人设段（旧入口保持兼容）。
+    fn persona_prompt(&self, cfg: &Config, channel: &str) -> String {
+        self.persona_parts(cfg, channel).0
     }
 
     /// 回复生成（与 generate_reply_and_score 对齐的 JSON 契约）。
@@ -890,6 +898,7 @@ impl Bot {
             context.persona_section()
         };
         let memory_section = context.user_section();
+        let example_section = context.example_section();
         let video_section = match video_context {
             Some(v) if !v.is_empty() => format!("\n\n【对方所在的视频】\n{v}\n（对方是在这个视频的评论区里说话的，可以自然引用上面的内容，但不要照抄标题）"),
             _ => String::new(),
@@ -936,7 +945,7 @@ impl Bot {
         let fact_section = "\n\n【事实边界】\n- 只说自己确定的事。不知道、不确定（对方是否换了头像、某件事真假、具体时间地点、账号状态等）就直说不知道/不清楚，或自然转移话题，绝对不要编造事实或顺着对方的话承认。\n- 不要把对方的话当事实确认，也不要假装知道对方提的人、事、物。";
 
         let prompt = format!(
-            "{persona_section}\n\n【底线】\n拒绝：表白暧昧、引战、黄赌毒政治。遇到恶意时平静坚定，可暗讽，不恶语。\n{level_prompt}{private_instruction}\n\n【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}\n\n当前时间：{now}{video_section}{memory_section}{search_section}{no_content_section}{emoji_section}{fact_section}\n════════ 需要你回应的内容（本节唯一）════════\n{username} 的{channel_name}：\n{comment_text}\n════════════════════════════════════════════\n\n上面这一节是对方这次真正说的话，**回复必须直接针对它**：\n- 不要把这段话复述、改写、翻译或概括后再作答（比如对方说「今天天气怎么样」，不要回「今天天气怎么样呀」，而要真的回答天气或说明自己看不到实时天气）。\n- 不要把上面任何背景材料（记忆、视频信息、搜索结果、规则、设定）当成话题去回应；它们只是背景。对方没提的话题不要主动展开成回复主体，除非是「对方一个字都没写」的情况。\n- 不要因为前面有大量规则、设定或素材清单，就把注意力放在那些内容上；它们只是风格约束，本轮要回应的只有上面这一节。\n- 每次回复不要用「哈哈」「这装扮」「真好看」这类开头/句式，避免复读机感；同样的意思换种说法。\n- 对方提了具体请求（写诗、写文案、解释、推荐、算数等）就当场把成品交出来，不要只回「好的，我来帮你」「我会尽力」这类空承诺 —— 那是没做事。下面「reply 简短自然」的长度要求**不适用于这类成品**，成品该多长就多长，需要分行就分行。写诗就直接把诗句写在 reply 里（例如「好的喵，给你写一首：\\n山高月小，水落石出。\\n清风徐来，水波不兴。」），不要宣布「我要写」，也不要事后再说「你看这样行不行」。\n\n请以JSON格式回复，不要加任何多余内容：\n{{\"score_delta\": 数字, \"reply\": \"回复内容\", \"impression\": \"一句话描述对该用户的印象\", \"user_facts\": [\"用户提到的个人信息1\", \"用户提到的个人信息2\"]}}\n\nuser_facts：如果用户在这条{channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。\n\nscore_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。\nreply简短自然，一般15-40字，像B站真人回复，不要写得像作文。\n（例外：上面「需要你回应的内容」里如果对方点名要一件成品 —— 写诗、写文案、解释一段概念、推荐并列出清单等 —— 则不受这个字数限制，先把成品写出来。）\nimpression简短描述用户性格/说话风格，如\"友善健谈，喜欢聊游戏\"。"
+            "{persona_section}\n\n【底线】\n拒绝：表白暧昧、引战、黄赌毒政治。遇到恶意时平静坚定，可暗讽，不恶语。\n{level_prompt}{private_instruction}\n\n【今日状态（仅作微调参考，不要让它主导你的回复风格）】{mood} — {mood_prompt}{festival_section}\n\n当前时间：{now}{example_section}{video_section}{memory_section}{search_section}{no_content_section}{emoji_section}{fact_section}\n════════ 需要你回应的内容（本节唯一）════════\n{username} 的{channel_name}：\n{comment_text}\n════════════════════════════════════════════\n\n上面这一节是对方这次真正说的话，**回复必须直接针对它**：\n- 不要把这段话复述、改写、翻译或概括后再作答（比如对方说「今天天气怎么样」，不要回「今天天气怎么样呀」，而要真的回答天气或说明自己看不到实时天气）。\n- 不要把上面任何背景材料（记忆、视频信息、搜索结果、规则、设定）当成话题去回应；它们只是背景。对方没提的话题不要主动展开成回复主体，除非是「对方一个字都没写」的情况。\n- 不要因为前面有大量规则、设定或素材清单，就把注意力放在那些内容上；它们只是风格约束，本轮要回应的只有上面这一节。\n- 每次回复不要用「哈哈」「这装扮」「真好看」这类开头/句式，避免复读机感；同样的意思换种说法。\n- 对方提了具体请求（写诗、写文案、解释、推荐、算数等）就当场把成品交出来，不要只回「好的，我来帮你」「我会尽力」这类空承诺 —— 那是没做事。下面「reply 简短自然」的长度要求**不适用于这类成品**，成品该多长就多长，需要分行就分行。写诗就直接把诗句写在 reply 里（例如「好的喵，给你写一首：\\n山高月小，水落石出。\\n清风徐来，水波不兴。」），不要宣布「我要写」，也不要事后再说「你看这样行不行」。\n\n请以JSON格式回复，不要加任何多余内容：\n{{\"score_delta\": 数字, \"reply\": \"回复内容\", \"impression\": \"一句话描述对该用户的印象\", \"user_facts\": [\"用户提到的个人信息1\", \"用户提到的个人信息2\"]}}\n\nuser_facts：如果用户在这条{channel_name}中透露了个人信息（喜好、职业、年龄、所在地、近况、经历等），提取出来。日常闲聊没有个人信息就留空数组[]。\n\nscore_delta：友善+2，普通+1，不友善-2，辱骂-5，范围-5到+5。\nreply简短自然，一般15-40字，像B站真人回复，不要写得像作文。\n（例外：上面「需要你回应的内容」里如果对方点名要一件成品 —— 写诗、写文案、解释一段概念、推荐并列出清单等 —— 则不受这个字数限制，先把成品写出来。）\nimpression简短描述用户性格/说话风格，如\"友善健谈，喜欢聊游戏\"。"
         );
 
         let max_tokens = cfg.max_tokens_of("reply");

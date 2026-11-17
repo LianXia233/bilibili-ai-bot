@@ -1793,6 +1793,11 @@ html[data-theme="dark"] .theme-toggle .icon-moon { display: block; }
             <label>对主人的态度</label>
             <textarea id="personaEditOwner" style="width:100%;min-height:80px;background:var(--bg-dark);border:1px solid rgba(126,200,227,0.15);border-radius:8px;color:var(--text-main);padding:10px;font-size:13px;font-family:inherit;resize:vertical;outline:none;"></textarea>
           </div>
+          <div class="settings-field">
+            <label>示例对话（每行一句，用户 / 助手交替，成对）</label>
+            <textarea id="personaEditDialogs" placeholder="用户：你好呀；助手：你好，今天想聊点什么？" style="width:100%;min-height:100px;background:var(--bg-dark);border:1px solid rgba(126,200,227,0.15);border-radius:8px;color:var(--text-main);padding:10px;font-size:13px;font-family:inherit;resize:vertical;outline:none;"></textarea>
+            <div style="font-size:11px;color:var(--text-dim);margin-top:4px;">全局人设示例，只示范语气与相处方式，不写入任何用户会话。</div>
+          </div>
           <div style="display:flex;gap:8px;">
             <button class="settings-btn primary" onclick="savePersonaEdit()">保存</button>
             <button class="settings-btn" onclick="document.getElementById('personaEditArea').style.display='none'">取消</button>
@@ -4768,6 +4773,7 @@ async function editPersona(name) {
     document.getElementById('personaEditSystem').value = p.system_prompt || '';
     document.getElementById('personaEditStyle').value = p.style_prompt || '';
     document.getElementById('personaEditOwner').value = p.owner_prompt || '';
+    document.getElementById('personaEditDialogs').value = (p.begin_dialogs || []).join('\n');
     document.getElementById('personaEditTitle').textContent = '编辑：' + p.display_name;
     document.getElementById('personaEditArea').style.display = 'block';
     document.getElementById('personaEditArea').scrollIntoView({behavior:'smooth'});
@@ -4782,6 +4788,7 @@ async function savePersonaEdit() {
     system_prompt: document.getElementById('personaEditSystem').value,
     style_prompt: document.getElementById('personaEditStyle').value,
     owner_prompt: document.getElementById('personaEditOwner').value,
+    begin_dialogs: document.getElementById('personaEditDialogs').value.split('\n').map(s => s.trim()).filter(Boolean),
   };
   try {
     const resp = await apiFetch('/api/personas/update', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(updates)});
